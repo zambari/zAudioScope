@@ -70,14 +70,17 @@ fn nsdf(x: &[f32], rate: u32, f_min: f32, f_max: f32) -> Option<f32> {
     if lag_max <= lag_min + 2 {
         return None;
     }
+    // m(tau) = sum of x[i]^2 + x[i+tau]^2 over the overlap, updated
+    // incrementally as the overlap shrinks (McLeod), so each lag costs one
+    // dot product.
     let n = x.len();
+    let mut m: f32 = 2.0 * x.iter().map(|s| s * s).sum::<f32>();
     let curve: Vec<f32> = (0..=lag_max + 1)
         .map(|tau| {
-            let (mut acf, mut m) = (0.0f32, 0.0f32);
-            for i in 0..n - tau {
-                acf += x[i] * x[i + tau];
-                m += x[i] * x[i] + x[i + tau] * x[i + tau];
+            if tau > 0 {
+                m -= x[n - tau] * x[n - tau] + x[tau - 1] * x[tau - 1];
             }
+            let acf: f32 = x[..n - tau].iter().zip(&x[tau..]).map(|(a, b)| a * b).sum();
             if m > 0.0 { 2.0 * acf / m } else { 0.0 }
         })
         .collect();

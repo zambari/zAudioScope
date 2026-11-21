@@ -11,6 +11,11 @@ egui = "0.37"
 serde = { version = "1.0.229", features = ["derive"] }
 
 # Drawing scopes and running FFTs in an unoptimized build is slow.
-# Optimize dependencies even in dev; our own crate stays fast to rebuild.
+# Optimize dependencies even in dev.
 [profile.dev.package."*"]
 opt-level = 2
+
+# Our own DSP (FFT, NSDF) runs every frame; opt-level 0 made the UI stutter.
+# Level 1 keeps rebuilds quick.
+[profile.dev]
+opt-level = 1

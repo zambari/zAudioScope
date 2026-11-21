@@ -5,6 +5,7 @@ mod app;
 mod audio;
 mod modules;
 mod pitch;
+mod relaunch;
 mod ui;
 
 /// eframe uses this as the folder for saved window and UI state.

@@ -1,3 +1,5 @@
+pub mod infobox;
+pub mod meter;
 pub mod theme;
 
 use egui::{Color32, Sense, Stroke, Ui};

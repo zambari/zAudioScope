@@ -3,18 +3,23 @@
 //! the sliders) becomes the gate the other modules analyse. Free mode just
 //! scrolls, and the others analyse everything.
 
+use serde::{Deserialize, Serialize};
+
 use egui::{Color32, Pos2, Rect, Sense, Stroke, Ui};
 
 use super::{Gate, Module, Shared};
 use crate::ui::theme;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum Mode {
     Free,
     Trigger,
 }
 
-pub struct Scope {
+/// The persisted settings.
+#[derive(Serialize, Deserialize)]
+#[serde(default)]
+struct Params {
     mode: Mode,
     /// Trigger level, 0..1 of full scale.
     threshold: f32,
@@ -26,12 +31,9 @@ pub struct Scope {
     win_start_ms: f32,
     win_end_ms: f32,
     gain: f32,
-    /// Absolute sample index of the trigger being shown.
-    trigger: Option<u64>,
-    drag_from_ms: Option<f32>,
 }
 
-impl Default for Scope {
+impl Default for Params {
     fn default() -> Self {
         Self {
             mode: Mode::Trigger,
@@ -41,10 +43,28 @@ impl Default for Scope {
             win_start_ms: 80.0,
             win_end_ms: 400.0,
             gain: 1.0,
-            trigger: None,
-            drag_from_ms: None,
         }
     }
+}
+
+impl Params {
+    /// Pull loaded values back into the ranges the UI allows.
+    fn sanitize(&mut self) {
+        self.view_ms = self.view_ms.clamp(50.0, 2000.0);
+        self.gain = self.gain.clamp(0.5, 16.0);
+        self.threshold = self.threshold.clamp(0.01, 1.0);
+        self.holdoff_ms = self.holdoff_ms.clamp(0.0, 1000.0);
+        self.win_start_ms = self.win_start_ms.clamp(0.0, self.view_ms);
+        self.win_end_ms = self.win_end_ms.clamp(self.win_start_ms, self.view_ms);
+    }
+}
+
+#[derive(Default)]
+pub struct Scope {
+    p: Params,
+    /// Absolute sample index of the trigger being shown.
+    trigger: Option<u64>,
+    drag_from_ms: Option<f32>,
 }
 
 impl Scope {
@@ -53,13 +73,13 @@ impl Scope {
     fn find_trigger(&self, shared: &Shared) -> Option<u64> {
         let f = &shared.frame;
         let x = &f.samples;
-        let need = f.ms_to_samples(self.win_end_ms.max(self.view_ms));
-        let holdoff = f.ms_to_samples(self.holdoff_ms);
+        let need = f.ms_to_samples(self.p.win_end_ms.max(self.p.view_ms));
+        let holdoff = f.ms_to_samples(self.p.holdoff_ms);
         let last = x.len().checked_sub(need)?;
         let mut found = None;
         let mut i = 1;
         while i <= last {
-            if x[i].abs() >= self.threshold && x[i - 1].abs() < self.threshold {
+            if x[i].abs() >= self.p.threshold && x[i - 1].abs() < self.p.threshold {
                 found = Some(f.start + i as u64);
                 i += holdoff.max(1);
             } else {
@@ -75,12 +95,30 @@ impl Module for Scope {
         "Scope"
     }
 
+    fn save_params(&self, storage: &mut dyn eframe::Storage, key: &str) {
+        eframe::set_value(storage, key, &self.p);
+    }
+
+    fn load_params(&mut self, storage: &dyn eframe::Storage, key: &str) {
+        if let Some(p) = eframe::get_value::<Params>(storage, key) {
+            self.p = p;
+            self.p.sanitize();
+        }
+    }
+
     fn graph_height(&self) -> f32 {
         220.0
     }
 
+    fn lookback(&self, rate: u32) -> usize {
+        // Room to find a trigger with a full view after it, and to keep
+        // showing the last one for a while.
+        let ms = (2.0 * self.p.view_ms.max(self.p.win_end_ms) + self.p.holdoff_ms).max(2000.0);
+        (ms * rate as f32 / 1000.0) as usize
+    }
+
     fn update(&mut self, shared: &mut Shared) {
-        match self.mode {
+        match self.p.mode {
             Mode::Free => shared.gate = Gate { window: None },
             Mode::Trigger => {
                 if let Some(t) = self.find_trigger(shared) {
@@ -88,7 +126,7 @@ impl Module for Scope {
                 }
                 let f = &shared.frame;
                 shared.gate.window = self.trigger.map(|t| {
-                    (t + f.ms_to_samples(self.win_start_ms) as u64, t + f.ms_to_samples(self.win_end_ms) as u64)
+                    (t + f.ms_to_samples(self.p.win_start_ms) as u64, t + f.ms_to_samples(self.p.win_end_ms) as u64)
                 });
             }
         }
@@ -96,51 +134,51 @@ impl Module for Scope {
 
     fn params(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.mode, Mode::Trigger, "Trigger");
-            ui.selectable_value(&mut self.mode, Mode::Free, "Free");
+            ui.selectable_value(&mut self.p.mode, Mode::Trigger, "Trigger");
+            ui.selectable_value(&mut self.p.mode, Mode::Free, "Free");
         });
-        ui.add(egui::Slider::new(&mut self.view_ms, 50.0..=2000.0).text("view ms"));
-        ui.add(egui::Slider::new(&mut self.gain, 0.5..=16.0).logarithmic(true).text("gain"));
-        ui.add_enabled_ui(self.mode == Mode::Trigger, |ui| {
-            ui.add(egui::Slider::new(&mut self.threshold, 0.01..=1.0).text("threshold"));
-            ui.add(egui::Slider::new(&mut self.holdoff_ms, 0.0..=1000.0).text("holdoff ms"));
-            ui.add(egui::Slider::new(&mut self.win_start_ms, 0.0..=self.view_ms).text("gate from"));
-            ui.add(egui::Slider::new(&mut self.win_end_ms, 0.0..=self.view_ms).text("gate to"));
+        ui.add(egui::Slider::new(&mut self.p.view_ms, 50.0..=2000.0).text("view ms"));
+        ui.add(egui::Slider::new(&mut self.p.gain, 0.5..=16.0).logarithmic(true).text("gain"));
+        ui.add_enabled_ui(self.p.mode == Mode::Trigger, |ui| {
+            ui.add(egui::Slider::new(&mut self.p.threshold, 0.01..=1.0).text("threshold"));
+            ui.add(egui::Slider::new(&mut self.p.holdoff_ms, 0.0..=1000.0).text("holdoff ms"));
+            ui.add(egui::Slider::new(&mut self.p.win_start_ms, 0.0..=self.p.view_ms).text("gate from"));
+            ui.add(egui::Slider::new(&mut self.p.win_end_ms, 0.0..=self.p.view_ms).text("gate to"));
         });
-        if self.win_end_ms < self.win_start_ms {
-            std::mem::swap(&mut self.win_start_ms, &mut self.win_end_ms);
+        if self.p.win_end_ms < self.p.win_start_ms {
+            std::mem::swap(&mut self.p.win_start_ms, &mut self.p.win_end_ms);
         }
     }
 
     fn graph(&mut self, ui: &mut Ui, rect: Rect, shared: &Shared) {
         let f = &shared.frame;
-        let view = f.ms_to_samples(self.view_ms).max(2);
-        let start = match (self.mode, self.trigger) {
+        let view = f.ms_to_samples(self.p.view_ms).max(2);
+        let start = match (self.p.mode, self.trigger) {
             (Mode::Trigger, Some(t)) => t,
             _ => f.start + f.samples.len().saturating_sub(view) as u64,
         };
         let painter = ui.painter_at(rect);
-        let x_of_ms = |ms: f32| rect.left() + rect.width() * ms / self.view_ms;
+        let x_of_ms = |ms: f32| rect.left() + rect.width() * ms / self.p.view_ms;
 
         // Gate window, with drag-to-select.
-        if self.mode == Mode::Trigger {
+        if self.p.mode == Mode::Trigger {
             let resp = ui.interact(rect, ui.scope_id().with("scope_drag"), Sense::drag());
-            let ms_at = |p: Pos2| ((p.x - rect.left()) / rect.width() * self.view_ms).clamp(0.0, self.view_ms);
+            let ms_at = |p: Pos2| ((p.x - rect.left()) / rect.width() * self.p.view_ms).clamp(0.0, self.p.view_ms);
             if resp.drag_started() {
                 self.drag_from_ms = resp.interact_pointer_pos().map(ms_at);
             }
             if let (Some(a), Some(p)) = (self.drag_from_ms, resp.interact_pointer_pos()) {
                 let b = ms_at(p);
-                (self.win_start_ms, self.win_end_ms) = (a.min(b), a.max(b));
+                (self.p.win_start_ms, self.p.win_end_ms) = (a.min(b), a.max(b));
             }
             if resp.drag_stopped() {
                 self.drag_from_ms = None;
             }
-            let gate = Rect::from_x_y_ranges(x_of_ms(self.win_start_ms)..=x_of_ms(self.win_end_ms), rect.y_range());
+            let gate = Rect::from_x_y_ranges(x_of_ms(self.p.win_start_ms)..=x_of_ms(self.p.win_end_ms), rect.y_range());
             painter.rect_filled(gate, 0.0, theme::ACCENT.gamma_multiply(0.25));
             let y = |v: f32| rect.center().y - v * rect.height() / 2.0;
-            for v in [self.threshold, -self.threshold] {
-                let yy = y(v * self.gain);
+            for v in [self.p.threshold, -self.p.threshold] {
+                let yy = y(v * self.p.gain);
                 painter.hline(rect.x_range(), yy, Stroke::new(1.0, theme::ACCENT_BRIGHT.gamma_multiply(0.4)));
             }
         }
@@ -162,7 +200,7 @@ impl Module for Scope {
             let yc = rect.center().y;
             painter.vline(
                 x,
-                (yc - (mx * self.gain).clamp(-1.0, 1.0) * half)..=(yc - (mn * self.gain).clamp(-1.0, 1.0) * half),
+                (yc - (mx * self.p.gain).clamp(-1.0, 1.0) * half)..=(yc - (mn * self.p.gain).clamp(-1.0, 1.0) * half),
                 Stroke::new(1.0, theme::WAVE),
             );
         }
