@@ -1,0 +1,30 @@
+# Claude / agent notes (local only)
+CLAUDE.md
+.claude/
+
+# Rust build output
+/target/
+**/*.rs.bk
+
+# Debug / profiling artifacts
+*.pdb
+*.profraw
+*.profdata
+flamegraph.svg
+perf.data*
+
+# Environment / secrets
+.env
+.env.*
+
+# IDE / editor
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
