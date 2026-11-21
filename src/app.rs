@@ -145,6 +145,7 @@ impl App {
                 self.relaunch = true;
                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
             }
+            self.listen_toggle(ui);
             if self.build_watch.ready() {
                 ui.separator();
                 let btn = egui::Button::new(egui::RichText::new("New build: relaunch").color(theme::ON_ACCENT))
@@ -184,19 +185,27 @@ impl App {
         });
     }
 
-    /// Pause, then the channel picker: a popup with every channel's level,
-    /// the sample rate and the buffer size.
-    fn input_controls(&mut self, ui: &mut egui::Ui) {
-        let mut paused = self.input.paused();
-        let label = if paused { "▶ Resume" } else { "⏸ Pause" };
+    /// Listening is the lit, active state; clicking releases the interface
+    /// and shows a greyed-out "Paused".
+    fn listen_toggle(&mut self, ui: &mut egui::Ui) {
+        let mut listening = !self.input.paused();
+        let label = if listening {
+            egui::RichText::new("▶ Listening")
+        } else {
+            egui::RichText::new("⏸ Paused").color(ui.visuals().weak_text_color())
+        };
         if ui
-            .toggle_value(&mut paused, label)
-            .on_hover_text("Pause disconnects from the interface so another app (e.g. a DAW in exclusive mode) can use it. The last captured audio stays on screen.")
+            .toggle_value(&mut listening, label)
+            .on_hover_text("Click to pause: disconnects from the interface so another app (e.g. a DAW in exclusive mode) can use it. The last captured audio stays on screen.")
             .changed()
         {
-            self.input.set_paused(paused);
+            self.input.set_paused(!listening);
         }
+    }
 
+    /// The channel picker: a popup with every channel's level, the sample
+    /// rate and the buffer size.
+    fn input_controls(&mut self, ui: &mut egui::Ui) {
         let n = self.input.channels;
         let cur = self.input.channel();
         let head = format!(
@@ -366,6 +375,13 @@ impl App {
                 ui.label(format!("{x} dropout{}", if x == 1 { "" } else { "s" }))
                     .on_hover_text("Buffer under/overruns reported by the driver since the stream opened. A few at start or on a rate change are normal; a steady count means the system is overloaded.");
             }
+            let z = self.input.skipped();
+            if z > 0 {
+                ui.separator();
+                let ms = z as f32 * 1000.0 / self.input.rate.max(1) as f32;
+                ui.label(format!("{ms:.0} ms of empty input skipped"))
+                    .on_hover_text("Blocks of exact zeros the driver delivered right after a stall or dropout: filler for audio that never arrived, left out so the analysers don't see false silence. Real silence on a healthy stream is kept.");
+            }
             let g = self.input.gaps();
             if g > 0 {
                 ui.separator();
@@ -402,7 +418,11 @@ impl eframe::App for App {
 
         egui::Panel::top("top_bar").show(ui, |ui| self.top_bar(ui));
         egui::Panel::bottom("status_bar").show(ui, |ui| self.status_bar(ui));
+        let paused = self.input.paused();
         egui::CentralPanel::default().show(ui, |ui| {
+            if paused {
+                ui.multiply_opacity(0.5);
+            }
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 for slot in self.slots.iter_mut().filter(|s| s.visible) {
                     ui.push_id(slot.module.title(), |ui| {

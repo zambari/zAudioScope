@@ -5,10 +5,22 @@
 
 use serde::{Deserialize, Serialize};
 
-use egui::{Color32, Pos2, Rect, Sense, Stroke, Ui};
+use egui::{Align2, Color32, Pos2, Rect, Sense, Stroke, Ui};
 
 use super::{Gate, Module, Shared};
+use crate::ui::handle::EdgeHandle;
+use crate::ui::plot::{self, Axis, Edge, Link, Scale};
 use crate::ui::theme;
+
+/// Sliders tied to spots on the graph.
+#[derive(Clone, Copy, PartialEq)]
+enum Key {
+    View,
+    Threshold,
+    Holdoff,
+    From,
+    To,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum Mode {
@@ -65,6 +77,7 @@ pub struct Scope {
     /// Absolute sample index of the trigger being shown.
     trigger: Option<u64>,
     drag_from_ms: Option<f32>,
+    link: Link<Key>,
 }
 
 impl Scope {
@@ -137,13 +150,14 @@ impl Module for Scope {
             ui.selectable_value(&mut self.p.mode, Mode::Trigger, "Trigger");
             ui.selectable_value(&mut self.p.mode, Mode::Free, "Free");
         });
-        ui.add(egui::Slider::new(&mut self.p.view_ms, 50.0..=2000.0).text("view ms"));
+        let link = &mut self.link;
+        link.slider(ui, Key::View, egui::Slider::new(&mut self.p.view_ms, 50.0..=2000.0).text("view ms"));
         ui.add(egui::Slider::new(&mut self.p.gain, 0.5..=16.0).logarithmic(true).text("gain"));
         ui.add_enabled_ui(self.p.mode == Mode::Trigger, |ui| {
-            ui.add(egui::Slider::new(&mut self.p.threshold, 0.01..=1.0).text("threshold"));
-            ui.add(egui::Slider::new(&mut self.p.holdoff_ms, 0.0..=1000.0).text("holdoff ms"));
-            ui.add(egui::Slider::new(&mut self.p.win_start_ms, 0.0..=self.p.view_ms).text("gate from"));
-            ui.add(egui::Slider::new(&mut self.p.win_end_ms, 0.0..=self.p.view_ms).text("gate to"));
+            link.slider(ui, Key::Threshold, egui::Slider::new(&mut self.p.threshold, 0.01..=1.0).text("threshold"));
+            link.slider(ui, Key::Holdoff, egui::Slider::new(&mut self.p.holdoff_ms, 0.0..=1000.0).text("holdoff ms"));
+            link.slider(ui, Key::From, egui::Slider::new(&mut self.p.win_start_ms, 0.0..=self.p.view_ms).text("gate from"));
+            link.slider(ui, Key::To, egui::Slider::new(&mut self.p.win_end_ms, 0.0..=self.p.view_ms).text("gate to"));
         });
         if self.p.win_end_ms < self.p.win_start_ms {
             std::mem::swap(&mut self.p.win_start_ms, &mut self.p.win_end_ms);
@@ -151,17 +165,26 @@ impl Module for Scope {
     }
 
     fn graph(&mut self, ui: &mut Ui, rect: Rect, shared: &Shared) {
+        self.link.tick(ui.input(|i| i.stable_dt).clamp(0.0, 0.1));
         let f = &shared.frame;
+        let trig = self.p.mode == Mode::Trigger;
         let view = f.ms_to_samples(self.p.view_ms).max(2);
-        let start = match (self.p.mode, self.trigger) {
-            (Mode::Trigger, Some(t)) => t,
+        let start = match (trig, self.trigger) {
+            (true, Some(t)) => t,
             _ => f.start + f.samples.len().saturating_sub(view) as u64,
         };
         let painter = ui.painter_at(rect);
+        // Trigger: ms after the trigger. Free: ms before now.
+        let xs = if trig {
+            Scale::linear((0.0, self.p.view_ms), (rect.left(), rect.right()))
+        } else {
+            Scale::linear((-self.p.view_ms, 0.0), (rect.left(), rect.right()))
+        };
         let x_of_ms = |ms: f32| rect.left() + rect.width() * ms / self.p.view_ms;
+        let amp = Scale::linear((-1.0 / self.p.gain, 1.0 / self.p.gain), (rect.bottom(), rect.top()));
 
         // Gate window, with drag-to-select.
-        if self.p.mode == Mode::Trigger {
+        if trig {
             let resp = ui.interact(rect, ui.scope_id().with("scope_drag"), Sense::drag());
             let ms_at = |p: Pos2| ((p.x - rect.left()) / rect.width() * self.p.view_ms).clamp(0.0, self.p.view_ms);
             if resp.drag_started() {
@@ -176,12 +199,12 @@ impl Module for Scope {
             }
             let gate = Rect::from_x_y_ranges(x_of_ms(self.p.win_start_ms)..=x_of_ms(self.p.win_end_ms), rect.y_range());
             painter.rect_filled(gate, 0.0, theme::ACCENT.gamma_multiply(0.25));
-            let y = |v: f32| rect.center().y - v * rect.height() / 2.0;
             for v in [self.p.threshold, -self.p.threshold] {
-                let yy = y(v * self.p.gain);
-                painter.hline(rect.x_range(), yy, Stroke::new(1.0, theme::ACCENT_BRIGHT.gamma_multiply(0.4)));
+                painter.hline(rect.x_range(), amp.px(v), Stroke::new(1.0, theme::ACCENT_BRIGHT.gamma_multiply(0.4)));
             }
         }
+        Axis::new(Edge::Bottom, xs).draw(&painter, rect, plot::fmt_ms);
+        Axis::new(Edge::Left, amp).spacing(36.0).draw(&painter, rect, plot::trim);
         painter.hline(rect.x_range(), rect.center().y, Stroke::new(1.0, Color32::from_gray(40)));
 
         // Min/max per pixel column.
@@ -203,6 +226,54 @@ impl Module for Scope {
                 (yc - (mx * self.p.gain).clamp(-1.0, 1.0) * half)..=(yc - (mn * self.p.gain).clamp(-1.0, 1.0) * half),
                 Stroke::new(1.0, theme::WAVE),
             );
+        }
+
+        // Handles: threshold on the left edge, gate ends along the bottom.
+        if trig {
+            let thr = Scale::linear((0.0, 1.0 / self.p.gain), (rect.center().y, rect.top()));
+            let fmt = |v: f32| format!("thr {v:.2}  {:.1} dB", 20.0 * v.log10());
+            let r = EdgeHandle::new("scope_thr", Edge::Left, thr, &mut self.p.threshold).clamp(0.01, 1.0).reset(0.3).label(&fmt).show(ui, rect);
+            if r.hovered() || r.dragged() {
+                self.link.touch(Key::Threshold);
+            }
+            let ms = Scale::linear((0.0, self.p.view_ms), (rect.left(), rect.right()));
+            let fmt = |v: f32| format!("from {}", plot::fmt_ms(v));
+            let r = EdgeHandle::new("scope_from", Edge::Bottom, ms, &mut self.p.win_start_ms)
+                .clamp(0.0, self.p.win_end_ms)
+                .label(&fmt)
+                .show(ui, rect);
+            if r.hovered() || r.dragged() {
+                self.link.touch(Key::From);
+            }
+            let fmt = |v: f32| format!("to {}", plot::fmt_ms(v));
+            let r = EdgeHandle::new("scope_to", Edge::Bottom, ms, &mut self.p.win_end_ms)
+                .clamp(self.p.win_start_ms, self.p.view_ms)
+                .label(&fmt)
+                .show(ui, rect);
+            if r.hovered() || r.dragged() {
+                self.link.touch(Key::To);
+            }
+        }
+
+        let caption = match (trig, self.trigger) {
+            (true, Some(_)) => format!(
+                "{} after trigger · gate {}–{}",
+                plot::fmt_ms(self.p.view_ms),
+                plot::fmt_ms(self.p.win_start_ms),
+                plot::fmt_ms(self.p.win_end_ms)
+            ),
+            (true, None) => format!("{} · waiting for trigger", plot::fmt_ms(self.p.view_ms)),
+            (false, _) => format!("last {}", plot::fmt_ms(self.p.view_ms)),
+        };
+        plot::caption(&painter, rect, Align2::RIGHT_TOP, caption);
+
+        match self.link.shown() {
+            Some(Key::View) => self.link.point_x(ui, rect, rect.right() - 1.0),
+            Some(Key::Threshold) => self.link.point_y(ui, rect, amp.px(self.p.threshold)),
+            Some(Key::Holdoff) => self.link.point_x(ui, rect, x_of_ms(self.p.holdoff_ms)),
+            Some(Key::From) => self.link.point_x(ui, rect, x_of_ms(self.p.win_start_ms)),
+            Some(Key::To) => self.link.point_x(ui, rect, x_of_ms(self.p.win_end_ms)),
+            None => {}
         }
     }
 }

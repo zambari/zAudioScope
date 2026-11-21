@@ -49,31 +49,55 @@ impl Method {
 }
 
 /// Detected fundamental in Hz, or `None` for silence / no clear pitch.
+#[allow(dead_code)] // the tuner reads the full candidate list instead
 pub fn detect(method: Method, samples: &[f32], rate: u32, f_min: f32, f_max: f32) -> Option<f32> {
     match method {
-        Method::Autocorrelation => nsdf(samples, rate, f_min, f_max),
+        Method::Autocorrelation => candidates(samples, rate, f_min, f_max).pick(),
         // TODO: FFT + harmonic product spectrum, with parabolic peak
         // interpolation. Until then, fall back so the selector is usable.
-        Method::Fft => nsdf(samples, rate, f_min, f_max),
+        Method::Fft => candidates(samples, rate, f_min, f_max).pick(),
     }
 }
 
-/// Normalized square difference (McLeod): picks the first strong peak
-/// of the normalized autocorrelation, refined by parabolic interpolation.
-fn nsdf(x: &[f32], rate: u32, f_min: f32, f_max: f32) -> Option<f32> {
-    let rms = (x.iter().map(|s| s * s).sum::<f32>() / x.len().max(1) as f32).sqrt();
+/// One periodicity the autocorrelation found: a peak of the NSDF curve.
+#[derive(Clone, Copy, Debug)]
+pub struct Candidate {
+    pub freq: f32,
+    /// NSDF peak height, 0..1: how periodic the signal is at this lag.
+    pub clarity: f32,
+}
+
+/// All NSDF key maxima in the lag range, by ascending lag (descending
+/// frequency), plus which one McLeod's rule picks as the pitch.
+#[derive(Default, Debug)]
+pub struct Candidates {
+    pub list: Vec<Candidate>,
+    pub pick: Option<usize>,
+}
+
+impl Candidates {
+    pub fn pick(&self) -> Option<f32> {
+        self.pick.map(|i| self.list[i].freq)
+    }
+}
+
+/// Normalized square difference (McLeod). Each positive lobe of the curve
+/// contributes its maximum, refined by parabolic interpolation; the pick is
+/// the first one close to the global best, which avoids octave errors.
+pub fn candidates(x: &[f32], rate: u32, f_min: f32, f_max: f32) -> Candidates {
+    let mut out = Candidates::default();
+    let n = x.len();
+    let rms = (x.iter().map(|s| s * s).sum::<f32>() / n.max(1) as f32).sqrt();
     if rms < 1e-3 {
-        return None;
+        return out;
     }
     let lag_min = (rate as f32 / f_max).floor().max(2.0) as usize;
-    let lag_max = ((rate as f32 / f_min).ceil() as usize).min(x.len() / 2);
+    let lag_max = ((rate as f32 / f_min).ceil() as usize).min(n / 2);
     if lag_max <= lag_min + 2 {
-        return None;
+        return out;
     }
     // m(tau) = sum of x[i]^2 + x[i+tau]^2 over the overlap, updated
-    // incrementally as the overlap shrinks (McLeod), so each lag costs one
-    // dot product.
-    let n = x.len();
+    // incrementally as the overlap shrinks, so each lag costs one dot product.
     let mut m: f32 = 2.0 * x.iter().map(|s| s * s).sum::<f32>();
     let curve: Vec<f32> = (0..=lag_max + 1)
         .map(|tau| {
@@ -85,17 +109,47 @@ fn nsdf(x: &[f32], rate: u32, f_min: f32, f_max: f32) -> Option<f32> {
         })
         .collect();
 
-    let best = (lag_min..=lag_max).map(|t| curve[t]).fold(0f32, f32::max);
-    if best < 0.5 {
-        return None;
+    // Walk the lobes. The first one (around lag 0) is the signal matching
+    // itself, so start after the curve first goes negative.
+    let mut t = 1;
+    while t <= lag_max && curve[t] > 0.0 {
+        t += 1;
     }
-    // First local maximum close to the global best avoids octave errors.
-    let tau = (lag_min..=lag_max)
-        .find(|&t| curve[t] >= 0.9 * best && curve[t] >= curve[t - 1] && curve[t] >= curve[t + 1])?;
-    let (a, b, c) = (curve[tau - 1], curve[tau], curve[tau + 1]);
-    let denom = a - 2.0 * b + c;
-    let shift = if denom.abs() > 1e-9 { 0.5 * (a - c) / denom } else { 0.0 };
-    Some(rate as f32 / (tau as f32 + shift))
+    let mut lobe: Option<usize> = None;
+    let push = |i: usize, out: &mut Candidates| {
+        if i < lag_min.max(1) || i > lag_max {
+            return;
+        }
+        let (a, b, c) = (curve[i - 1], curve[i], curve[i + 1]);
+        let denom = a - 2.0 * b + c;
+        let shift = if denom.abs() > 1e-9 { (0.5 * (a - c) / denom).clamp(-0.5, 0.5) } else { 0.0 };
+        let peak = b - 0.25 * (a - c) * shift;
+        out.list.push(Candidate { freq: rate as f32 / (i as f32 + shift), clarity: peak.clamp(0.0, 1.0) });
+    };
+    while t <= lag_max {
+        let v = curve[t];
+        if v > 0.0 {
+            lobe = Some(match lobe {
+                Some(b) if curve[b] >= v => b,
+                _ => t,
+            });
+        } else if let Some(b) = lobe.take() {
+            push(b, &mut out);
+        }
+        t += 1;
+    }
+    // A lobe still open at the end only counts if its peak is interior.
+    if let Some(b) = lobe
+        && curve[b] > curve[b + 1]
+    {
+        push(b, &mut out);
+    }
+
+    let best = out.list.iter().map(|c| c.clarity).fold(0f32, f32::max);
+    if best >= 0.5 {
+        out.pick = out.list.iter().position(|c| c.clarity >= 0.9 * best);
+    }
+    out
 }
 
 #[cfg(test)]

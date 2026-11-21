@@ -15,11 +15,12 @@ const TILT_DB_PER_OCT: f32 = 3.0;
 /// Below this, a bin reads as silence.
 pub const FLOOR_DB: f32 = -96.0;
 
-fn warp(f: f32) -> f32 {
+/// The frequency warp, for `ui::plot::Scale::warped`.
+pub fn warp(f: f32) -> f32 {
     (1.0 + f / F_KNEE).ln()
 }
 
-fn unwarp(w: f32) -> f32 {
+pub fn unwarp(w: f32) -> f32 {
     F_KNEE * (w.exp() - 1.0)
 }
 

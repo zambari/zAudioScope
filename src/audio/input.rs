@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -100,70 +100,91 @@ impl ChannelSel {
     }
 }
 
-/// Mono samples written by the audio callback, read by the UI.
+/// Mono samples written by the audio callback, read by the UI, with no
+/// lock: the callback never waits, never defers, never drops. Samples are
+/// `f32` bits in atomics; `written` is published once per callback with
+/// `Release`, and a reader copies behind it, then checks that the writer
+/// hasn't lapped what it copied.
 struct Ring {
-    buf: Vec<f32>,
+    buf: Box<[AtomicU32]>,
     /// Total samples ever written; `written % buf.len()` is the write head.
-    written: u64,
+    written: AtomicU64,
     /// Per-channel peak since the UI last looked, for the level meter.
-    peaks: [f32; 2],
-    /// The selected L/R pair (or the mono channel twice), for the phase strip.
-    stereo: Vec<(f32, f32)>,
-    stereo_written: usize,
+    /// Non-negative `f32` bits order like the floats, so `fetch_max` works.
+    peaks: [AtomicU32; 2],
+    /// The selected L/R pair (or the mono channel twice), packed L<<32 | R,
+    /// for the phase strip.
+    stereo: Box<[AtomicU64]>,
+    stereo_written: AtomicUsize,
     /// Every device channel's peak since the UI last looked; only filled
     /// while the channel picker is open.
-    all_peaks: Vec<f32>,
+    all_peaks: Box<[AtomicU32]>,
+}
+
+fn atomics<A>(n: usize, f: impl Fn() -> A) -> Box<[A]> {
+    (0..n).map(|_| f()).collect()
 }
 
 impl Ring {
     fn new(len: usize, channels: u16) -> Self {
         Self {
-            buf: vec![0.0; len.max(1)],
-            written: 0,
-            peaks: [0.0; 2],
-            stereo: vec![(0.0, 0.0); STEREO_LEN],
-            stereo_written: 0,
-            all_peaks: vec![0.0; channels as usize],
+            buf: atomics(len.max(1), || AtomicU32::new(0)),
+            written: AtomicU64::new(0),
+            peaks: [AtomicU32::new(0), AtomicU32::new(0)],
+            stereo: atomics(STEREO_LEN, || AtomicU64::new(0)),
+            stereo_written: AtomicUsize::new(0),
+            all_peaks: atomics(channels as usize, || AtomicU32::new(0)),
         }
     }
 
-    /// Append a block of (mono, L, R) frames.
-    fn extend(&mut self, block: &[[f32; 3]]) {
-        let len = self.buf.len() as u64;
-        for &[s, l, r] in block {
-            self.buf[(self.written % len) as usize] = s;
-            self.written += 1;
-            self.peaks[0] = self.peaks[0].max(l.abs());
-            self.peaks[1] = self.peaks[1].max(r.abs());
-            self.stereo[self.stereo_written % STEREO_LEN] = (l, r);
-            self.stereo_written += 1;
-        }
+    /// Writer side; only the audio callback calls these.
+    fn write(&self, at: u64, s: f32, stereo_at: usize, l: f32, r: f32) {
+        self.buf[(at % self.buf.len() as u64) as usize].store(s.to_bits(), Ordering::Relaxed);
+        let packed = (l.to_bits() as u64) << 32 | r.to_bits() as u64;
+        self.stereo[stereo_at % STEREO_LEN].store(packed, Ordering::Relaxed);
+    }
+
+    fn publish(&self, written: u64, stereo_written: usize) {
+        self.stereo_written.store(stereo_written, Ordering::Release);
+        self.written.store(written, Ordering::Release);
+    }
+
+    fn written(&self) -> u64 {
+        self.written.load(Ordering::Acquire)
     }
 
     /// The last `n` L/R frames, oldest first.
     fn latest_stereo(&self, n: usize) -> Vec<(f32, f32)> {
-        let n = n.min(STEREO_LEN).min(self.stereo_written);
-        let start = self.stereo_written - n;
-        (start..self.stereo_written).map(|i| self.stereo[i % STEREO_LEN]).collect()
+        let w = self.stereo_written.load(Ordering::Acquire);
+        let n = n.min(STEREO_LEN / 2).min(w);
+        (w - n..w)
+            .map(|i| {
+                let v = self.stereo[i % STEREO_LEN].load(Ordering::Relaxed);
+                (f32::from_bits((v >> 32) as u32), f32::from_bits(v as u32))
+            })
+            .collect()
     }
 
     /// The last `n` samples, oldest first, and the absolute index of the first.
-    /// Two slice copies, so the audio callback never waits long on the lock.
-    fn latest(&self, n: usize) -> (Vec<f32>, u64) {
-        let len = self.buf.len();
-        let n = n.min(len).min(self.written as usize);
-        let start = self.written - n as u64;
-        let head = (start % len as u64) as usize;
-        let first = (len - head).min(n);
-        let mut out = Vec::with_capacity(n);
-        out.extend_from_slice(&self.buf[head..head + first]);
-        out.extend_from_slice(&self.buf[..n - first]);
-        (out, start)
+    /// `slack`: samples the writer may be past `written` mid-callback; any
+    /// copied sample that close to being overwritten is dropped from the front.
+    fn latest(&self, n: usize, slack: u64) -> (Vec<f32>, u64) {
+        let len = self.buf.len() as u64;
+        let end = self.written();
+        let n = (n as u64).min(len.saturating_sub(slack)).min(end);
+        let start = end - n;
+        let out: Vec<f32> =
+            (start..end).map(|i| f32::from_bits(self.buf[(i % len) as usize].load(Ordering::Relaxed))).collect();
+        // If the writer lapped the oldest samples while we copied (the UI
+        // thread stalled for most of the ring's length), drop them.
+        let safe = (self.written() + slack).saturating_sub(len);
+        let skip = safe.saturating_sub(start).min(n) as usize;
+        (out[skip..].to_vec(), start + skip as u64)
     }
 }
 
 struct Shared {
-    ring: Mutex<Ring>,
+    ring: Ring,
     error: Mutex<Option<String>>,
     /// Buffer under/overruns reported by the driver since the stream opened.
     xruns: AtomicU64,
@@ -172,6 +193,10 @@ struct Shared {
     /// Times audio stopped arriving for much longer than one buffer, e.g.
     /// macOS pausing the IO (no mic permission, device grabbed elsewhere).
     gaps: AtomicU64,
+    /// Frames of driver-filled zeros left out of the ring (see `build`).
+    skipped: AtomicU64,
+    /// Set by the error callback on an xrun, cleared by the data callback.
+    xrun_flag: AtomicBool,
 }
 
 /// Input choices that survive a restart.
@@ -209,8 +234,14 @@ pub struct Input {
     pub device_name: String,
     /// The rate the stream runs (or would run) at.
     pub rate: u32,
-    /// Channels the stream is opened with (all the device offers).
+    /// Channels the device has.
     pub channels: u16,
+    /// Channels the stream is opened with: just enough for the selection,
+    /// or all of them while the channel picker meters every channel.
+    stream_channels: u16,
+    /// Reuse the ring on the next open (same device, rate and length), so a
+    /// channel-count reopen keeps the captured audio.
+    keep_ring: bool,
     /// Standard rates the device supports, ascending.
     pub rates: Vec<u32>,
     /// The device's own default rate.
@@ -241,6 +272,8 @@ impl Input {
             device_name: "none".into(),
             rate: 48_000,
             channels: 0,
+            stream_channels: 0,
+            keep_ring: false,
             rates: Vec::new(),
             default_rate: 48_000,
             want_rate: settings.rate,
@@ -321,8 +354,8 @@ impl Input {
     /// Samples the ring holds, and how many of them are filled so far.
     /// `filled == capacity`: a full capture's worth is available.
     pub fn captured(&self) -> (usize, usize) {
-        let ring = self.shared.ring.lock().expect("poisoned");
-        (ring.buf.len(), (ring.written as usize).min(ring.buf.len()))
+        let ring = &self.shared.ring;
+        (ring.buf.len(), (ring.written() as usize).min(ring.buf.len()))
     }
 
     /// Frames per callback as delivered, 0 before the first one.
@@ -330,25 +363,51 @@ impl Input {
         self.shared.callback_frames.load(Ordering::Relaxed)
     }
 
-    /// Measure every channel's level (costs a little per sample, so only
-    /// while someone looks at it).
-    pub fn set_meter_all(&self, on: bool) {
-        self.meter_all.store(on, Ordering::Relaxed);
+    /// Measure every channel's level. Opens the stream with every channel,
+    /// so only while someone looks at it (the channel picker).
+    pub fn set_meter_all(&mut self, on: bool) {
+        if self.meter_all.swap(on, Ordering::Relaxed) != on {
+            self.sync_channels();
+        }
+    }
+
+    /// Channels the stream needs: up to the selected one, or all of them
+    /// while metering. Never more than the device has.
+    fn wanted_channels(&self) -> u16 {
+        let need = if self.meter_all.load(Ordering::Relaxed) {
+            self.channels
+        } else {
+            match self.channel() {
+                ChannelSel::Mono(c) => c + 1,
+                ChannelSel::Pair(c) => c + 2,
+            }
+        };
+        need.clamp(1, self.channels.max(1))
+    }
+
+    /// Reopen the running stream if it carries a different channel count
+    /// than the selection needs, keeping the captured audio.
+    fn sync_channels(&mut self) {
+        if self.paused || self.stream.is_none() || self.wanted_channels() == self.stream_channels {
+            return;
+        }
+        self.keep_ring = true;
+        let id = self.device_id.clone();
+        self.switch(id.as_deref());
     }
 
     /// Every channel's peak since the last call, after gain.
     pub fn take_all_peaks(&self) -> Vec<f32> {
-        let mut ring = self.shared.ring.lock().expect("poisoned");
-        let n = ring.all_peaks.len();
-        std::mem::replace(&mut ring.all_peaks, vec![0.0; n])
+        self.shared.ring.all_peaks.iter().map(|p| f32::from_bits(p.swap(0, Ordering::Relaxed))).collect()
     }
 
     pub fn channel(&self) -> ChannelSel {
         ChannelSel::from_bits(self.channel.load(Ordering::Relaxed))
     }
 
-    pub fn set_channel(&self, sel: ChannelSel) {
+    pub fn set_channel(&mut self, sel: ChannelSel) {
         self.channel.store(sel.to_bits(), Ordering::Relaxed);
+        self.sync_channels();
     }
 
     pub fn paused(&self) -> bool {
@@ -414,12 +473,22 @@ impl Input {
             cpal::SupportedBufferSize::Unknown => Vec::new(),
         };
         let len = (self.rate as usize * self.history_secs as usize).next_power_of_two();
-        self.shared = new_shared(len, self.channels);
+        let keep = std::mem::take(&mut self.keep_ring) && {
+            let ring = &self.shared.ring;
+            ring.buf.len() == len && ring.all_peaks.len() == self.channels as usize
+        };
+        if !keep {
+            self.shared = new_shared(len, self.channels);
+        }
         if self.paused {
             return Ok(());
         }
 
         let mut sc: cpal::StreamConfig = config.config();
+        // CoreAudio hands over the first N channels; asking for 2 of 14
+        // keeps the per-callback work and copying small.
+        sc.channels = self.wanted_channels();
+        self.stream_channels = sc.channels;
         if let Some(b) = self.want_buffer.filter(|b| self.buffer_sizes.contains(b)) {
             sc.buffer_size = cpal::BufferSize::Fixed(b);
         }
@@ -444,19 +513,25 @@ impl Input {
 
     /// The last `n` samples for the modules to analyse.
     pub fn frame(&self, n: usize) -> Frame {
-        let (samples, start) = self.shared.ring.lock().expect("poisoned").latest(n);
+        // Two callbacks' worth of margin (or a generous guess before the
+        // first one) against the writer catching up to the copy.
+        let slack = match self.callback_frames() {
+            0 => 8192,
+            f => 2 * f as u64,
+        };
+        let (samples, start) = self.shared.ring.latest(n, slack);
         Frame { samples, rate: self.rate, start }
     }
 
     /// Per-channel (L, R) peak since the last call, after gain. A mono
     /// selection reports the same value for both.
     pub fn take_peaks(&self) -> [f32; 2] {
-        std::mem::take(&mut self.shared.ring.lock().expect("poisoned").peaks)
+        self.shared.ring.peaks.each_ref().map(|p| f32::from_bits(p.swap(0, Ordering::Relaxed)))
     }
 
     /// The last `n` L/R frames, after gain.
     pub fn scope(&self, n: usize) -> Vec<(f32, f32)> {
-        self.shared.ring.lock().expect("poisoned").latest_stereo(n)
+        self.shared.ring.latest_stereo(n)
     }
 
     pub fn is_stereo(&self) -> bool {
@@ -475,6 +550,11 @@ impl Input {
         self.shared.gaps.load(Ordering::Relaxed)
     }
 
+    /// Frames of driver-filled zeros left out of the capture.
+    pub fn skipped(&self) -> u64 {
+        self.shared.skipped.load(Ordering::Relaxed)
+    }
+
     /// Driver-reported dropouts since the stream (re)opened.
     pub fn xruns(&self) -> u64 {
         self.shared.xruns.load(Ordering::Relaxed)
@@ -487,11 +567,13 @@ impl Input {
 
 fn new_shared(len: usize, channels: u16) -> Arc<Shared> {
     Arc::new(Shared {
-        ring: Mutex::new(Ring::new(len, channels)),
+        ring: Ring::new(len, channels),
         error: Mutex::new(None),
         xruns: AtomicU64::new(0),
         callback_frames: AtomicU32::new(0),
         gaps: AtomicU64::new(0),
+        skipped: AtomicU64::new(0),
+        xrun_flag: AtomicBool::new(false),
     })
 }
 
@@ -511,13 +593,16 @@ where
     let Taps { sh, gain, channel, meter_all } = taps;
     let ch = config.channels.max(1) as usize;
     let err_sh = sh.clone();
-    // Converted outside the lock, then copied in one go, so the UI thread
-    // reading the ring holds the callback up as little as possible.
-    let mut block: Vec<[f32; 3]> = Vec::with_capacity(8192);
-    let mut all = vec![0f32; ch];
     let rate = config.sample_rate.max(1) as f32;
+    let mut all = vec![0f32; ch];
     let t0 = std::time::Instant::now();
     let mut last_cb: Option<f32> = None;
+    // Set after a late callback or an xrun, cleared by the first block with
+    // any signal. While set, all-zero blocks are what the driver fills in
+    // for audio it didn't get, so they stay out of the ring. A healthy
+    // stream never sets it, so real digital silence (a USB synth between
+    // hits) is still captured.
+    let mut trouble = false;
     device
         .build_input_stream(
             config,
@@ -536,11 +621,29 @@ where
                 // paused, not just a late callback.
                 let now = t0.elapsed().as_secs_f32();
                 if let Some(prev) = last_cb.replace(now) {
-                    if now - prev > (4.0 * frames as f32 / rate).max(0.05) {
+                    let late = now - prev;
+                    if late > (4.0 * frames as f32 / rate).max(0.05) {
                         sh.gaps.fetch_add(1, Ordering::Relaxed);
                     }
+                    if late > 2.5 * frames as f32 / rate {
+                        trouble = true;
+                    }
                 }
-                block.clear();
+                if sh.xrun_flag.swap(false, Ordering::Relaxed) {
+                    trouble = true;
+                }
+                if trouble {
+                    if data.iter().all(|&x| f32::from_sample(x) == 0.0) {
+                        sh.skipped.fetch_add(frames as u64, Ordering::Relaxed);
+                        return;
+                    }
+                    trouble = false;
+                }
+                let ring = &sh.ring;
+                // Only this callback writes, so the published counts are ours.
+                let mut w = ring.written.load(Ordering::Relaxed);
+                let mut sw = ring.stereo_written.load(Ordering::Relaxed);
+                let mut pk = [0f32; 2];
                 for frame in data.chunks_exact(ch) {
                     let at = |i: usize| f32::from_sample(frame[i]) * g;
                     if metering {
@@ -548,23 +651,29 @@ where
                             *p = p.max(at(i).abs());
                         }
                     }
-                    block.push(match sel {
+                    let (m, l, r) = match sel {
                         ChannelSel::Mono(c) => {
                             let v = at(c as usize);
-                            [v, v, v]
+                            (v, v, v)
                         }
                         ChannelSel::Pair(c) => {
                             let (l, r) = (at(c as usize), at(c as usize + 1));
-                            [(l + r) * 0.5, l, r]
+                            ((l + r) * 0.5, l, r)
                         }
-                    });
+                    };
+                    ring.write(w, m, sw, l, r);
+                    w += 1;
+                    sw += 1;
+                    pk[0] = pk[0].max(l.abs());
+                    pk[1] = pk[1].max(r.abs());
                 }
-                if let Ok(mut ring) = sh.ring.lock() {
-                    ring.extend(&block);
-                    if metering {
-                        for (dst, src) in ring.all_peaks.iter_mut().zip(all.iter_mut()) {
-                            *dst = dst.max(std::mem::take(src));
-                        }
+                ring.publish(w, sw);
+                for (dst, p) in ring.peaks.iter().zip(pk) {
+                    dst.fetch_max(p.to_bits(), Ordering::Relaxed);
+                }
+                if metering {
+                    for (dst, src) in ring.all_peaks.iter().zip(all.iter_mut()) {
+                        dst.fetch_max(std::mem::take(src).to_bits(), Ordering::Relaxed);
                     }
                 }
             },
@@ -573,6 +682,7 @@ where
                 // device/rate changes): count them, don't latch an error.
                 if matches!(err.kind(), cpal::ErrorKind::Xrun) {
                     err_sh.xruns.fetch_add(1, Ordering::Relaxed);
+                    err_sh.xrun_flag.store(true, Ordering::Relaxed);
                 } else if let Ok(mut e) = err_sh.error.lock() {
                     *e = Some(err.to_string());
                 }

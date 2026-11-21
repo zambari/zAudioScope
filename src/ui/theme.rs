@@ -11,6 +11,8 @@ pub const ACCENT_BRIGHT: Color32 = Color32::from_rgb(236, 132, 44);
 pub const ON_ACCENT: Color32 = Color32::from_rgb(255, 238, 222);
 /// Main waveform colour.
 pub const WAVE: Color32 = Color32::from_rgb(178, 200, 214);
+/// Draggable graph handles (thresholds, zoom, speed).
+pub const HANDLE: Color32 = Color32::from_rgb(222, 78, 60);
 /// In tune / within tolerance.
 pub const GOOD: Color32 = Color32::from_rgb(80, 200, 120);
 

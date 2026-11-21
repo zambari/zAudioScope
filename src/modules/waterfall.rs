@@ -1,17 +1,33 @@
 //! Rolling spectrum waterfall, newest row at the top. Uses the warped
 //! frequency axis from KitPool's sample editor so the bass gets room.
+//! Handles: two along the bottom pick the shown frequency range (placed on
+//! the full-range axis, with a thin strip marking the zoom), one on the
+//! right sets the scroll speed.
 
 use std::collections::VecDeque;
 
 use serde::{Deserialize, Serialize};
 
-use egui::{Color32, ColorImage, Rect, TextureHandle, TextureOptions, Ui};
+use egui::{Color32, ColorImage, Rect, Stroke, TextureHandle, TextureOptions, Ui, pos2};
 
 use super::{Module, Shared};
 use crate::audio::spectrum::{self, Bands};
+use crate::ui::handle::EdgeHandle;
+use crate::ui::plot::{self, Axis, Edge, Link, Scale};
 use crate::ui::theme;
 
-const BANDS: usize = 256;
+/// Across the full range; zooming shows a slice of these.
+const BANDS: usize = 512;
+const ROW_MS: (f32, f32) = (2.0, 100.0);
+/// Narrowest zoom, as a ratio of top to bottom frequency.
+const MIN_ZOOM: f32 = 1.25;
+
+#[derive(Clone, Copy, PartialEq)]
+enum Key {
+    Lo,
+    Hi,
+    Speed,
+}
 
 /// The persisted settings.
 #[derive(Serialize, Deserialize)]
@@ -25,11 +41,23 @@ struct Params {
     follow_gate: bool,
     /// Audio time per row, so the scroll speed doesn't depend on the frame rate.
     row_ms: f32,
+    /// Shown frequency range, Hz.
+    f_lo: f32,
+    f_hi: f32,
 }
 
 impl Default for Params {
     fn default() -> Self {
-        Self { fft_pow: 12, rows: 160, floor_db: -90.0, range_db: 80.0, follow_gate: false, row_ms: 15.0 }
+        Self {
+            fft_pow: 12,
+            rows: 160,
+            floor_db: -90.0,
+            range_db: 80.0,
+            follow_gate: false,
+            row_ms: 15.0,
+            f_lo: spectrum::F_MIN,
+            f_hi: 24_000.0,
+        }
     }
 }
 
@@ -43,7 +71,9 @@ impl Params {
         self.rows = self.rows.clamp(20, 600);
         self.floor_db = self.floor_db.clamp(spectrum::FLOOR_DB, -20.0);
         self.range_db = self.range_db.clamp(20.0, 100.0);
-        self.row_ms = self.row_ms.clamp(2.0, 100.0);
+        self.row_ms = self.row_ms.clamp(ROW_MS.0, ROW_MS.1);
+        self.f_hi = self.f_hi.clamp(spectrum::F_MIN * MIN_ZOOM, 48_000.0);
+        self.f_lo = self.f_lo.clamp(spectrum::F_MIN, self.f_hi / MIN_ZOOM);
     }
 }
 
@@ -63,6 +93,7 @@ pub struct Waterfall {
     /// The texture is out of date.
     dirty: bool,
     texture: Option<TextureHandle>,
+    link: Link<Key>,
 }
 
 /// Dark → accent orange → near white.
@@ -155,11 +186,16 @@ impl Module for Waterfall {
         ui.add(egui::Slider::new(&mut self.p.rows, 20..=600).text("history"));
         ui.add(egui::Slider::new(&mut self.p.floor_db, spectrum::FLOOR_DB..=-20.0).text("floor dB"));
         ui.add(egui::Slider::new(&mut self.p.range_db, 20.0..=100.0).text("range dB"));
-        ui.add(egui::Slider::new(&mut self.p.row_ms, 2.0..=100.0).logarithmic(true).text("ms / row"));
+        let link = &mut self.link;
+        link.slider(ui, Key::Speed, egui::Slider::new(&mut self.p.row_ms, ROW_MS.0..=ROW_MS.1).logarithmic(true).text("ms / row"));
+        link.slider(ui, Key::Lo, egui::Slider::new(&mut self.p.f_lo, spectrum::F_MIN..=5000.0).logarithmic(true).suffix(" Hz").text("from"));
+        link.slider(ui, Key::Hi, egui::Slider::new(&mut self.p.f_hi, 50.0..=24_000.0).logarithmic(true).suffix(" Hz").text("to"));
+        self.p.f_lo = self.p.f_lo.min(self.p.f_hi / MIN_ZOOM);
         ui.checkbox(&mut self.p.follow_gate, "only gated window");
     }
 
     fn graph(&mut self, ui: &mut Ui, rect: Rect, shared: &Shared) {
+        self.link.tick(ui.input(|i| i.stable_dt).clamp(0.0, 0.1));
         if self.history.is_empty() {
             return;
         }
@@ -190,30 +226,66 @@ impl Module for Waterfall {
 }
 
 impl Waterfall {
-    fn paint(&self, ui: &mut Ui, rect: Rect, shared: &Shared) {
-        let Some(tex) = &self.texture else { return };
-        ui.painter_at(rect).image(
-            tex.id(),
-            rect,
-            Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-            Color32::WHITE,
-        );
-        // Frequency grid.
+    fn paint(&mut self, ui: &mut Ui, rect: Rect, shared: &Shared) {
+        let Some(tex) = self.texture.as_ref().map(|t| t.id()) else { return };
+        let painter = ui.painter_at(rect);
         let f_max = shared.frame.rate as f32 / 2.0;
-        for f in [50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0] {
-            if f >= f_max {
-                break;
-            }
-            let x = rect.left() + spectrum::axis_pos(f, f_max) * rect.width();
-            ui.painter().vline(x, rect.y_range(), egui::Stroke::new(1.0, Color32::from_white_alpha(18)));
-            let label = if f >= 1000.0 { format!("{}k", f / 1000.0) } else { format!("{f}") };
-            ui.painter().text(
-                egui::pos2(x + 2.0, rect.bottom() - 2.0),
-                egui::Align2::LEFT_BOTTOM,
-                label,
-                egui::FontId::monospace(10.0),
-                Color32::from_white_alpha(90),
-            );
+        let f_hi = self.p.f_hi.min(f_max);
+        let f_lo = self.p.f_lo.min(f_hi / MIN_ZOOM);
+        let (u0, u1) = (spectrum::axis_pos(f_lo, f_max), spectrum::axis_pos(f_hi, f_max));
+        painter.image(tex, rect, Rect::from_min_max(pos2(u0, 0.0), pos2(u1, 1.0)), Color32::WHITE);
+
+        // Frequency along the bottom (zoomed), time ago down the left.
+        let shown = Scale::warped(spectrum::warp, spectrum::unwarp, (f_lo, f_hi), (rect.left(), rect.right()));
+        Axis::new(Edge::Bottom, shown).spacing(48.0).draw(&painter, rect, plot::fmt_hz);
+        let secs = self.p.rows as f32 * self.p.row_ms / 1000.0;
+        Axis::new(Edge::Left, Scale::linear((0.0, secs), (rect.top(), rect.bottom())))
+            .spacing(32.0)
+            .grid(false)
+            .draw(&painter, rect, plot::fmt_secs);
+
+        // Zoom handles live on the full-range axis; a strip shows the slice.
+        let full = Scale::warped(spectrum::warp, spectrum::unwarp, (spectrum::F_MIN, f_max), (rect.left(), rect.right()));
+        if f_lo > spectrum::F_MIN * 1.01 || f_hi < f_max * 0.99 {
+            let y = rect.bottom() - 1.0;
+            painter.hline(rect.x_range(), y, Stroke::new(2.0, Color32::from_white_alpha(14)));
+            painter.hline(full.px(f_lo)..=full.px(f_hi), y, Stroke::new(2.0, theme::HANDLE.gamma_multiply(0.45)));
+        }
+        let fmt = |f: f32| format!("from {} Hz", plot::fmt_hz(f));
+        let r = EdgeHandle::new("wf_lo", Edge::Bottom, full, &mut self.p.f_lo)
+            .clamp(spectrum::F_MIN, f_hi / MIN_ZOOM)
+            .reset(spectrum::F_MIN)
+            .guide(false)
+            .label(&fmt)
+            .show(ui, rect);
+        if r.hovered() || r.dragged() {
+            self.link.touch(Key::Lo);
+        }
+        let fmt = |f: f32| format!("to {} Hz", plot::fmt_hz(f));
+        let r = EdgeHandle::new("wf_hi", Edge::Bottom, full, &mut self.p.f_hi)
+            .clamp(self.p.f_lo * MIN_ZOOM, f_max)
+            .reset(f_max)
+            .guide(false)
+            .label(&fmt)
+            .show(ui, rect);
+        if r.hovered() || r.dragged() {
+            self.link.touch(Key::Hi);
+        }
+
+        // Speed on the right: up is faster.
+        let speed = Scale::log(ROW_MS, (rect.top() + 6.0, rect.bottom() - 6.0));
+        let rows = self.p.rows as f32;
+        let fmt = |ms: f32| format!("{} ms/row · {}", plot::trim(ms), plot::fmt_secs(rows * ms / 1000.0));
+        let r = EdgeHandle::new("wf_speed", Edge::Right, speed, &mut self.p.row_ms).reset(15.0).guide(false).label(&fmt).show(ui, rect);
+        if r.hovered() || r.dragged() {
+            self.link.touch(Key::Speed);
+        }
+
+        match self.link.shown() {
+            Some(Key::Lo) => self.link.point_x(ui, rect, full.px(self.p.f_lo)),
+            Some(Key::Hi) => self.link.point_x(ui, rect, full.px(self.p.f_hi.min(f_max))),
+            Some(Key::Speed) => self.link.point_y(ui, rect, speed.px(self.p.row_ms)),
+            None => {}
         }
     }
 }
