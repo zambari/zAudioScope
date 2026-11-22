@@ -16,7 +16,7 @@ use crate::ui::noterange::A4;
 use crate::ui::plot::{self, Axis, Edge, Scale};
 use crate::ui::theme;
 
-pub const TITLE: &str = "Spectral Graph";
+pub const TITLE: &str = "Graph";
 
 /// Cost stages, in `Costs` order (0 is decimation, see `NoteInput::next`).
 const STAGES: [&str; 2] = ["decimate", "spectrum"];

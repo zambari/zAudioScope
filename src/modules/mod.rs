@@ -17,15 +17,15 @@
 //! 5. `Module::graph` draws. Then `Shared::finish` drops every cached
 //!    result and hands the FFT plans back for the next frame.
 
+pub mod impulse;
 pub mod midi;
 mod note_input;
 pub mod note_spectrum;
 mod perf;
 pub mod scope;
-pub mod spectrogram;
+pub mod waterfall;
 mod spectrum_rows;
 pub mod tuner;
-pub mod waterfall;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -48,9 +48,48 @@ pub struct Gate {
     pub window: Option<(u64, u64)>,
 }
 
-/// FFT plans (window, twiddles, scratch) by size; they outlive frames.
+/// FFT plans (window, twiddles, scratch) by size, plus debug counters for
+/// the per-frame spectrum cache. Everything here outlives frames.
 #[derive(Default)]
-pub struct FftPlans(HashMap<usize, Fft>);
+pub struct FftPlans {
+    plans: HashMap<usize, Fft>,
+    /// Work counted so far in the frame being analysed.
+    pending: FftCounts,
+    /// The last completed frame.
+    pub last_frame: FftCounts,
+    /// Everything since the app started.
+    pub total: FftCounts,
+}
+
+/// How FFT work splits between computing spectra and reusing the cache.
+#[derive(Default, Clone, Copy, Debug)]
+pub struct FftCounts {
+    /// Spectra computed (cache miss, or an uncached transform).
+    pub computed: u64,
+    /// Requests answered from the frame cache without computing.
+    pub reused: u64,
+    /// Cached spectra thrown away at the end of a frame.
+    pub discarded: u64,
+}
+
+impl FftCounts {
+    fn add(&mut self, other: FftCounts) {
+        self.computed += other.computed;
+        self.reused += other.reused;
+        self.discarded += other.discarded;
+    }
+}
+
+impl FftPlans {
+    /// Two-line debug summary of the FFT cache, for the profiler overlay.
+    pub fn report(&self) -> String {
+        let (f, t) = (self.last_frame, self.total);
+        format!(
+            "FFT last frame: {} computed · {} reused · {} discarded\nFFT total: {} computed · {} reused · {} discarded\n",
+            f.computed, f.reused, f.discarded, t.computed, t.reused, t.discarded
+        )
+    }
+}
 
 /// Results computed at most once per frame.
 #[derive(Default)]
@@ -98,9 +137,16 @@ impl Shared {
         }
     }
 
-    /// End of frame: drop every cached result, keep the FFT plans.
+    /// End of frame: drop every cached result, keep the FFT plans, and roll
+    /// this frame's counters into the totals.
     pub fn finish(self) -> FftPlans {
-        self.plans.into_inner()
+        let discarded = self.cache.into_inner().spectra.len() as u64;
+        let mut plans = self.plans.into_inner();
+        let mut frame = std::mem::take(&mut plans.pending);
+        frame.discarded = discarded;
+        plans.total.add(frame);
+        plans.last_frame = frame;
+        plans
     }
 
     /// Samples to analyse: the gated window if there is one, otherwise the
@@ -125,29 +171,38 @@ impl Shared {
         let start = start.max(end.saturating_sub(n as u64));
         let key = (n, start, end);
         if let Some(s) = self.cache.borrow().spectra.get(&key) {
+            self.plans.borrow_mut().pending.reused += 1;
             return s.clone();
         }
-        let f = &self.frame;
-        let mut x = vec![0f32; n];
-        // x[i] holds absolute sample end - n + i.
-        let first = end as i128 - n as i128;
-        for (i, v) in x.iter_mut().enumerate() {
-            let at = first + i as i128;
-            if at >= start as i128 && at >= f.start as i128 && at < f.end() as i128 {
-                *v = f.samples[(at - f.start as i128) as usize];
-            }
-        }
-        let power: Rc<[f32]> = {
-            let mut plans = self.plans.borrow_mut();
-            plans
-                .0
-                .entry(n)
-                .or_insert_with(|| Fft::new(n))
-                .power(&x)
-                .into()
-        };
+        let power = self.fft_power(&take(&self.frame, n, (start, end)));
         self.cache.borrow_mut().spectra.insert(key, power.clone());
         power
+    }
+
+    /// Run the `x.len()`-point plan on `x`.
+    fn fft_power(&self, x: &[f32]) -> Rc<[f32]> {
+        let mut plans = self.plans.borrow_mut();
+        plans.pending.computed += 1;
+        plans.plans.entry(x.len()).or_insert_with(|| Fft::new(x.len())).power(x).into()
+    }
+
+    /// Power spectrum (`n/2 + 1` bins) of the latest audio at `1/factor` of
+    /// the rate, for fine low-frequency resolution: bins are
+    /// `rate / factor / n` Hz wide. Only the tail it needs is decimated.
+    /// Not memoized (one caller).
+    pub fn decimated_spectrum(&self, factor: u32, n: usize) -> Rc<[f32]> {
+        assert!(factor.is_power_of_two());
+        let f = &self.frame;
+        let need = (n + 8) * factor as usize;
+        let tail = &f.samples[f.samples.len().saturating_sub(need)..];
+        let mut d = Frame { samples: tail.to_vec(), rate: f.rate, start: f.end() - tail.len() as u64 };
+        let mut k = factor;
+        while k > 1 {
+            d = halve(&d);
+            k /= 2;
+        }
+        let end = d.end();
+        self.fft_power(&take(&d, n, (0, end)))
     }
 
     /// The largest spectrum some module already computed this frame, as
@@ -156,7 +211,10 @@ impl Shared {
     pub fn any_spectrum(&self, fallback: usize) -> (usize, Rc<[f32]>, bool) {
         let cached = self.cache.borrow().spectra.iter().max_by_key(|(k, _)| (k.0, k.2)).map(|(k, v)| (k.0, v.clone()));
         match cached {
-            Some((n, p)) => (n, p, true),
+            Some((n, p)) => {
+                self.plans.borrow_mut().pending.reused += 1;
+                (n, p, true)
+            }
             None => {
                 let end = self.frame.end();
                 (fallback, self.spectrum(fallback, (end.saturating_sub(fallback as u64), end)), false)
@@ -187,10 +245,25 @@ impl Shared {
     }
 }
 
+/// `n` samples of `f` ending at absolute `end`; anything before `start` or
+/// outside the frame reads as silence.
+fn take(f: &Frame, n: usize, (start, end): (u64, u64)) -> Vec<f32> {
+    let first = end as i128 - n as i128;
+    (0..n)
+        .map(|i| {
+            let at = first + i as i128;
+            if at >= start as i128 && at >= f.start as i128 && at < f.end() as i128 {
+                f.samples[(at - f.start as i128) as usize]
+            } else {
+                0.0
+            }
+        })
+        .collect()
+}
+
 /// Halve the rate: a 5-tap binomial low-pass, then every other sample,
 /// keeping even absolute indices so repeated halving stays aligned. Gentle
 /// (about −6 dB at the new Nyquist), fine for display and pitch of low notes.
-#[allow(dead_code)]
 fn halve(f: &Frame) -> Frame {
     let x = &f.samples;
     let at = |i: isize| x[i.clamp(0, x.len() as isize - 1) as usize];
@@ -255,6 +328,11 @@ pub trait Module {
     fn stack_over(&self) -> Option<&'static str> {
         None
     }
+    /// `true` for analyzers that appear only on their own solo page, never in
+    /// the display stack or its inspector.
+    fn solo_only(&self) -> bool {
+        false
+    }
     /// Everything `graph` draws except the background and grid, over the
     /// [`Self::stack_over`] module's full graph in the same rect.
     fn overlay(&mut self, ui: &mut Ui, rect: Rect, shared: &Shared) {
@@ -284,10 +362,10 @@ pub fn all() -> Vec<Slot> {
     };
     vec![
         slot(Box::new(scope::Scope::default())),
-        slot(Box::new(note_spectrum::NoteSpectrum::default())),
         slot(Box::new(tuner::Tuner::default())),
-        slot(Box::new(spectrogram::Spectrogram::default())),
         slot(Box::new(waterfall::Waterfall::default())),
+        slot(Box::new(note_spectrum::NoteSpectrum::default())),
+        slot(Box::new(impulse::Impulse::default())),
         slot(Box::new(midi::MidiMonitor::default())),
     ]
 }

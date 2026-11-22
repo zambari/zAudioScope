@@ -1,5 +1,5 @@
 //! The dB floor / ceiling control every level-scaled view uses (tuner
-//! spectrum, spectrogram, 3D waterfall), with its limits defined once here.
+//! spectrum, waterfall, Impulse), with its limits defined once here.
 //!
 //! Each control has its own persisted range plus a padlock. Locked controls
 //! all read and write one shared range ([`Shared::db`], kept by the app), so

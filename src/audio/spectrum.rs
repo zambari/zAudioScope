@@ -1,11 +1,11 @@
-//! Short-time spectra for the spectrogram and waterfall: a small radix-2 FFT, a Hann window,
+//! Short-time spectra for the waterfall and Impulse: a small radix-2 FFT, a Hann window,
 //! and log-spaced display bands (the shared note axis is log frequency).
 
 use std::f32::consts::TAU;
 
 /// Display tilt, dB per octave around 1 kHz, so typical program material
 /// (which falls off with frequency) looks roughly level.
-const TILT_DB_PER_OCT: f32 = 3.0;
+pub const TILT_DB_PER_OCT: f32 = 3.0;
 /// Below this, a bin reads as silence.
 pub const FLOOR_DB: f32 = -96.0;
 

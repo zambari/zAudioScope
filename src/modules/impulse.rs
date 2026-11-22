@@ -1,8 +1,8 @@
-//! Rotatable 3D waterfall (after sample_manager's stats panel): one spectrum
+//! Impulse: a rotatable 3D waterfall (after sample_manager's stats panel): one spectrum
 //! per row, newest at the front, older rows stepping back up and to the
 //! right and fading into the background. Frequency has its own range;
 //! the shared note range highlights the active spectrum. Shares
-//! its rows and settings with the spectrogram (see `spectrum_rows`).
+//! its rows and settings with the waterfall (see `spectrum_rows`).
 
 use egui::{Align2, Mesh, Rect, Stroke, Ui, pos2, vec2};
 
@@ -27,7 +27,7 @@ const WINDOW_MS: (f32, f32) = (50.0, 4000.0);
 const DEFAULT_WINDOW_MS: f32 = 500.0;
 const SLICES: (usize, usize) = (20, 100);
 
-pub struct Waterfall {
+pub struct Impulse {
     p: Params,
     range_hz: (f32, f32),
     // Camera framing is session-only; only analysis parameters are persisted.
@@ -43,7 +43,7 @@ pub struct Waterfall {
     link: Link<Key>,
 }
 
-impl Default for Waterfall {
+impl Default for Impulse {
     fn default() -> Self {
         Self {
             p: Params::with_rows(48),
@@ -60,12 +60,15 @@ impl Default for Waterfall {
     }
 }
 
-impl Module for Waterfall {
+impl Module for Impulse {
     fn title(&self) -> &'static str {
-        "Waterfall3D"
+        "Impulse"
     }
 
-    // Own key: "Waterfall" used to hold the spectrogram's settings.
+    fn solo_only(&self) -> bool {
+        true
+    }
+
     fn save_params(&self, storage: &mut dyn eframe::Storage, key: &str) {
         eframe::set_value(storage, &format!("{key}.3d"), &self.p);
         eframe::set_value(storage, &format!("{key}.range_hz"), &self.range_hz);
@@ -79,11 +82,7 @@ impl Module for Waterfall {
                 self.fade_speed = speed.clamp(0.0, 10.0);
             }
         }
-        if let Some(p) = Params::load(
-            storage,
-            &format!("{key}.3d"),
-            Some(&format!("{}.3d", key.replace("Waterfall3D", "Waterfall"))),
-        ) {
+        if let Some(p) = Params::load(storage, &format!("{key}.3d")) {
             self.p = p;
         }
         // Older saves only had rows and ms/row: keep the same depth.
@@ -163,7 +162,7 @@ impl Module for Waterfall {
         let drag_rect = Rect::from_min_max(plot.min, plot.max - vec2(16.0, 0.0));
         let response = ui.interact(
             drag_rect,
-            ui.scope_id().with("waterfall3d_rotation"),
+            ui.scope_id().with("impulse_rotation"),
             egui::Sense::click_and_drag(),
         );
         if response.double_clicked() {
@@ -371,7 +370,7 @@ impl Module for Waterfall {
         spectrum_rows::time_handle(
             ui,
             rect,
-            "waterfall_speed",
+            "impulse_speed",
             &mut self.link,
             &mut self.window_ms,
             WINDOW_MS,
@@ -381,7 +380,7 @@ impl Module for Waterfall {
     }
 }
 
-impl Waterfall {
+impl Impulse {
     /// Derive rows and ms/row so `slices` rows span exactly `window_ms`.
     fn apply_window(&mut self) {
         self.p.rows = self.slices;

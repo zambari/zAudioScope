@@ -1,4 +1,4 @@
-//! Rolling spectrogram, newest row at the top. The frequency axis is the
+//! Rolling waterfall, newest row at the top. The frequency axis is the
 //! shared note range (log frequency, set in the bar above the status bar):
 //! rows are kept across the bar's whole span and the texture is cropped to
 //! the selection, so changing the range keeps the history. The handle on
@@ -13,7 +13,7 @@ use super::{Module, Shared};
 use crate::ui::plot::{self, Axis, Edge, Link, Scale};
 
 #[derive(Default)]
-pub struct Spectrogram {
+pub struct Waterfall {
     p: Params,
     rows: Rows,
     /// The rows as colours, made once per row instead of every frame.
@@ -26,9 +26,9 @@ pub struct Spectrogram {
     link: Link<Key>,
 }
 
-impl Module for Spectrogram {
+impl Module for Waterfall {
     fn title(&self) -> &'static str {
-        "Spectrogram"
+        "Waterfall"
     }
 
     fn save_params(&self, storage: &mut dyn eframe::Storage, key: &str) {
@@ -36,9 +36,7 @@ impl Module for Spectrogram {
     }
 
     fn load_params(&mut self, storage: &dyn eframe::Storage, key: &str) {
-        // Saved as "Waterfall" before the 3D waterfall took that name.
-        let legacy = key.replace(self.title(), "Waterfall");
-        if let Some(p) = Params::load(storage, key, Some(&legacy)) {
+        if let Some(p) = Params::load(storage, key) {
             self.p = p;
         }
     }
@@ -77,7 +75,7 @@ impl Module for Spectrogram {
     }
 }
 
-impl Spectrogram {
+impl Waterfall {
     /// Bring the texture up to date with the rows and colour scale.
     fn refresh(&mut self, ui: &Ui) {
         // Colour scale changed: recolour what we have.
@@ -96,7 +94,7 @@ impl Spectrogram {
             }
             match &mut self.texture {
                 Some(t) => t.set(img, TextureOptions::LINEAR),
-                None => self.texture = Some(ui.ctx().load_texture("spectrogram", img, TextureOptions::LINEAR)),
+                None => self.texture = Some(ui.ctx().load_texture("waterfall", img, TextureOptions::LINEAR)),
             }
         }
     }
@@ -124,6 +122,6 @@ impl Spectrogram {
             .grid(false)
             .draw(&painter, rect, plot::fmt_secs);
 
-        self.p.speed_handle(ui, rect, "spectrogram_speed", &mut self.link);
+        self.p.speed_handle(ui, rect, "waterfall_speed", &mut self.link);
     }
 }

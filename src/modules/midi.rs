@@ -273,6 +273,11 @@ impl Module for MidiMonitor {
     }
 
     fn top_row(&mut self, ui: &mut Ui) {
+        // No open port means no channels to pick from; the port itself is
+        // chosen in the app's top bar. The saved filter is kept meanwhile.
+        if !self.connected {
+            return;
+        }
         ui.label("Source");
         if ui
             .selectable_label(self.p.channel.is_none(), "all")

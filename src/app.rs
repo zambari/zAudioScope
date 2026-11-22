@@ -95,12 +95,6 @@ impl App {
                 .modules
                 .iter()
                 .find(|m| m.0 == slot.module.title())
-                .or_else(|| {
-                    saved
-                        .modules
-                        .iter()
-                        .find(|m| slot.module.title() == "Waterfall3D" && m.0 == "Waterfall")
-                })
             {
                 (slot.visible, slot.open) = (*v, *o);
             }
@@ -214,11 +208,6 @@ impl App {
                 }
             }
             ui.separator();
-            for slot in &mut self.slots {
-                if !matches!(slot.module.title(), "Tuner" | "Spectrogram" | "Waterfall3D" | "MIDI") {
-                    ui.toggle_value(&mut slot.visible, slot.module.title());
-                }
-            }
             ui.label("Debug");
             ui.add(ui::widgets::flicktoggle(&mut self.profiler.enabled))
                 .on_hover_text("Show UI-thread load and per-module timings");
@@ -530,6 +519,9 @@ impl eframe::App for App {
         self.db = shared.db.get().sanitized();
         // Frame done: drop the cached spectra, keep the plans.
         self.fft_plans = shared.finish();
+        if self.profiler.enabled {
+            self.profiler.note = self.fft_plans.report();
+        }
         self.profiler.finish(ui, timing, debug_origin);
         ui.ctx().request_repaint();
     }

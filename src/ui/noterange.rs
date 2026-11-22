@@ -1,5 +1,5 @@
 //! The shared note / frequency range: one span of notes that every
-//! frequency-axis analyser (tuner, spectrogram, waterfall, MIDI roll) uses for its x
+//! frequency-axis analyser (tuner, waterfall, Impulse, MIDI roll) uses for its x
 //! axis, so a given pitch sits at the same x in all of them.
 //!
 //! The axis is linear in MIDI note number, i.e. logarithmic in frequency
@@ -13,7 +13,7 @@ use egui::{Align2, Color32, CursorIcon, FontId, Rect, Sense, Stroke, Ui, pos2, v
 use serde::{Deserialize, Serialize};
 
 use super::plot::{self, Scale};
-use super::outside::Outside;
+use super::outside::{AIR_W, Outside};
 use super::theme;
 use super::widgets::{Grab, clamp_pair};
 use crate::pitch;
@@ -129,9 +129,13 @@ fn strip(ui: &mut Ui, range: &mut NoteRange, marks: &[f32], outside: Option<&Out
     let (rect, resp) =
         ui.allocate_exact_size(vec2(ui.available_width(), 36.0), Sense::click_and_drag());
     let full = NoteRange::BOUNDS;
-    let notes = full.scale(rect);
+    // With side spectra, an "air" zone right of the keys shows bar top .. Nyquist.
+    let air_w = if outside.is_some() { AIR_W } else { 0.0 };
+    let main = Rect::from_min_max(rect.min, pos2(rect.right() - air_w, rect.bottom()));
+    let notes = full.scale(main);
     let label_h = 12.0;
-    let keys = Rect::from_min_max(pos2(rect.left(), rect.top() + label_h), rect.max);
+    let keys = Rect::from_min_max(pos2(main.left(), main.top() + label_h), main.max);
+    let air = Rect::from_min_max(pos2(keys.right() + 2.0, keys.top()), pos2(rect.right(), keys.bottom()));
 
     // ---- interaction ------------------------------------------------------
     let (mut lo, mut hi) = (range.lo as f32, range.hi as f32);
@@ -223,7 +227,7 @@ fn strip(ui: &mut Ui, range: &mut NoteRange, marks: &[f32], outside: Option<&Out
     p.rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
 
     // Hz labels: log ticks across the full span.
-    let hz = full.hz_scale(rect);
+    let hz = full.hz_scale(main);
     for t in hz.ticks(34.0) {
         let x = hz.px(t.value);
         p.vline(
@@ -292,11 +296,15 @@ fn strip(ui: &mut Ui, range: &mut NoteRange, marks: &[f32], outside: Option<&Out
         shade,
     );
     if let Some(o) = outside {
-        o.paint(
-            &p,
-            Rect::from_min_max(keys.min, pos2(sel.left(), keys.bottom())),
-            Rect::from_min_max(pos2(sel.right(), keys.top()), keys.max),
+        p.rect_filled(air, 0.0, Color32::from_gray(14));
+        p.text(
+            pos2(air.right(), rect.top() + 1.0),
+            Align2::RIGHT_TOP,
+            format!("→{}", plot::fmt_hz(pitch::midi_to_freq(o.hi.midi.1, A4).round())),
+            FontId::monospace(9.0),
+            Color32::from_gray(140),
         );
+        o.paint(&p, keys, (sel.left(), sel.right()), air, *range);
     }
     p.rect_filled(sel, 0.0, theme::ACCENT.gamma_multiply(0.18));
     p.rect_stroke(

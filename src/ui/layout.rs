@@ -16,8 +16,6 @@ const INSPECTOR_MIN: f32 = 270.0;
 const DISPLAY_MIN: f32 = 72.0;
 /// Height reserved for the tab row above the display column.
 const TABS: f32 = 24.0;
-/// FFT size for the range bar's side spectra when no analyser ran one.
-const OUTSIDE_FFT: usize = 4096;
 
 /// The display column's page, as saved. Solo keeps the title so the choice
 /// survives reordering and an analyzer being switched off for a while.
@@ -43,6 +41,15 @@ struct MixLayer {
     title: String,
     on: bool,
     opacity: f32,
+}
+
+impl MixLayer {
+    /// First-time mixer state for an analyzer. The scope starts off at half
+    /// opacity so it doesn't swamp the other layers until asked for.
+    fn default_for(title: &str) -> Self {
+        let (on, opacity) = if title == "Scope" { (false, 0.5) } else { (true, 1.0) };
+        Self { title: title.to_owned(), on, opacity }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -132,15 +139,15 @@ impl Workspace {
             _ => Tab::Stack,
         };
         let mut tabs: Vec<(Tab, &str, bool)> = vec![(Tab::Stack, "Stack", false)];
-        if layered {
-            tabs.push((Tab::Composite, "Composite", false));
-        }
         // Every analyzer has a solo tab; a switched-off one is dimmed and
         // clicking it switches it back on.
         tabs.extend(ordered.iter().map(|&i| {
             let title = slots[i].module.title();
             (Tab::Solo(title), title, !slots[i].visible)
         }));
+        if layered {
+            tabs.push((Tab::Composite, "Composite", false));
+        }
         let mut tabs_ui = child(ui, "display_tabs", column.with_max_y(column.top() + TABS));
         let before = current;
         theme::tab_strip(&mut tabs_ui, &tabs, &mut current);
@@ -189,7 +196,7 @@ impl Workspace {
                     let title = slot.module.title();
                     // Solo and Composite focus the inspector on what they show.
                     let shown = match current {
-                        Tab::Stack => true,
+                        Tab::Stack => !slot.module.solo_only(),
                         Tab::Composite => slot.module.layer_depth().is_some(),
                         // A solo overlay also shows the graph it draws over.
                         Tab::Solo(solo) => solo == title || overlays.contains(&(i, solo)),
@@ -250,7 +257,11 @@ impl Workspace {
             // The stack keeps switched-off analyzers as folded header strips.
             // Overlays ride in their host's panel instead of a row of their own.
             Tab::Stack => {
-                let rows: Vec<usize> = ordered.iter().copied().filter(|&i| !merged.iter().any(|m| m.1 == i)).collect();
+                let rows: Vec<usize> = ordered
+                    .iter()
+                    .copied()
+                    .filter(|&i| !merged.iter().any(|m| m.1 == i) && !slots[i].module.solo_only())
+                    .collect();
                 self.displays(ui, displays, slots, &rows, &merged, true, shared, profiler)
             }
             Tab::Solo(title) => {
@@ -289,12 +300,26 @@ impl Workspace {
         let mut range_ui = child(ui, "note_range", range_rect);
         let mut range = shared.range.get();
         let readout_width = self.inspector_width + DIVIDER - range_ui.spacing().item_spacing.x;
-        // Out-of-range spectrum: reuse a frame FFT if any, else our own.
+        // Out-of-range spectrum: a fine decimated FFT for the low end, plus
+        // the largest FFT an analyser already ran (else our own) above it.
+        let rate = shared.frame.rate;
         let start = profiler.start();
-        let (n, power, reused) = shared.any_spectrum(OUTSIDE_FFT);
-        profiler.record("Range", if reused { "FFT (shared)" } else { "FFT (own)" }, start);
+        let (n, coarse, reused) = shared.any_spectrum(noterange_outside::COARSE_FFT);
+        profiler.record("Range", if reused { "coarse FFT shared" } else { "coarse FFT own" }, start);
         let start = profiler.start();
-        self.outside.update(&power, n, shared.frame.rate, range, reused);
+        let (d, fn_) = (noterange_outside::FINE_DECIMATE, noterange_outside::FINE_FFT);
+        let fine = shared.decimated_spectrum(d, fn_);
+        profiler.record("Range", "fine FFT /16", start);
+        let start = profiler.start();
+        let fine_rate = rate as f32 / d as f32;
+        self.outside.update(
+            &noterange_outside::Source::new(&fine, fine_rate, fn_, fine_rate * noterange_outside::FINE_TOP),
+            &noterange_outside::Source::new(&coarse, rate as f32, n, rate as f32 / 2.0),
+            rate,
+            range,
+            n,
+            reused,
+        );
         profiler.record("Range", "side stats", start);
         let start = profiler.start();
         if noterange::bar(&mut range_ui, &mut range, marks, readout_width, Some(&self.outside)) {
@@ -318,7 +343,7 @@ impl Workspace {
     }
 
     /// Keep one mix entry per layerable analyzer, stacked by depth: the
-    /// opaque spectrogram at the bottom, then scope trace, spectrum, tuner, and MIDI notes on top.
+    /// opaque waterfall at the bottom, then scope trace, spectrum, tuner, and MIDI notes on top.
     fn sync_mix(&mut self, slots: &[Slot]) {
         let depth = |title: &str| {
             slots.iter().find(|s| s.module.title() == title).and_then(|s| s.module.layer_depth())
@@ -327,7 +352,7 @@ impl Workspace {
         for slot in slots {
             let title = slot.module.title();
             if slot.module.layer_depth().is_some() && !self.mix.iter().any(|l| l.title == title) {
-                self.mix.push(MixLayer { title: title.to_owned(), on: true, opacity: 1.0 });
+                self.mix.push(MixLayer::default_for(title));
             }
         }
         self.mix.sort_by_key(|l| depth(&l.title));

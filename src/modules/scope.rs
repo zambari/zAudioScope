@@ -344,7 +344,7 @@ impl Module for Scope {
         }
     }
 
-    /// Above the opaque spectrogram, below the spectrum lines.
+    /// Above the opaque waterfall, below the spectrum lines.
     fn layer_depth(&self) -> Option<u8> {
         Some(1)
     }

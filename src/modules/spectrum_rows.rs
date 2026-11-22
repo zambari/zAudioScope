@@ -1,4 +1,4 @@
-//! What the spectrogram and the 3D waterfall share: rows of log-band
+//! What the waterfall and Impulse share: rows of log-band
 //! spectra taken at a fixed rate of audio time, their persisted settings
 //! (FFT size, history, colour scale, speed, gating), the parameter UI, the
 //! colour ramp and the speed handle on the graph's right edge.
@@ -77,9 +77,9 @@ impl Params {
         self.row_ms = self.row_ms.clamp(ROW_MS.0, ROW_MS.1);
     }
 
-    /// Load from `key`, falling back to `legacy` (an older key), sanitized.
-    pub fn load(storage: &dyn eframe::Storage, key: &str, legacy: Option<&str>) -> Option<Self> {
-        let mut p = eframe::get_value::<Self>(storage, key).or_else(|| eframe::get_value(storage, legacy?))?;
+    /// Load from `key`, sanitized.
+    pub fn load(storage: &dyn eframe::Storage, key: &str) -> Option<Self> {
+        let mut p = eframe::get_value::<Self>(storage, key)?;
         p.sanitize();
         Some(p)
     }

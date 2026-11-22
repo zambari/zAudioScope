@@ -4,6 +4,8 @@ use std::{collections::BTreeMap, time::Instant};
 #[derive(Default)]
 pub struct Profiler {
     pub enabled: bool,
+    /// Extra lines (ending in `\n`) shown under the timings, set per frame.
+    pub note: String,
     rows: BTreeMap<(&'static str, &'static str), f64>,
     samples: BTreeMap<(&'static str, &'static str), f64>,
     previous: Option<Instant>,
@@ -77,6 +79,7 @@ impl Profiler {
                 text.push_str(&format!("{group:8} {name:14} {:7.0} µs\n", seconds * 1e6));
             }
         }
+        text.push_str(&self.note);
         if self.interval > 0.0 {
             text.push_str(&format!(
                 "Frame interval {:.1} / 50 ms · {:.1} FPS",
