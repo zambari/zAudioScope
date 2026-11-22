@@ -11,6 +11,15 @@ egui = "0.37"
 midir = "0.11.1"
 serde = { version = "1.0.229", features = ["derive"] }
 
+[target.'cfg(windows)'.dependencies.windows]
+# Same version cpal uses, so the crate is shared rather than built twice.
+version = "0.62"
+features = ["Win32_Foundation", "Win32_Media_Audio", "Win32_Media_Audio_DirectSound"]
+
+[features]
+# Windows ASIO host. Needs the Steinberg ASIO SDK (CPAL_ASIO_DIR) and libclang.
+asio = ["cpal/asio"]
+
 # Drawing scopes and running FFTs in an unoptimized build is slow.
 # Optimize dependencies even in dev.
 [profile.dev.package."*"]

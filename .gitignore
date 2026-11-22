@@ -2,6 +2,9 @@
 CLAUDE.md
 .claude/
 
+# Steinberg ASIO SDK (licensed; never commit)
+/asio_sdk/
+
 # Rust build output
 /target/
 **/*.rs.bk

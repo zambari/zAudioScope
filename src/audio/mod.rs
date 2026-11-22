@@ -22,6 +22,8 @@ pub mod levels;
 pub mod loudness;
 pub mod mic_permission;
 pub mod monitor;
+#[cfg(windows)]
+pub mod dsound;
 pub mod spectrum;
 pub mod tap;
 

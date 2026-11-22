@@ -217,8 +217,17 @@ impl Default for InputSettings {
     }
 }
 
+/// A running capture, through cpal or DirectSound. Held only to keep it
+/// running; dropping it stops it.
+#[allow(dead_code)]
+enum Capture {
+    Cpal(cpal::Stream),
+    #[cfg(windows)]
+    DirectSound(super::dsound::Capture),
+}
+
 pub struct Input {
-    stream: Option<cpal::Stream>,
+    stream: Option<Capture>,
     shared: Arc<Shared>,
     pub device_id: Option<String>,
     pub device_name: String,
@@ -299,10 +308,19 @@ impl Input {
     }
 
     pub fn devices() -> Vec<DeviceInfo> {
-        cpal::default_host()
+        let mut list: Vec<DeviceInfo> = cpal::default_host()
             .input_devices()
             .map(describe)
-            .unwrap_or_default()
+            .unwrap_or_default();
+        #[cfg(windows)]
+        list.extend(super::dsound::devices());
+        // ASIO drivers are only loaded by listing them, so this is kept to
+        // the device list refresh, not the per-frame path.
+        #[cfg(feature = "asio")]
+        if let Ok(asio) = cpal::host_from_id(cpal::HostId::Asio) {
+            list.extend(asio.input_devices().map(describe).unwrap_or_default());
+        }
+        list
     }
 
     /// The feed the monitor output plays from.
@@ -416,6 +434,10 @@ impl Input {
         if self.paused || self.stream.is_none() || self.wanted_channels() == self.stream_channels {
             return;
         }
+        // DirectSound always captures every channel; nothing to reopen.
+        if self.fixed_channels() {
+            return;
+        }
         self.keep_ring = true;
         let id = self.device_id.clone();
         self.switch(id.as_deref());
@@ -460,8 +482,21 @@ impl Input {
         }
     }
 
+    /// Whether the open stream always carries every channel (DirectSound).
+    fn fixed_channels(&self) -> bool {
+        #[cfg(windows)]
+        if let Some(Capture::DirectSound(_)) = &self.stream {
+            return true;
+        }
+        false
+    }
+
     fn open_stream(&mut self, device_id: Option<&str>) -> Result<(), String> {
-        let host = cpal::default_host();
+        #[cfg(windows)]
+        if let Some(id) = device_id.filter(|id| id.starts_with(super::dsound::PREFIX)) {
+            return self.open_dsound(id);
+        }
+        let host = host_for(device_id);
         let device = by_id(&host, device_id)
             .or_else(|| host.default_input_device())
             .ok_or("no input device")?;
@@ -542,7 +577,58 @@ impl Input {
         };
         let stream = super::by_format!(config.sample_format(), build(&device, sc, taps))?;
         stream.play().map_err(|e| e.to_string())?;
-        self.stream = Some(stream);
+        self.stream = Some(Capture::Cpal(stream));
+        Ok(())
+    }
+
+    /// Open a DirectSound capture. It always runs at the rate and channel
+    /// count the device accepted, so there is no rate, buffer or channel
+    /// choice beyond that.
+    #[cfg(windows)]
+    fn open_dsound(&mut self, id: &str) -> Result<(), String> {
+        let open = super::dsound::open(id, self.want_rate)?;
+        let fmt = open.format;
+        self.device_id = Some(id.to_owned());
+        self.device_name = open.name.clone();
+        self.default_rate = fmt.rate;
+        self.rates = vec![fmt.rate];
+        self.rate = fmt.rate;
+        self.channels = fmt.channels;
+        self.stream_channels = fmt.channels;
+        self.buffer_sizes = Vec::new();
+
+        let len = (self.rate as usize * self.history_secs as usize).next_power_of_two();
+        let keep = std::mem::take(&mut self.keep_ring) && {
+            let ring = &self.shared.ring;
+            ring.buf.len() == len && ring.all_peaks.len() == self.channels as usize
+        };
+        if !keep {
+            self.shared = new_shared(len, self.channels);
+        }
+        if self.paused {
+            // Dropping `open` releases the device.
+            return Ok(());
+        }
+
+        let taps = Taps {
+            sh: self.shared.clone(),
+            gain: self.gain.clone(),
+            channel: self.channel.clone(),
+            meter_all: self.meter_all.clone(),
+            monitor: self.monitor.clone(),
+        };
+        let mut pipe = Pipe::new(taps, fmt.rate, fmt.channels);
+        let sh = self.shared.clone();
+        let capture = super::dsound::start(
+            open,
+            move |block: &[f32]| pipe.run(block),
+            move |e: String| {
+                if let Ok(mut err) = sh.error.lock() {
+                    *err = Some(e);
+                }
+            },
+        );
+        self.stream = Some(Capture::DirectSound(capture));
         Ok(())
     }
 
@@ -649,9 +735,139 @@ pub(crate) fn device_name(d: &cpal::Device, fallback: &str) -> String {
         .unwrap_or_else(|_| fallback.to_owned())
 }
 
+/// The host a device id belongs to (`asio:...` lists ASIO), else the
+/// default host.
+pub(crate) fn host_for(id: Option<&str>) -> cpal::Host {
+    id.and_then(|id| id.parse::<cpal::DeviceId>().ok())
+        .and_then(|d| cpal::host_from_id(d.host()).ok())
+        .unwrap_or_else(cpal::default_host)
+}
+
 /// A saved device id, if that device is present.
 pub(crate) fn by_id(host: &cpal::Host, id: Option<&str>) -> Option<cpal::Device> {
     host.device_by_id(&id?.parse::<cpal::DeviceId>().ok()?)
+}
+
+/// The per-stream half of the capture path: everything the callback keeps
+/// between blocks. Shared by cpal callbacks and the DirectSound reader.
+struct Pipe {
+    taps: Taps,
+    ch: usize,
+    in_rate: u32,
+    /// Per-channel scratch for the meter-all pass.
+    all: Vec<f32>,
+    t0: std::time::Instant,
+    last_cb: Option<f32>,
+    /// Set after a late block or an xrun, cleared by the first block with
+    /// any signal. While set, all-zero blocks are what the driver fills in
+    /// for audio it didn't get, so they stay out of the ring. A healthy
+    /// stream never sets it, so real digital silence (a USB synth between
+    /// hits) is still captured.
+    trouble: bool,
+}
+
+impl Pipe {
+    fn new(taps: Taps, in_rate: u32, channels: u16) -> Self {
+        let ch = channels.max(1) as usize;
+        Self {
+            taps,
+            ch,
+            in_rate,
+            all: vec![0f32; ch],
+            t0: std::time::Instant::now(),
+            last_cb: None,
+            trouble: false,
+        }
+    }
+
+    /// Handle one block of interleaved samples.
+    fn run<T: Copy>(&mut self, data: &[T])
+    where
+        f32: FromSample<T>,
+    {
+        let ch = self.ch;
+        let taps = &self.taps;
+        let sh = &taps.sh;
+        let g = f32::from_bits(taps.gain.load(Ordering::Relaxed));
+        // A selection the device lacks falls back to channels 1/2.
+        let sel = match ChannelSel::from_bits(taps.channel.load(Ordering::Relaxed)) {
+            s if s.fits(ch as u16) => s,
+            _ if ch > 1 => ChannelSel::Pair(0),
+            _ => ChannelSel::Mono(0),
+        };
+        let metering = taps.meter_all.load(Ordering::Relaxed);
+        let frames = data.len() / ch;
+        sh.callback_frames.store(frames as u32, Ordering::Relaxed);
+        let rate = self.in_rate.max(1) as f32;
+        // A silence in delivery far longer than a buffer: IO was
+        // paused, not just a late callback.
+        let now = self.t0.elapsed().as_secs_f32();
+        if let Some(prev) = self.last_cb.replace(now) {
+            let late = now - prev;
+            if late > (4.0 * frames as f32 / rate).max(0.05) {
+                sh.gaps.fetch_add(1, Ordering::Relaxed);
+            }
+            if late > 2.5 * frames as f32 / rate {
+                self.trouble = true;
+            }
+        }
+        if sh.xrun_flag.swap(false, Ordering::Relaxed) {
+            self.trouble = true;
+        }
+        if self.trouble {
+            if data.iter().all(|&x| f32::from_sample(x) == 0.0) {
+                sh.skipped.fetch_add(frames as u64, Ordering::Relaxed);
+                return;
+            }
+            self.trouble = false;
+        }
+        let ring = &sh.ring;
+        // Only this callback writes, so the published counts are ours.
+        let mut w = ring.written.load(Ordering::Relaxed);
+        let mut sw = ring.stereo.written();
+        let mon = taps.monitor.enabled();
+        let mut mw = taps.monitor.ring.written();
+        let mut pk = [0f32; 2];
+        for frame in data.chunks_exact(ch) {
+            let at = |i: usize| f32::from_sample(frame[i]) * g;
+            if metering {
+                for (i, p) in self.all.iter_mut().enumerate() {
+                    *p = p.max(at(i).abs());
+                }
+            }
+            let (m, l, r) = match sel {
+                ChannelSel::Mono(c) => {
+                    let v = at(c as usize);
+                    (v, v, v)
+                }
+                ChannelSel::Pair(c) => {
+                    let (l, r) = (at(c as usize), at(c as usize + 1));
+                    ((l + r) * 0.5, l, r)
+                }
+            };
+            ring.write(w, m, sw, l, r);
+            if mon {
+                taps.monitor.ring.write(mw, l, r);
+                mw += 1;
+            }
+            w += 1;
+            sw += 1;
+            pk[0] = pk[0].max(l.abs());
+            pk[1] = pk[1].max(r.abs());
+        }
+        ring.publish(w, sw);
+        if mon {
+            taps.monitor.publish(mw, self.in_rate, frames as u32);
+        }
+        for (dst, p) in ring.peaks.iter().zip(pk) {
+            dst.fetch_max(p.to_bits(), Ordering::Relaxed);
+        }
+        if metering {
+            for (dst, src) in ring.all_peaks.iter().zip(self.all.iter_mut()) {
+                dst.fetch_max(std::mem::take(src).to_bits(), Ordering::Relaxed);
+            }
+        }
+    }
 }
 
 fn build<T>(
@@ -663,109 +879,12 @@ where
     T: SizedSample,
     f32: FromSample<T>,
 {
-    let Taps {
-        sh,
-        gain,
-        channel,
-        meter_all,
-        monitor,
-    } = taps;
-    let in_rate = config.sample_rate;
-    let ch = config.channels.max(1) as usize;
-    let err_sh = sh.clone();
-    let rate = config.sample_rate.max(1) as f32;
-    let mut all = vec![0f32; ch];
-    let t0 = std::time::Instant::now();
-    let mut last_cb: Option<f32> = None;
-    // Set after a late callback or an xrun, cleared by the first block with
-    // any signal. While set, all-zero blocks are what the driver fills in
-    // for audio it didn't get, so they stay out of the ring. A healthy
-    // stream never sets it, so real digital silence (a USB synth between
-    // hits) is still captured.
-    let mut trouble = false;
+    let mut pipe = Pipe::new(taps, config.sample_rate, config.channels);
+    let err_sh = pipe.taps.sh.clone();
     device
         .build_input_stream(
             config,
-            move |data: &[T], _: &cpal::InputCallbackInfo| {
-                let g = f32::from_bits(gain.load(Ordering::Relaxed));
-                // A selection the device lacks falls back to channels 1/2.
-                let sel = match ChannelSel::from_bits(channel.load(Ordering::Relaxed)) {
-                    s if s.fits(ch as u16) => s,
-                    _ if ch > 1 => ChannelSel::Pair(0),
-                    _ => ChannelSel::Mono(0),
-                };
-                let metering = meter_all.load(Ordering::Relaxed);
-                let frames = data.len() / ch;
-                sh.callback_frames.store(frames as u32, Ordering::Relaxed);
-                // A silence in delivery far longer than a buffer: IO was
-                // paused, not just a late callback.
-                let now = t0.elapsed().as_secs_f32();
-                if let Some(prev) = last_cb.replace(now) {
-                    let late = now - prev;
-                    if late > (4.0 * frames as f32 / rate).max(0.05) {
-                        sh.gaps.fetch_add(1, Ordering::Relaxed);
-                    }
-                    if late > 2.5 * frames as f32 / rate {
-                        trouble = true;
-                    }
-                }
-                if sh.xrun_flag.swap(false, Ordering::Relaxed) {
-                    trouble = true;
-                }
-                if trouble {
-                    if data.iter().all(|&x| f32::from_sample(x) == 0.0) {
-                        sh.skipped.fetch_add(frames as u64, Ordering::Relaxed);
-                        return;
-                    }
-                    trouble = false;
-                }
-                let ring = &sh.ring;
-                // Only this callback writes, so the published counts are ours.
-                let mut w = ring.written.load(Ordering::Relaxed);
-                let mut sw = ring.stereo.written();
-                let mon = monitor.enabled();
-                let mut mw = monitor.ring.written();
-                let mut pk = [0f32; 2];
-                for frame in data.chunks_exact(ch) {
-                    let at = |i: usize| f32::from_sample(frame[i]) * g;
-                    if metering {
-                        for (i, p) in all.iter_mut().enumerate() {
-                            *p = p.max(at(i).abs());
-                        }
-                    }
-                    let (m, l, r) = match sel {
-                        ChannelSel::Mono(c) => {
-                            let v = at(c as usize);
-                            (v, v, v)
-                        }
-                        ChannelSel::Pair(c) => {
-                            let (l, r) = (at(c as usize), at(c as usize + 1));
-                            ((l + r) * 0.5, l, r)
-                        }
-                    };
-                    ring.write(w, m, sw, l, r);
-                    if mon {
-                        monitor.ring.write(mw, l, r);
-                        mw += 1;
-                    }
-                    w += 1;
-                    sw += 1;
-                    pk[0] = pk[0].max(l.abs());
-                    pk[1] = pk[1].max(r.abs());
-                }
-                ring.publish(w, sw);
-                if mon {
-                    monitor.publish(mw, in_rate, frames as u32);
-                }
-                for (dst, p) in ring.peaks.iter().zip(pk) {
-                    dst.fetch_max(p.to_bits(), Ordering::Relaxed);
-                }
-                if metering {
-                    for (dst, src) in ring.all_peaks.iter().zip(all.iter_mut()) {
-                        dst.fetch_max(std::mem::take(src).to_bits(), Ordering::Relaxed);
-                    }
-                }
-            },
+            move |data: &[T], _: &cpal::InputCallbackInfo| pipe.run(data),
             move |err: cpal::Error| {
                 // Overloads are transient (CoreAudio reports one on many
                 // device/rate changes): count them, don't latch an error.
