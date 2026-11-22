@@ -3,6 +3,8 @@
 //! decimate the analysis window so the per-note work runs on a few thousand
 //! samples per second instead of 48k. Plus the per-note DFT they both use.
 
+use std::sync::Arc;
+
 use super::Shared;
 use super::perf::Costs;
 use crate::pitch;
@@ -122,10 +124,34 @@ pub struct Window {
     pub level_db: f32,
 }
 
+/// Raw audio cut for one analysis, ready to decimate on any thread.
+pub struct Cut {
+    x: Vec<f32>,
+    decim: Arc<Decimator>,
+    window_ms: f32,
+}
+
+impl Cut {
+    /// Low-pass, decimate and trim to the window.
+    pub fn run(&self) -> Window {
+        let d = &self.decim;
+        let y = d.run(&self.x);
+        let r = d.out_rate();
+        let keep = (self.window_ms / 1000.0 * r as f32) as usize;
+        let y = y[y.len().saturating_sub(keep)..].to_vec();
+        let rms = (y.iter().map(|s| s * s).sum::<f32>() / y.len().max(1) as f32).sqrt();
+        Window {
+            y,
+            rate: r,
+            level_db: 20.0 * rms.max(1e-9).log10(),
+        }
+    }
+}
+
 /// Pacing and decimation state for one module.
 #[derive(Default)]
 pub struct NoteInput {
-    decim: Option<Decimator>,
+    decim: Option<Arc<Decimator>>,
     /// What was analysed last: the gate window, or the stream position in
     /// free mode. Unchanged input is not analysed again.
     last: Option<(u64, u64)>,
@@ -137,6 +163,14 @@ impl NoteInput {
     /// The next window to analyse, or `None` when nothing new arrived (or
     /// the free-running hop hasn't elapsed). Stage 0 of `costs` is decimation.
     pub fn next(&mut self, shared: &Shared, want: &Want, costs: &mut Costs) -> Option<Window> {
+        let cut = self.prepare(shared, want)?;
+        costs.tick();
+        Some(costs.time(0, || cut.run()))
+    }
+
+    /// The raw audio for the next analysis (see [`NoteInput::next`]), cut
+    /// but not decimated, so the heavy part can run off the UI thread.
+    pub fn prepare(&mut self, shared: &Shared, want: &Want) -> Option<Cut> {
         let f = &shared.frame;
         let rate = f.rate;
         let key = match shared.gate.window {
@@ -164,23 +198,16 @@ impl NoteInput {
             .as_ref()
             .is_some_and(|d| d.rate == rate && d.factor == factor)
         {
-            self.decim = Some(Decimator::new(rate, factor));
+            self.decim = Some(Arc::new(Decimator::new(rate, factor)));
         }
-        costs.tick();
-        let d = self.decim.as_ref().unwrap();
+        let decim = self.decim.clone().unwrap();
         let window = (want.window_ms / 1000.0 * rate as f32) as usize;
         let x = shared.analysis_slice(want.lookback(rate));
-        let y = costs.time(0, || {
-            d.run(&x[x.len().saturating_sub(window + d.taps.len())..])
-        });
-        let r = d.out_rate();
-        let keep = (want.window_ms / 1000.0 * r as f32) as usize;
-        let y = y[y.len().saturating_sub(keep)..].to_vec();
-        let rms = (y.iter().map(|s| s * s).sum::<f32>() / y.len().max(1) as f32).sqrt();
-        Some(Window {
-            y,
-            rate: r,
-            level_db: 20.0 * rms.max(1e-9).log10(),
+        let x = x[x.len().saturating_sub(window + decim.taps.len())..].to_vec();
+        Some(Cut {
+            x,
+            decim,
+            window_ms: want.window_ms,
         })
     }
 }

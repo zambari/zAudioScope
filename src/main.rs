@@ -8,6 +8,7 @@ mod modules;
 mod pitch;
 mod relaunch;
 mod ui;
+mod worker;
 
 /// eframe uses this as the folder for saved window and UI state.
 const APP_ID: &str = "zAudioScope";

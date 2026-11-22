@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 use egui::{Align2, Color32, FontId, Rect, Stroke, Ui, pos2, vec2};
 
 use super::note_hold::{NoteHold, Reading, Timing};
-use super::note_input::{NoteInput, Want, ease, note_db};
-use super::perf::Costs;
+use super::note_input::{Cut, NoteInput, Want, ease, note_db};
+use super::perf::{Costs, Laps};
 use super::{Module, Shared};
 use crate::pitch::{self, Method};
 use crate::ui::icons::{self, Dir};
@@ -24,10 +24,11 @@ use crate::ui::noterange::NoteRange;
 use crate::ui::plot::{self, Lanes, NOTE_LANE};
 use crate::ui::theme;
 use crate::ui::widgets::{self, Foldout};
+use crate::worker::Latest;
 
 pub const TITLE: &str = "Tuner";
 
-/// Cost stages, in `Costs` order (0 is decimation, see `NoteInput::next`).
+/// Cost stages, in `Costs` order; all measured on the worker thread.
 const STAGES: [&str; 3] = ["decimate", "nsdf", "ghosts"];
 
 /// Candidates shown at most.
@@ -188,6 +189,89 @@ enum Draw {
     Layer,
 }
 
+/// One analysis, handed to the worker thread.
+struct Job {
+    cut: Cut,
+    a4: f32,
+    /// Analysed note span (top already held to the ceiling).
+    lo: f32,
+    hi: f32,
+    f_lo: f32,
+    f_hi: f32,
+    gate_db: f32,
+}
+
+/// What the worker found.
+struct Found {
+    level_db: f32,
+    /// (midi, clarity, is the pick), ghosts removed, best first.
+    raw: Vec<(f32, f32, bool)>,
+    /// (midi, clarity) of the pick.
+    picked: Option<(f32, f32)>,
+    laps: Laps,
+}
+
+/// Decimate, find NSDF candidates and drop subharmonic ghosts. Runs on the
+/// tuner's worker thread; track easing and smoothing stay on the UI thread.
+fn analyse(job: Job) -> Found {
+    let Job {
+        cut,
+        a4,
+        lo,
+        hi,
+        f_lo,
+        f_hi,
+        gate_db,
+    } = job;
+    let mut laps = Laps::default();
+    let w = laps.time(0, || cut.run());
+    let (y, r) = (&w.y, w.rate);
+    let c = if w.level_db < gate_db {
+        laps.skip(1);
+        pitch::Candidates::default()
+    } else {
+        laps.time(1, || pitch::candidates(y, r, f_lo, f_hi))
+    };
+    let mut raw: Vec<(f32, f32, bool)> = c
+        .list
+        .iter()
+        .enumerate()
+        .map(|(i, k)| {
+            (
+                pitch::freq_to_midi(k.freq, a4),
+                k.clarity,
+                c.pick == Some(i),
+            )
+        })
+        .filter(|&(m, cl, _)| cl >= MIN_CLARITY && m >= lo - 0.5 && m <= hi + 0.5)
+        .collect();
+    // NSDF also peaks at 2T, 3T… of the true period: lines with no
+    // spectral energy under them are those subharmonic ghosts.
+    laps.time(2, || {
+        let level = |m: f32| {
+            [-0.5, -0.25, 0.0, 0.25, 0.5]
+                .map(|d| note_db(y, r, pitch::midi_to_freq(m + d, a4), GHOST_CYCLES))
+                .into_iter()
+                .fold(f32::MIN, f32::max)
+        };
+        let levels: Vec<f32> = raw.iter().map(|&(m, ..)| level(m)).collect();
+        let peak = levels.iter().copied().fold(f32::MIN, f32::max);
+        let mut keep = levels.iter().map(|&l| l >= peak - GHOST_DB);
+        raw.retain(|&(_, _, pick)| keep.next().unwrap() || pick);
+    });
+    raw.sort_by(|a, b| b.2.cmp(&a.2).then(b.1.total_cmp(&a.1)));
+    raw.truncate(MAX_CANDIDATES);
+    let picked = c
+        .pick
+        .map(|i| (pitch::freq_to_midi(c.list[i].freq, a4), c.list[i].clarity));
+    Found {
+        level_db: w.level_db,
+        raw,
+        picked,
+        laps,
+    }
+}
+
 #[derive(Default)]
 pub struct Tuner {
     p: Params,
@@ -204,6 +288,8 @@ pub struct Tuner {
     readings: NoteHold,
 
     costs: Costs,
+    /// Runs [`analyse`]; spawned on first use.
+    worker: Option<Latest<Job, Found>>,
 }
 
 impl Tuner {
@@ -252,60 +338,32 @@ impl Module for Tuner {
 
     fn update(&mut self, shared: &mut Shared) {
         let want = self.p.want();
-        let Some(w) = self.input.next(shared, &want, &mut self.costs) else {
+        if let Some(cut) = self.input.prepare(shared, &want) {
+            self.costs.tick();
+            let (lo, hi) = self.input.analysed.span();
+            let hi = want.top(hi);
+            let a4 = self.p.a4;
+            let job = Job {
+                cut,
+                a4,
+                lo,
+                hi,
+                f_lo: pitch::midi_to_freq(lo - 0.5, a4),
+                f_hi: pitch::midi_to_freq(want.top(hi + 0.5), a4),
+                gate_db: self.p.gate_db,
+            };
+            self.worker
+                .get_or_insert_with(|| Latest::spawn("tuner", analyse))
+                .submit(job);
+        }
+        let Some(found) = self.worker.as_ref().and_then(Latest::take) else {
             return;
         };
-        let (y, r) = (&w.y, w.rate);
-        self.level_db = w.level_db;
-        let (lo, hi) = self.input.analysed.span();
-        let hi = want.top(hi);
-        let a4 = self.p.a4;
-        let (f_lo, f_hi) = (
-            pitch::midi_to_freq(lo - 0.5, a4),
-            pitch::midi_to_freq(want.top(hi + 0.5), a4),
-        );
-        let c = if self.level_db < self.p.gate_db {
-            self.costs.skip(1);
-            pitch::Candidates::default()
-        } else {
-            self.costs.time(1, || pitch::candidates(y, r, f_lo, f_hi))
-        };
-        let mut raw: Vec<(f32, f32, bool)> = c
-            .list
-            .iter()
-            .enumerate()
-            .map(|(i, k)| {
-                (
-                    pitch::freq_to_midi(k.freq, a4),
-                    k.clarity,
-                    c.pick == Some(i),
-                )
-            })
-            .filter(|&(m, cl, _)| cl >= MIN_CLARITY && m >= lo - 0.5 && m <= hi + 0.5)
-            .collect();
-        // NSDF also peaks at 2T, 3T… of the true period: lines with no
-        // spectral energy under them are those subharmonic ghosts.
-        self.costs.time(2, || {
-            let level = |m: f32| {
-                [-0.5, -0.25, 0.0, 0.25, 0.5]
-                    .map(|d| note_db(y, r, pitch::midi_to_freq(m + d, a4), GHOST_CYCLES))
-                    .into_iter()
-                    .fold(f32::MIN, f32::max)
-            };
-            let levels: Vec<f32> = raw.iter().map(|&(m, ..)| level(m)).collect();
-            let peak = levels.iter().copied().fold(f32::MIN, f32::max);
-            let mut keep = levels.iter().map(|&l| l >= peak - GHOST_DB);
-            raw.retain(|&(_, _, pick)| keep.next().unwrap() || pick);
-        });
-        raw.sort_by(|a, b| b.2.cmp(&a.2).then(b.1.total_cmp(&a.1)));
-        raw.truncate(MAX_CANDIDATES);
-        self.raw = raw;
-
-        let picked = c
-            .pick
-            .map(|i| (pitch::freq_to_midi(c.list[i].freq, a4), c.list[i].clarity));
-        self.pick_clarity = picked.map_or(0.0, |p| p.1);
-        self.midi = match (self.midi, picked.map(|p| p.0)) {
+        self.costs.absorb(&found.laps);
+        self.level_db = found.level_db;
+        self.raw = found.raw;
+        self.pick_clarity = found.picked.map_or(0.0, |p| p.1);
+        self.midi = match (self.midi, found.picked.map(|p| p.0)) {
             // Jumped by more than a semitone: a new note, don't glide to it.
             (Some(prev), Some(m)) if (m - prev).abs() < 1.0 => {
                 Some(prev * self.p.smoothing + m * (1.0 - self.p.smoothing))

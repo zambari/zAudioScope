@@ -426,10 +426,12 @@ impl Input {
     }
 
     fn system_devices() -> Vec<DeviceInfo> {
-        let mut list: Vec<DeviceInfo> = cpal::default_host()
+        let list: Vec<DeviceInfo> = cpal::default_host()
             .input_devices()
             .map(describe)
             .unwrap_or_default();
+        #[cfg(windows)]
+        let mut list = list;
         #[cfg(windows)]
         list.extend(super::dsound::devices());
         list
