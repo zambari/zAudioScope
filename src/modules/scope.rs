@@ -45,7 +45,8 @@ struct Params {
     win_start_ms: f32,
     win_end_ms: f32,
     /// Vertical view: the ceiling is the top edge (0 dB = full scale), the
-    /// floor the lowest labelled tick.
+    /// floor sits on the centre line; anything quieter folds to zero, so
+    /// raising the floor zooms into the peaks.
     db: DynamicRange,
     /// Legacy linear zoom, read once and migrated to the ceiling.
     #[serde(skip_serializing)]
@@ -82,9 +83,33 @@ impl Params {
         self.win_end_ms = self.win_end_ms.clamp(self.win_start_ms, self.view_ms);
     }
 
-    /// Linear zoom that puts the ceiling at the top edge.
+    fn fold(&self) -> Fold {
+        Fold { floor: loudness::lin(self.db.range.floor), top: loudness::lin(self.db.range.ceil) }
+    }
+}
+
+/// Vertical amplitude mapping: |s| at the floor lands on the centre line,
+/// the ceiling on the edge, and anything under the floor folds to zero.
+#[derive(Clone, Copy)]
+struct Fold {
+    floor: f32,
+    top: f32,
+}
+
+impl Fold {
+    /// -1..1 of the half height, clamped.
+    fn norm(&self, s: f32) -> f32 {
+        ((s.abs() - self.floor) / (self.top - self.floor)).clamp(0.0, 1.0).copysign(s)
+    }
+
+    /// Screen y for a sample value.
+    fn y(&self, rect: Rect, s: f32) -> f32 {
+        rect.center().y - self.norm(s) * rect.height() / 2.0
+    }
+
+    /// Effective linear magnification of the visible span.
     fn zoom(&self) -> f32 {
-        10f32.powf(-self.db.range.ceil / 20.0)
+        1.0 / (self.top - self.floor)
     }
 }
 
@@ -199,8 +224,7 @@ impl Module for Scope {
             Scale::linear((-self.p.view_ms, 0.0), (rect.left(), rect.right()))
         };
         let x_of_ms = |ms: f32| rect.left() + rect.width() * ms / self.p.view_ms;
-        let gain = self.p.zoom();
-        let amp = Scale::linear((-1.0 / gain, 1.0 / gain), (rect.bottom(), rect.top()));
+        let fold = self.p.fold();
 
         // Gate window, with drag-to-select.
         if trig {
@@ -220,13 +244,12 @@ impl Module for Scope {
             painter.rect_filled(gate, 0.0, theme::ACCENT.gamma_multiply(0.25));
         }
         Axis::new(Edge::Bottom, xs).draw(&painter, rect, plot::fmt_ms);
-        draw_db_axis(&painter, rect, &amp, gain, self.p.db.range.floor);
+        draw_db_axis(&painter, rect, fold);
         painter.hline(rect.x_range(), rect.center().y, Stroke::new(1.0, Color32::from_gray(40)));
 
         // Min/max per pixel column.
         let cols = rect.width().max(1.0) as usize;
         let lo = start.saturating_sub(f.start) as usize;
-        let half = rect.height() / 2.0;
         for c in 0..cols {
             let a = lo + c * view / cols;
             let b = (lo + (c + 1) * view / cols).max(a + 1);
@@ -236,17 +259,12 @@ impl Module for Scope {
             }
             let (mn, mx) = seg.iter().fold((f32::MAX, f32::MIN), |(mn, mx), &s| (mn.min(s), mx.max(s)));
             let x = rect.left() + c as f32 + 0.5;
-            let yc = rect.center().y;
-            painter.vline(
-                x,
-                (yc - (mx * gain).clamp(-1.0, 1.0) * half)..=(yc - (mn * gain).clamp(-1.0, 1.0) * half),
-                Stroke::new(1.0, theme::WAVE),
-            );
+            painter.vline(x, fold.y(rect, mx)..=fold.y(rect, mn), Stroke::new(1.0, theme::WAVE));
         }
 
         // Handles: threshold on the left edge, gate ends along the bottom.
         if trig {
-            let thr = Scale::linear((0.0, 1.0 / gain), (rect.center().y, rect.top()));
+            let thr = Scale::linear((fold.floor, fold.top), (rect.center().y, rect.top()));
             let fmt = |v: f32| format!("thr {v:.2}  {:.1} dB", 20.0 * v.log10());
             let r = EdgeHandle::new("scope_thr", Edge::Left, thr, &mut self.p.threshold).clamp(0.01, 1.0).reset(0.3).label(&fmt).show(ui, rect);
             if r.hovered() || r.dragged() {
@@ -287,13 +305,13 @@ impl Module for Scope {
         let settle = f.ms_to_samples(100.0);
         if let Some((peak, lufs)) = loudness::measure(&f.samples, f.rate, lo, lo + view, settle) {
             let fmt = |v: f32| if v.is_finite() { format!("{v:.1}") } else { "-inf".to_owned() };
-            let text = format!("peak {} dBFS · {} LUFS · zoom ×{}", fmt(loudness::db(peak)), fmt(lufs), plot::trim(gain));
+            let text = format!("peak {} dBFS · {} LUFS · zoom ×{}", fmt(loudness::db(peak)), fmt(lufs), plot::trim(fold.zoom()));
             plot::caption(&painter, rect, Align2::CENTER_TOP, text);
         }
 
         match self.link.shown() {
             Some(Key::View) => self.link.point_x(ui, rect, rect.right() - 1.0),
-            Some(Key::Threshold) => self.link.point_y(ui, rect, amp.px(self.p.threshold)),
+            Some(Key::Threshold) => self.link.point_y(ui, rect, fold.y(rect, self.p.threshold)),
             Some(Key::Holdoff) => self.link.point_x(ui, rect, x_of_ms(self.p.holdoff_ms)),
             Some(Key::From) => self.link.point_x(ui, rect, x_of_ms(self.p.win_start_ms)),
             Some(Key::To) => self.link.point_x(ui, rect, x_of_ms(self.p.win_end_ms)),
@@ -302,27 +320,26 @@ impl Module for Scope {
     }
 }
 
-/// Left-edge amplitude ticks labelled in dBFS. The trace stays linear, so
-/// the ticks bunch towards the centre line; ones too close to a kept one
-/// are dropped. Labels go on the upper half, ticks on both.
-fn draw_db_axis(painter: &egui::Painter, rect: Rect, amp: &Scale, gain: f32, floor_db: f32) {
+/// Left-edge amplitude ticks labelled in dBFS. The trace stays linear
+/// (above the floor), so the ticks bunch towards the centre line; ones too
+/// close to a kept one are dropped. Labels go on the upper half, ticks on both.
+fn draw_db_axis(painter: &egui::Painter, rect: Rect, fold: Fold) {
     const DBS: [f32; 14] = [
         3.0, 0.0, -3.0, -6.0, -9.0, -12.0, -18.0, -24.0, -30.0, -36.0, -42.0, -48.0, -54.0, -60.0,
     ];
     const MIN_GAP: f32 = 14.0;
-    let top = 1.0 / gain;
     let mut kept: Vec<f32> = Vec::new();
-    for db in DBS.into_iter().filter(|&db| db >= floor_db) {
-        let v = 10f32.powf(db / 20.0);
-        if v > top * 1.0001 {
+    for db in DBS {
+        let v = loudness::lin(db);
+        if v > fold.top * 1.0001 || v < fold.floor {
             continue;
         }
-        let y = amp.px(v);
+        let y = fold.y(rect, v);
         if (rect.center().y - y) < MIN_GAP || kept.iter().any(|&k| (k - y).abs() < MIN_GAP) {
             continue;
         }
         kept.push(y);
-        let y_neg = amp.px(-v);
+        let y_neg = fold.y(rect, -v);
         for yy in [y, y_neg] {
             painter.hline(rect.x_range(), yy, Stroke::new(1.0, plot::GRID));
             painter.line_segment([egui::pos2(rect.left(), yy), egui::pos2(rect.left() + 5.0, yy)], Stroke::new(1.0, plot::TICK));

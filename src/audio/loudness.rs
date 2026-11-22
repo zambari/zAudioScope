@@ -68,6 +68,11 @@ pub fn db(v: f32) -> f32 {
     if v > 0.0 { 20.0 * v.log10() } else { f32::NEG_INFINITY }
 }
 
+/// dB to linear amplitude.
+pub fn lin(db: f32) -> f32 {
+    10f32.powf(db / 20.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
