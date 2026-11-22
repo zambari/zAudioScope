@@ -32,6 +32,10 @@ const DENSITY: (usize, usize) = (20, 100);
 const DEPTH: (f32, f32) = (-2.0, 2.0);
 /// Front layer's z in view space; the default stack spans ±Z_HALF.
 const Z_HALF: f32 = 0.7;
+/// Peak height of a full-scale spectrum, before the vertical scale.
+const BASE_HEIGHT: f32 = 0.65;
+/// Vertical scale of the spectrum heights; 1 = default, above 1 pushes peaks higher.
+const Y_SCALE: (f32, f32) = (1.0, 3.0);
 
 pub struct Impulse {
     p: Params,
@@ -52,6 +56,8 @@ pub struct Impulse {
     density: usize,
     /// Z spacing multiplier; negative flips the stack towards the viewer.
     depth: f32,
+    /// Multiplies the spectrum heights (see `Y_SCALE`).
+    y_scale: f32,
     /// Pan as fractions of the viewport, so resizing preserves the framing.
     pan: (f32, f32),
     /// Temporal smoothing across layers (per band, never across bands): 0 = raw,
@@ -77,6 +83,7 @@ impl Default for Impulse {
             window_ms: DEFAULT_WINDOW_MS,
             density: 48,
             depth: 1.0,
+            y_scale: 1.0,
             range_hz: (40.0, NoteRange::top_hz(false)),
             rotation: DEFAULT_ROTATION,
             zoom: DEFAULT_ZOOM,
@@ -118,6 +125,7 @@ impl Module for Impulse {
             &(self.window_ms, self.density),
         );
         eframe::set_value(storage, &format!("{key}.depth"), &self.depth);
+        eframe::set_value(storage, &format!("{key}.y_scale"), &self.y_scale);
         eframe::set_value(storage, &format!("{key}.time_smooth"), &self.time_smooth);
         eframe::set_value(storage, &format!("{key}.line_opacity"), &self.line_opacity);
     }
@@ -145,6 +153,11 @@ impl Module for Impulse {
             && depth.is_finite()
         {
             self.depth = depth.clamp(DEPTH.0, DEPTH.1);
+        }
+        if let Some(y) = eframe::get_value::<f32>(storage, &format!("{key}.y_scale"))
+            && y.is_finite()
+        {
+            self.y_scale = y.clamp(Y_SCALE.0, Y_SCALE.1);
         }
         if let Some(s) = eframe::get_value::<f32>(storage, &format!("{key}.time_smooth"))
             && s.is_finite()
@@ -216,6 +229,12 @@ impl Module for Impulse {
             "Scales the z spacing of the stack (1 = default). The layer count \
                  scales with it. Negative values flip the stack towards the viewer.",
         );
+        ui.add(
+            egui::Slider::new(&mut self.y_scale, Y_SCALE.0..=Y_SCALE.1)
+                .text("y scale")
+                .fixed_decimals(2),
+        )
+        .on_hover_text("Multiplies the height of the spectrum (1 = default, up to 3×).");
         ui.add(
             RangeSlider::new(
                 &mut self.range_hz.0,
@@ -305,10 +324,13 @@ impl Module for Impulse {
         };
         // Layer depth: `back` 0 is the front layer, 1 the oldest. Depth scales the spacing.
         let z_of = |back: f32| Z_HALF - 2.0 * Z_HALF * self.depth * back;
-        // Fit the whole volume, including its tallest possible peak, at every angle.
+        // Peak height with the vertical scale, applied once per frame (not per point).
+        let height = BASE_HEIGHT * self.y_scale;
+        // Fit the volume at the base height, so the vertical scale grows the peaks
+        // instead of shrinking the whole cube to make room for them.
         let mut projected = Rect::NOTHING;
         for x in [-1.0, 1.0] {
-            for y in [0.0, 0.65] {
+            for y in [0.0, BASE_HEIGHT] {
                 for z in [z_of(0.0), z_of(1.0)] {
                     let (x, y, _) = rotate(x, y, z);
                     projected.extend_with(pos2(x, -y));
@@ -411,7 +433,7 @@ impl Module for Impulse {
                 let centre = (j + (j + step).min(hi) - 1) / 2;
                 let inside = inside_band[centre];
                 let x = x_of(centre);
-                let top = project(x, lv * 0.65, z);
+                let top = project(x, lv * height, z);
                 let v = mesh.vertices.len() as u32;
                 if inside {
                     mesh.colored_vertex(project(x, 0.0, z), bg);
