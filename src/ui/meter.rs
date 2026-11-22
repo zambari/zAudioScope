@@ -79,27 +79,16 @@ impl Meter {
             let db = to_db(lin.max(1e-6));
             rect.left() + rect.width() * ((db - FLOOR_DB) / -FLOOR_DB).clamp(0.0, 1.0)
         };
-        // Colour zones: green up to -9 dB, orange to -1 dB, red at the top.
-        let zones = [
-            (FLOOR_DB, -9.0, Color32::from_rgb(96, 168, 104)),
-            (-9.0, -1.0, theme::ACCENT_BRIGHT),
-            (-1.0, 0.0, Color32::from_rgb(222, 60, 50)),
-        ];
         let bar_h = (rect.height() - 1.0) / 2.0;
         for k in 0..2 {
             let y0 = rect.top() + k as f32 * (bar_h + 1.0);
-            let lvl = x_of(self.level[k]);
-            for (a, b, c) in zones {
-                let xa = x_of(from_db(a));
-                let xb = x_of(from_db(b)).min(lvl);
-                if xb > xa {
-                    p.rect_filled(Rect::from_x_y_ranges(xa..=xb, y0..=y0 + bar_h), 0.0, c);
-                }
-            }
-            if self.hold[k] > 1e-4 {
-                let x = x_of(self.hold[k]);
-                p.line_segment([pos2(x, y0), pos2(x, y0 + bar_h)], Stroke::new(1.0, Color32::from_gray(220)));
-            }
+            let bar = Rect::from_x_y_ranges(rect.x_range(), y0..=y0 + bar_h);
+            super::level_bar::paint(
+                p,
+                bar,
+                audio_fraction(self.level[k]),
+                (self.hold[k] > 1e-4).then(|| audio_fraction(self.hold[k])),
+            );
         }
         // Tick marks at -24, -12 and -6 dB.
         if bg_alpha > 0.0 {
@@ -215,28 +204,18 @@ impl ChannelMeters {
         let (level, hold) = (self.level.get(k).copied().unwrap_or(0.0), self.hold.get(k).copied().unwrap_or(0.0));
         let p = ui.painter();
         p.rect_filled(rect, 1.0, ui.visuals().extreme_bg_color);
-        const FLOOR_DB: f32 = -48.0;
-        let x_of = |lin: f32| {
-            let db = to_db(lin.max(1e-6));
-            rect.left() + rect.width() * ((db - FLOOR_DB) / -FLOOR_DB).clamp(0.0, 1.0)
-        };
-        let lvl = x_of(level);
-        for (a, b, c) in [
-            (FLOOR_DB, -9.0, Color32::from_rgb(96, 168, 104)),
-            (-9.0, -1.0, theme::ACCENT_BRIGHT),
-            (-1.0, 0.0, Color32::from_rgb(222, 60, 50)),
-        ] {
-            let xa = x_of(from_db(a));
-            let xb = x_of(from_db(b)).min(lvl);
-            if xb > xa {
-                p.rect_filled(Rect::from_x_y_ranges(xa..=xb, rect.y_range()), 0.0, c);
-            }
-        }
-        if hold > 1e-4 {
-            let x = x_of(hold);
-            p.line_segment([pos2(x, rect.top()), pos2(x, rect.bottom())], Stroke::new(1.0, Color32::from_gray(220)));
-        }
+        super::level_bar::paint(
+            p,
+            rect,
+            audio_fraction(level),
+            (hold > 1e-4).then(|| audio_fraction(hold)),
+        );
         let db = to_db(hold.max(1e-6));
         resp.on_hover_text(if db < -90.0 { "-inf dB".to_owned() } else { format!("Peak {db:.1} dB") })
     }
+}
+
+/// Map the audio display range (-48..0 dBFS) onto a normalized bar.
+fn audio_fraction(level: f32) -> f32 {
+    ((to_db(level.max(1e-6)) + 48.0) / 48.0).clamp(0.0, 1.0)
 }

@@ -42,7 +42,10 @@ impl NoteRange {
     pub fn sanitized(self) -> Self {
         let (b, gap) = (Self::BOUNDS, Self::MIN_KEYS - 1);
         let hi = self.hi.clamp(b.lo + gap, b.hi);
-        Self { lo: self.lo.clamp(b.lo, hi - gap), hi }
+        Self {
+            lo: self.lo.clamp(b.lo, hi - gap),
+            hi,
+        }
     }
 
     /// Shown span in fractional MIDI: half a note beyond each end note.
@@ -90,23 +93,40 @@ const EDGE_PX: f32 = 6.0;
 
 /// The range control. `marks` are live pitches (fractional MIDI) reported
 /// by the analysers, lit on the keys. Returns true when the range changed.
-pub fn bar(ui: &mut Ui, range: &mut NoteRange, marks: &[f32]) -> bool {
+pub fn bar(ui: &mut Ui, range: &mut NoteRange, marks: &[f32], readout_width: f32) -> bool {
     let before = *range;
     ui.horizontal(|ui| {
         // Readout in the parameter column, so the strip lines up with graphs.
-        ui.allocate_ui_with_layout(vec2(super::PARAMS_W, 34.0), egui::Layout::top_down(egui::Align::Min), |ui| {
-            ui.set_width(super::PARAMS_W);
-            let (f0, f1) = range.hz();
-            ui.label(egui::RichText::new(format!("{} – {}", pitch::note_name(range.lo), pitch::note_name(range.hi))).strong());
-            ui.weak(format!("{} – {} Hz · {} notes", plot::fmt_hz(f0.round()), plot::fmt_hz(f1.round()), range.count()));
-        });
+        ui.allocate_ui_with_layout(
+            vec2(readout_width, 34.0),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.set_width(readout_width);
+                let (f0, f1) = range.hz();
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} – {}",
+                        pitch::note_name(range.lo),
+                        pitch::note_name(range.hi)
+                    ))
+                    .strong(),
+                );
+                ui.weak(format!(
+                    "{} – {} Hz · {} notes",
+                    plot::fmt_hz(f0.round()),
+                    plot::fmt_hz(f1.round()),
+                    range.count()
+                ));
+            },
+        );
         strip(ui, range, marks);
     });
     *range != before
 }
 
 fn strip(ui: &mut Ui, range: &mut NoteRange, marks: &[f32]) {
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 36.0), Sense::click_and_drag());
+    let (rect, resp) =
+        ui.allocate_exact_size(vec2(ui.available_width(), 36.0), Sense::click_and_drag());
     let full = NoteRange::BOUNDS;
     let notes = full.scale(rect);
     let label_h = 12.0;
@@ -172,12 +192,27 @@ fn strip(ui: &mut Ui, range: &mut NoteRange, marks: &[f32]) {
                 clamp_pair(&mut lo, &mut hi, bounds, gap, Grab::Both);
             }
         }
-        active = if resp.dragged() { ui.data(|d| d.get_temp::<(Grab, f32, f32, f32)>(id)).map(|t| t.0) } else if resp.hovered() { Some(pick(p.x, lo, hi)) } else { None };
+        active = if resp.dragged() {
+            ui.data(|d| d.get_temp::<(Grab, f32, f32, f32)>(id))
+                .map(|t| t.0)
+        } else if resp.hovered() {
+            Some(pick(p.x, lo, hi))
+        } else {
+            None
+        };
         if active.is_some() {
-            ui.ctx().set_cursor_icon(if active == Some(Grab::Both) { CursorIcon::Grab } else { CursorIcon::ResizeHorizontal });
+            ui.ctx().set_cursor_icon(if active == Some(Grab::Both) {
+                CursorIcon::Grab
+            } else {
+                CursorIcon::ResizeHorizontal
+            });
         }
     }
-    *range = NoteRange { lo: lo as i32, hi: hi as i32 }.sanitized();
+    *range = NoteRange {
+        lo: lo as i32,
+        hi: hi as i32,
+    }
+    .sanitized();
 
     if !ui.is_rect_visible(rect) {
         return;
@@ -190,9 +225,23 @@ fn strip(ui: &mut Ui, range: &mut NoteRange, marks: &[f32]) {
     let hz = full.hz_scale(rect);
     for t in hz.ticks(34.0) {
         let x = hz.px(t.value);
-        p.vline(x, rect.top()..=rect.top() + 3.0, Stroke::new(1.0, plot::TICK));
-        let c = if t.major { Color32::from_gray(140) } else { Color32::from_gray(95) };
-        p.text(pos2(x, rect.top() + 1.0), Align2::CENTER_TOP, plot::fmt_hz(t.value), FontId::monospace(9.0), c);
+        p.vline(
+            x,
+            rect.top()..=rect.top() + 3.0,
+            Stroke::new(1.0, plot::TICK),
+        );
+        let c = if t.major {
+            Color32::from_gray(140)
+        } else {
+            Color32::from_gray(95)
+        };
+        p.text(
+            pos2(x, rect.top() + 1.0),
+            Align2::CENTER_TOP,
+            plot::fmt_hz(t.value),
+            FontId::monospace(9.0),
+            c,
+        );
     }
 
     // Piano-roll keys: equal-width columns (log frequency), white / black.
@@ -200,11 +249,25 @@ fn strip(ui: &mut Ui, range: &mut NoteRange, marks: &[f32]) {
     for k in full.notes() {
         let x0 = notes.px(k as f32 - 0.5);
         let black = is_black(k);
-        let fill = if black { Color32::from_gray(26) } else { Color32::from_gray(78) };
-        p.rect_filled(Rect::from_min_max(pos2(x0, keys.top()), pos2(x0 + kw, keys.bottom())), 0.0, fill);
+        let fill = if black {
+            Color32::from_gray(26)
+        } else {
+            Color32::from_gray(78)
+        };
+        p.rect_filled(
+            Rect::from_min_max(pos2(x0, keys.top()), pos2(x0 + kw, keys.bottom())),
+            0.0,
+            fill,
+        );
         if k.rem_euclid(12) == 0 {
             p.vline(x0, keys.y_range(), Stroke::new(1.0, Color32::from_gray(30)));
-            p.text(pos2(x0 + 1.5, keys.bottom() - 1.0), Align2::LEFT_BOTTOM, pitch::note_name(k), FontId::proportional(8.0), Color32::from_gray(30));
+            p.text(
+                pos2(x0 + 1.5, keys.bottom() - 1.0),
+                Align2::LEFT_BOTTOM,
+                pitch::note_name(k),
+                FontId::proportional(8.0),
+                Color32::from_gray(30),
+            );
         } else if !black && !is_black(k - 1) {
             // E|F and B|C: white keys that touch.
             p.vline(x0, keys.y_range(), Stroke::new(1.0, Color32::from_gray(52)));
@@ -212,15 +275,35 @@ fn strip(ui: &mut Ui, range: &mut NoteRange, marks: &[f32]) {
     }
 
     // Dim outside the selection; outline and edge handles on it.
-    let sel = Rect::from_min_max(pos2(edge_x(range.lo as f32, false), keys.top()), pos2(edge_x(range.hi as f32, true), keys.bottom()));
+    let sel = Rect::from_min_max(
+        pos2(edge_x(range.lo as f32, false), keys.top()),
+        pos2(edge_x(range.hi as f32, true), keys.bottom()),
+    );
     let shade = Color32::from_black_alpha(175);
-    p.rect_filled(Rect::from_min_max(keys.min, pos2(sel.left(), keys.bottom())), 0.0, shade);
-    p.rect_filled(Rect::from_min_max(pos2(sel.right(), keys.top()), keys.max), 0.0, shade);
+    p.rect_filled(
+        Rect::from_min_max(keys.min, pos2(sel.left(), keys.bottom())),
+        0.0,
+        shade,
+    );
+    p.rect_filled(
+        Rect::from_min_max(pos2(sel.right(), keys.top()), keys.max),
+        0.0,
+        shade,
+    );
     p.rect_filled(sel, 0.0, theme::ACCENT.gamma_multiply(0.18));
-    p.rect_stroke(sel, 1.0, Stroke::new(1.0, theme::ACCENT_BRIGHT), egui::StrokeKind::Inside);
+    p.rect_stroke(
+        sel,
+        1.0,
+        Stroke::new(1.0, theme::ACCENT_BRIGHT),
+        egui::StrokeKind::Inside,
+    );
     for (x, g) in [(sel.left() + 1.0, Grab::Lo), (sel.right() - 1.0, Grab::Hi)] {
         let lit = active == Some(g) || active == Some(Grab::Both);
-        p.vline(x, keys.y_range(), Stroke::new(3.0, if lit { Color32::WHITE } else { theme::HANDLE }));
+        p.vline(
+            x,
+            keys.y_range(),
+            Stroke::new(3.0, if lit { Color32::WHITE } else { theme::HANDLE }),
+        );
     }
 
     // Live pitches from the analysers.
@@ -230,8 +313,16 @@ fn strip(ui: &mut Ui, range: &mut NoteRange, marks: &[f32]) {
             continue;
         }
         let x0 = notes.px(k as f32 - 0.5);
-        p.rect_filled(Rect::from_min_max(pos2(x0, keys.bottom() - 5.0), pos2(x0 + kw, keys.bottom())), 0.0, theme::ACCENT_BRIGHT);
-        p.vline(notes.px(m), keys.y_range(), Stroke::new(1.0, theme::ON_ACCENT));
+        p.rect_filled(
+            Rect::from_min_max(pos2(x0, keys.bottom() - 5.0), pos2(x0 + kw, keys.bottom())),
+            0.0,
+            theme::ACCENT_BRIGHT,
+        );
+        p.vline(
+            notes.px(m),
+            keys.y_range(),
+            Stroke::new(1.0, theme::ON_ACCENT),
+        );
     }
 
     if let Some(h) = resp.hover_pos() {

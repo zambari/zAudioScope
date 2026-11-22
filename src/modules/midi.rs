@@ -48,7 +48,13 @@ struct Params {
 
 impl Default for Params {
     fn default() -> Self {
-        Self { port: None, channel: None, span_s: 8.0, octave: 0, style: NoteStyle::default() }
+        Self {
+            port: None,
+            channel: None,
+            span_s: 8.0,
+            octave: 0,
+            style: NoteStyle::default(),
+        }
     }
 }
 
@@ -121,7 +127,11 @@ fn input(name: &str) -> Result<midir::MidiInput, String> {
 fn list_ports() -> Vec<String> {
     // A fresh client each time: a long-lived one may not see ports come and go.
     match input("zAudioScope scan") {
-        Ok(i) => i.ports().iter().filter_map(|p| i.port_name(p).ok()).collect(),
+        Ok(i) => i
+            .ports()
+            .iter()
+            .filter_map(|p| i.port_name(p).ok())
+            .collect(),
         Err(_) => Vec::new(),
     }
 }
@@ -141,7 +151,9 @@ impl MidiMonitor {
     }
 
     fn held(&self) -> impl Iterator<Item = &Note> {
-        self.notes.iter().filter(|n| n.off.is_none() && self.passes(n.ch))
+        self.notes
+            .iter()
+            .filter(|n| n.off.is_none() && self.passes(n.ch))
     }
 
     fn disconnect(&mut self) {
@@ -172,7 +184,11 @@ impl MidiMonitor {
                     if !(0x80..0xF0).contains(&status) {
                         return;
                     }
-                    let b = [status, msg.get(1).copied().unwrap_or(0), msg.get(2).copied().unwrap_or(0)];
+                    let b = [
+                        status,
+                        msg.get(1).copied().unwrap_or(0),
+                        msg.get(2).copied().unwrap_or(0),
+                    ];
                     if let Ok(mut q) = queue.lock() {
                         q.push((epoch.elapsed().as_secs_f64(), b));
                     }
@@ -203,7 +219,11 @@ impl MidiMonitor {
         }
         self.last_scan = Some(Instant::now());
         self.ports = list_ports();
-        if self.connected.as_ref().is_some_and(|n| !self.ports.contains(n)) {
+        if self
+            .connected
+            .as_ref()
+            .is_some_and(|n| !self.ports.contains(n))
+        {
             self.disconnect();
             self.error = None;
         }
@@ -236,7 +256,13 @@ impl MidiMonitor {
             (0x90, v) if v > 0 => {
                 // Retriggered without a note-off: end the old one here.
                 self.close_note(ch, Some(b[1]), t);
-                self.notes.push_back(Note { ch, key: b[1], vel: v, on: t, off: None });
+                self.notes.push_back(Note {
+                    ch,
+                    key: b[1],
+                    vel: v,
+                    on: t,
+                    off: None,
+                });
                 if self.notes.len() > RING {
                     self.notes.pop_front();
                 }
@@ -250,7 +276,7 @@ impl MidiMonitor {
 
     fn channel_boxes(&mut self, ui: &mut Ui) {
         let now = self.now();
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 1.0;
             let size = vec2(20.0, 18.0);
             for ch in 0..16u8 {
@@ -273,13 +299,27 @@ impl MidiMonitor {
                     Stroke::new(1.0, Color32::from_gray(52))
                 };
                 p.rect_stroke(rect, 1.0, stroke, egui::StrokeKind::Inside);
-                let text = if lit > 0.5 { Color32::BLACK } else { Color32::from_gray(150) };
-                p.text(rect.center(), Align2::CENTER_CENTER, format!("{}", ch + 1), FontId::proportional(8.0), text);
+                let text = if lit > 0.5 {
+                    Color32::BLACK
+                } else {
+                    Color32::from_gray(150)
+                };
+                p.text(
+                    rect.center(),
+                    Align2::CENTER_CENTER,
+                    format!("{}", ch + 1),
+                    FontId::proportional(8.0),
+                    text,
+                );
                 if resp.clicked() {
                     // Clicking the selected channel goes back to all.
                     self.p.channel = if selected { None } else { Some(ch) };
                 }
-                resp.on_hover_text(format!("channel {}: {} messages", ch + 1, self.count[ch as usize]));
+                resp.on_hover_text(format!(
+                    "channel {}: {} messages",
+                    ch + 1,
+                    self.count[ch as usize]
+                ));
             }
         });
     }
@@ -346,27 +386,38 @@ impl Module for MidiMonitor {
             Some(name) => egui::RichText::new(name),
             None => egui::RichText::new("— none —"),
         };
-        let combo = egui::ComboBox::from_id_salt("midi_port").width(200.0).selected_text(shown).show_ui(
-            ui,
-            |ui| {
+        let combo = egui::ComboBox::from_id_salt("midi_port")
+            .width(200.0)
+            .selected_text(shown)
+            .show_ui(ui, |ui| {
                 let mut pick = None;
-                if ui.selectable_label(self.p.port.is_none(), "— none —").clicked() {
+                if ui
+                    .selectable_label(self.p.port.is_none(), "— none —")
+                    .clicked()
+                {
                     pick = Some(None);
                 }
                 // The chosen port while unplugged: shown, but not pickable.
                 if let Some(name) = self.p.port.as_ref().filter(|_| missing) {
-                    ui.add_enabled(false, egui::Button::selectable(true, format!("{name} (not connected)")));
+                    ui.add_enabled(
+                        false,
+                        egui::Button::selectable(true, format!("{name} (not connected)")),
+                    );
                 }
                 for name in &self.ports {
-                    if ui.selectable_label(self.connected.as_ref() == Some(name), name).clicked() {
+                    if ui
+                        .selectable_label(self.connected.as_ref() == Some(name), name)
+                        .clicked()
+                    {
                         pick = Some(Some(name.clone()));
                     }
                 }
                 pick
-            },
-        );
+            });
         if missing {
-            combo.response.on_hover_text("Device not connected; it reopens when it comes back");
+            combo
+                .response
+                .on_hover_text("Device not connected; it reopens when it comes back");
         }
         match combo.inner.flatten() {
             Some(Some(name)) => {
@@ -385,14 +436,22 @@ impl Module for MidiMonitor {
 
         ui.separator();
         ui.label("Source");
-        if ui.selectable_label(self.p.channel.is_none(), "all").clicked() {
+        if ui
+            .selectable_label(self.p.channel.is_none(), "all")
+            .clicked()
+        {
             self.p.channel = None;
         }
         self.channel_boxes(ui);
     }
 
     fn params(&mut self, ui: &mut Ui, shared: &Shared) {
-        ui.add(egui::Slider::new(&mut self.p.span_s, 0.5..=60.0).logarithmic(true).suffix(" s").text("history"));
+        ui.add(
+            egui::Slider::new(&mut self.p.span_s, 0.5..=60.0)
+                .logarithmic(true)
+                .suffix(" s")
+                .text("history"),
+        );
         ui.horizontal(|ui| {
             ui.label("octave");
             if ui.small_button("−").clicked() {
@@ -400,7 +459,11 @@ impl Module for MidiMonitor {
             }
             let o = self.p.octave;
             let text = if o == 0 { "0".into() } else { format!("{o:+}") };
-            if ui.add(egui::Label::new(egui::RichText::new(text).monospace()).sense(Sense::click())).on_hover_text("Shift notes up/down by octaves; click to reset").clicked() {
+            if ui
+                .add(egui::Label::new(egui::RichText::new(text).monospace()).sense(Sense::click()))
+                .on_hover_text("Shift notes up/down by octaves; click to reset")
+                .clicked()
+            {
                 self.p.octave = 0;
             }
             if ui.small_button("+").clicked() {
@@ -409,11 +472,25 @@ impl Module for MidiMonitor {
         });
         self.p.style.ui(ui);
         ui.horizontal(|ui| {
-            if ui.button("fit range").on_hover_text("Set the shared note range to the notes in the history").clicked() {
-                let keys = self.notes.iter().filter(|n| self.passes(n.ch)).map(|n| self.shown_key(n));
+            if ui
+                .button("fit range")
+                .on_hover_text("Set the shared note range to the notes in the history")
+                .clicked()
+            {
+                let keys = self
+                    .notes
+                    .iter()
+                    .filter(|n| self.passes(n.ch))
+                    .map(|n| self.shown_key(n));
                 if let (Some(a), Some(b)) = (keys.clone().min(), keys.max()) {
                     let pad = ((NoteRange::MIN_KEYS - (b - a)).max(0) + 1) / 2 + 2;
-                    shared.range.set(NoteRange { lo: a - pad, hi: b + pad }.sanitized());
+                    shared.range.set(
+                        NoteRange {
+                            lo: a - pad,
+                            hi: b + pad,
+                        }
+                        .sanitized(),
+                    );
                 }
             }
             if ui.button("clear").clicked() {
@@ -444,20 +521,45 @@ impl Module for MidiMonitor {
         for k in lo..=hi {
             let x = key_x(k);
             if is_black(k) {
-                p.rect_filled(Rect::from_min_max(pos2(x, plot.top()), pos2(x + kw, plot.bottom())), 0.0, Color32::from_gray(19));
+                p.rect_filled(
+                    Rect::from_min_max(pos2(x, plot.top()), pos2(x + kw, plot.bottom())),
+                    0.0,
+                    Color32::from_gray(19),
+                );
             }
             if k.rem_euclid(12) == 0 {
-                p.line_segment([pos2(x, plot.top()), pos2(x, rect.bottom())], Stroke::new(1.0, Color32::from_gray(40)));
-                p.text(pos2(x + 2.0, rect.bottom() - 1.0), Align2::LEFT_BOTTOM, pitch::note_name(k), FontId::proportional(9.0), Color32::from_gray(120));
+                p.line_segment(
+                    [pos2(x, plot.top()), pos2(x, rect.bottom())],
+                    Stroke::new(1.0, Color32::from_gray(40)),
+                );
+                p.text(
+                    pos2(x + 2.0, rect.bottom() - 1.0),
+                    Align2::LEFT_BOTTOM,
+                    pitch::note_name(k),
+                    FontId::proportional(9.0),
+                    Color32::from_gray(120),
+                );
             }
         }
         // Seconds ago.
-        let step = [0.25, 0.5, 1.0, 2.0, 5.0, 10.0].into_iter().find(|s| span / s <= 10.0).unwrap_or(10.0);
+        let step = [0.25, 0.5, 1.0, 2.0, 5.0, 10.0]
+            .into_iter()
+            .find(|s| span / s <= 10.0)
+            .unwrap_or(10.0);
         let mut s = step;
         while s < span {
             let y = time_y(now - s);
-            p.line_segment([pos2(plot.left(), y), pos2(plot.right(), y)], Stroke::new(1.0, Color32::from_gray(30)));
-            p.text(pos2(plot.right() - 3.0, y - 1.0), Align2::RIGHT_BOTTOM, format!("-{s}s"), FontId::proportional(9.0), Color32::from_gray(90));
+            p.line_segment(
+                [pos2(plot.left(), y), pos2(plot.right(), y)],
+                Stroke::new(1.0, Color32::from_gray(30)),
+            );
+            p.text(
+                pos2(plot.right() - 3.0, y - 1.0),
+                Align2::RIGHT_BOTTOM,
+                format!("-{s}s"),
+                FontId::proportional(9.0),
+                Color32::from_gray(90),
+            );
             s += step;
         }
 
@@ -470,8 +572,16 @@ impl Module for MidiMonitor {
                 continue;
             }
             let k = self.shown_key(n);
-            let base = theme::lerp(theme::ACCENT.gamma_multiply(0.6), theme::ACCENT_BRIGHT, style.vel_gain(n.vel));
-            let fill = if n.off.is_none() { theme::lerp(base, theme::ON_ACCENT, 0.35) } else { base };
+            let base = theme::lerp(
+                theme::ACCENT.gamma_multiply(0.6),
+                theme::ACCENT_BRIGHT,
+                style.vel_gain(n.vel),
+            );
+            let fill = if n.off.is_none() {
+                theme::lerp(base, theme::ON_ACCENT, 0.35)
+            } else {
+                base
+            };
             let draw = |m: &mut Mesh, k: i32, gain: f32, ghost: bool| {
                 let x = style.span(key_x(k), kw, ghost);
                 style.add_note(m, x, fill, gain, (n.on, n.off), now, min_hold, &time_y);
@@ -483,7 +593,11 @@ impl Module for MidiMonitor {
                 }
             }
             if k < lo || k > hi {
-                if k < lo { below += 1 } else { above += 1 }
+                if k < lo {
+                    below += 1
+                } else {
+                    above += 1
+                }
                 continue;
             }
             let x = draw(&mut mesh, k, 1.0, false);
@@ -504,10 +618,22 @@ impl Module for MidiMonitor {
         // Notes the key range hides.
         let small = FontId::proportional(10.0);
         if below > 0 {
-            p.text(plot.left_top() + vec2(4.0, 3.0), Align2::LEFT_TOP, format!("◀ {below} below"), small.clone(), theme::ACCENT_BRIGHT);
+            p.text(
+                plot.left_top() + vec2(4.0, 3.0),
+                Align2::LEFT_TOP,
+                format!("◀ {below} below"),
+                small.clone(),
+                theme::ACCENT_BRIGHT,
+            );
         }
         if above > 0 {
-            p.text(plot.right_top() + vec2(-4.0, 3.0), Align2::RIGHT_TOP, format!("{above} above ▶"), small, theme::ACCENT_BRIGHT);
+            p.text(
+                plot.right_top() + vec2(-4.0, 3.0),
+                Align2::RIGHT_TOP,
+                format!("{above} above ▶"),
+                small,
+                theme::ACCENT_BRIGHT,
+            );
         }
 
         // Held notes light up their key along the bottom.
@@ -515,13 +641,27 @@ impl Module for MidiMonitor {
             let k = self.shown_key(n);
             if (lo..=hi).contains(&k) {
                 let x = key_x(k);
-                p.rect_filled(Rect::from_min_max(pos2(x, plot.bottom()), pos2(x + kw, plot.bottom() + 3.0)), 0.0, theme::ACCENT_BRIGHT);
+                p.rect_filled(
+                    Rect::from_min_max(pos2(x, plot.bottom()), pos2(x + kw, plot.bottom() + 3.0)),
+                    0.0,
+                    theme::ACCENT_BRIGHT,
+                );
             }
         }
 
         if self.connected.is_none() {
-            let text = if self.missing() { "no device" } else { "no MIDI input selected" };
-            p.text(plot.center(), Align2::CENTER_CENTER, text, FontId::proportional(13.0), Color32::from_gray(90));
+            let text = if self.missing() {
+                "no device"
+            } else {
+                "no MIDI input selected"
+            };
+            p.text(
+                plot.center(),
+                Align2::CENTER_CENTER,
+                text,
+                FontId::proportional(13.0),
+                Color32::from_gray(90),
+            );
         }
     }
 }

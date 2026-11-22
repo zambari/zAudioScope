@@ -104,7 +104,8 @@ impl Params {
 
     pub fn ui(&mut self, ui: &mut Ui, link: &mut Link<Key>) {
         ui.add(egui::Slider::new(&mut self.fft_pow, 10..=15).text("FFT 2^n"));
-        ui.add(egui::Slider::new(&mut self.rows, ROWS.0..=ROWS.1).text("history"));
+        ui.add(egui::Slider::new(&mut self.rows, ROWS.0..=ROWS.1).text("history rows"))
+            .on_hover_text("Number of spectrum rows retained. Time between rows is set by ms / row.");
         ui.add(RangeSlider::new(&mut self.floor_db, &mut self.ceil_db, spectrum::FLOOR_DB..=DB_CEIL).min_gap(DB_MIN_GAP).text("dB"));
         link.slider(ui, Key::Speed, egui::Slider::new(&mut self.row_ms, ROW_MS.0..=ROW_MS.1).logarithmic(true).text("ms / row"));
         ui.checkbox(&mut self.follow_gate, "only gated window");

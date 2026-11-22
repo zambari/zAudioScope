@@ -200,9 +200,6 @@ impl Module for Scope {
             }
             let gate = Rect::from_x_y_ranges(x_of_ms(self.p.win_start_ms)..=x_of_ms(self.p.win_end_ms), rect.y_range());
             painter.rect_filled(gate, 0.0, theme::ACCENT.gamma_multiply(0.25));
-            for v in [self.p.threshold, -self.p.threshold] {
-                painter.hline(rect.x_range(), amp.px(v), Stroke::new(1.0, theme::ACCENT_BRIGHT.gamma_multiply(0.4)));
-            }
         }
         Axis::new(Edge::Bottom, xs).draw(&painter, rect, plot::fmt_ms);
         draw_db_axis(&painter, rect, &amp, self.p.gain);

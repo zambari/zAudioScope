@@ -1,5 +1,5 @@
-//! Analyser modules. Each is a foldout row: parameters on the left, graph
-//! on the right. The scope runs first and decides which slice of audio the
+//! Analyser modules. Parameters live in the inspector, graphs in a resizable
+//! display stack. The scope runs first and decides which slice of audio the
 //! others analyse (the gate), so the tuner can look only at "the bass note
 //! 80–400 ms after the kick".
 //!
@@ -72,7 +72,14 @@ pub struct Shared {
 
 impl Shared {
     pub fn new(frame: Frame, reset: bool, range: NoteRange, plans: FftPlans) -> Self {
-        Self { frame, gate: Gate::default(), reset, range: Cell::new(range), plans: RefCell::new(plans), cache: Default::default() }
+        Self {
+            frame,
+            gate: Gate::default(),
+            reset,
+            range: Cell::new(range),
+            plans: RefCell::new(plans),
+            cache: Default::default(),
+        }
     }
 
     /// End of frame: drop every cached result, keep the FFT plans.
@@ -116,7 +123,12 @@ impl Shared {
         }
         let power: Rc<[f32]> = {
             let mut plans = self.plans.borrow_mut();
-            plans.0.entry(n).or_insert_with(|| Fft::new(n)).power(&x).into()
+            plans
+                .0
+                .entry(n)
+                .or_insert_with(|| Fft::new(n))
+                .power(&x)
+                .into()
         };
         self.cache.borrow_mut().spectra.insert(key, power.clone());
         power
@@ -132,7 +144,11 @@ impl Shared {
             return d.clone();
         }
         let d = if factor == 1 {
-            Rc::new(Frame { samples: self.frame.samples.clone(), rate: self.frame.rate, start: self.frame.start })
+            Rc::new(Frame {
+                samples: self.frame.samples.clone(),
+                rate: self.frame.rate,
+                start: self.frame.start,
+            })
         } else {
             Rc::new(halve(&self.decimated(factor / 2)))
         };
@@ -156,7 +172,11 @@ fn halve(f: &Frame) -> Frame {
             (at(i - 2) + 4.0 * at(i - 1) + 6.0 * at(i) + 4.0 * at(i + 1) + at(i + 2)) / 16.0
         })
         .collect();
-    Frame { samples, rate: f.rate / 2, start: first }
+    Frame {
+        samples,
+        rate: f.rate / 2,
+        start: first,
+    }
 }
 
 pub trait Module {
@@ -165,6 +185,7 @@ pub trait Module {
     fn save_params(&self, storage: &mut dyn eframe::Storage, key: &str);
     /// Restore parameters saved by `save_params`; keeps defaults if absent.
     fn load_params(&mut self, storage: &dyn eframe::Storage, key: &str);
+    /// Initial relative display size, before the user adjusts the dividers.
     fn graph_height(&self) -> f32 {
         200.0
     }
@@ -178,11 +199,11 @@ pub trait Module {
     fn update(&mut self, _shared: &mut Shared) {}
     /// Live pitches (fractional MIDI) to light on the shared range bar.
     fn marks(&self, _out: &mut Vec<f32>) {}
-    /// Whether this module adds a settings row under the top bar.
+    /// Whether this module has global device controls below the audio toolbar.
     fn has_top_row(&self) -> bool {
         false
     }
-    /// Device-level settings shown in the module's own top-bar row.
+    /// Global device controls shown above the workspace layout.
     fn top_row(&mut self, _ui: &mut Ui) {}
     fn params(&mut self, ui: &mut Ui, shared: &Shared);
     fn graph(&mut self, ui: &mut Ui, rect: Rect, shared: &Shared);
@@ -203,7 +224,11 @@ impl Slot {
 }
 
 pub fn all() -> Vec<Slot> {
-    let slot = |m: Box<dyn Module>| Slot { visible: true, open: true, module: m };
+    let slot = |m: Box<dyn Module>| Slot {
+        visible: true,
+        open: true,
+        module: m,
+    };
     vec![
         slot(Box::new(scope::Scope::default())),
         slot(Box::new(tuner::Tuner::default())),

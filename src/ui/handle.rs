@@ -1,8 +1,8 @@
 //! Edge handles: a small reddish triangle glued to one side of a graph that
 //! drags a value along that side (the scope's threshold on its left edge,
 //! the scope's gate window along its bottom...). The tip touches the
-//! edge at the value. With the pointer elsewhere it shrinks to a dot;
-//! hovering that side of the graph brings it back, with its label.
+//! edge at the value. With the pointer elsewhere it stays an outlined triangle;
+//! hovering that side of the graph fades in its fill and label.
 //!
 //! Register handles after any whole-graph interaction (like the scope's
 //! drag-to-select) so they win the hit test.
@@ -68,7 +68,7 @@ impl<'a> EdgeHandle<'a> {
         self
     }
 
-    /// Faint line across the graph while hovered or dragged (default on).
+    /// Faint vertical guide for top/bottom handles while hovered or dragged (default on).
     pub fn guide(mut self, on: bool) -> Self {
         self.guide = on;
         self
@@ -113,24 +113,17 @@ impl<'a> EdgeHandle<'a> {
         let painter = ui.painter_at(rect);
         let color = if active { self.color } else { self.color.gamma_multiply(0.8) };
 
-        if self.guide && active {
+        if self.guide && active && !edge.vertical() {
             let s = Stroke::new(1.0, self.color.gamma_multiply(if resp.dragged() { 0.5 } else { 0.3 }));
-            let along = edge.along(tip);
-            if edge.vertical() {
-                painter.hline(rect.x_range(), along, s);
-            } else {
-                painter.vline(along, rect.y_range(), s);
-            }
+            painter.vline(edge.along(tip), rect.y_range(), s);
         }
-        if vis < 0.99 {
-            painter.circle_filled(tip + n * 3.0, 2.0, self.color.gamma_multiply(0.65 * (1.0 - vis)));
-        }
-        if vis > 0.01 {
-            let s = SIZE * (0.45 + 0.55 * vis);
-            let side = vec2(-n.y, n.x) * (s * 0.6);
-            let base = tip + n * s;
-            painter.add(Shape::convex_polygon(vec![tip, base + side, base - side], color.gamma_multiply(vis), Stroke::NONE));
-        }
+        let side = vec2(-n.y, n.x) * (SIZE * 0.6);
+        let base = tip + n * SIZE;
+        painter.add(Shape::convex_polygon(
+            vec![tip, base + side, base - side],
+            color.gamma_multiply(vis),
+            Stroke::new(1.0, color),
+        ));
         if let Some(fmt) = self.label
             && vis > 0.02
         {

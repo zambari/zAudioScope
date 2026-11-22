@@ -9,7 +9,139 @@
 
 use std::ops::RangeInclusive;
 
-use egui::{Align2, AsIdSalt, CursorIcon, FontId, Frame, Margin, Response, Sense, Stroke, Ui, Widget, pos2, vec2};
+use egui::{
+    Align2, AsIdSalt, CursorIcon, FontId, Frame, Margin, Response, Sense, Stroke, Ui, Widget, pos2,
+    vec2,
+};
+
+/// Module foldout with an independent, right-aligned display switch.
+pub fn module_header(ui: &mut Ui, title: &str, open: &mut bool, enabled: &mut bool) -> (egui::Pos2, f32) {
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 22.0), Sense::hover());
+    let switch = egui::Rect::from_min_max(
+        pos2((rect.right() - FLICK_HIT.x).max(rect.left()), rect.top()),
+        rect.max,
+    );
+    ui.put(switch, flicktoggle(enabled))
+        .on_hover_text(format!("Show {title} display"));
+    let label = egui::Rect::from_min_max(
+        rect.min,
+        pos2(switch.left().max(rect.left()), rect.bottom()),
+    );
+    let font = FontId::proportional(13.0);
+    let measure = |text: String| {
+        ui.painter().layout_no_wrap(text, font.clone(), ui.visuals().text_color()).size().x
+    };
+    let name_left = label.left() + 2.0 + measure("⏷  ".to_owned());
+    let name = egui::Rect::from_min_max(
+        pos2(name_left, label.top()),
+        pos2(name_left + measure(title.to_owned()), label.bottom()),
+    ).intersect(label);
+    // Expanded sections only fold from the name; the remaining header still
+    // selects the module for its connector without collapsing the controls.
+    let hit = if *open { name } else { label };
+    let response = ui.interact(hit, ui.scope_id().with("foldout"), Sense::click());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), title));
+    if response.clicked() {
+        *open = !*open;
+    }
+    let mut label_end = label.left_center();
+    if ui.is_rect_visible(label) {
+        if response.hovered() {
+            ui.painter()
+                .rect_filled(hit, 2.0, ui.visuals().widgets.hovered.weak_bg_fill);
+        }
+        let arrow = if *open { "⏷" } else { "⏵" };
+        let text_rect = ui.painter()
+            .with_clip_rect(label.intersect(ui.clip_rect()))
+            .text(
+                label.left_center() + vec2(2.0, 0.0),
+                Align2::LEFT_CENTER,
+                format!("{arrow}  {title}"),
+                FontId::proportional(13.0),
+                ui.style().interact(&response).text_color(),
+            );
+        label_end = pos2(text_rect.right() + 35.0, text_rect.center().y);
+    }
+    (label_end, switch.left() - 4.0)
+}
+
+/// Drawn size of [`flicktoggle`].
+const FLICK_SIZE: egui::Vec2 = vec2(44.0, 18.0);
+/// Click area of [`flicktoggle`]: the drawn switch sits at its right edge,
+/// with extra room to the left and above/below so near-misses still toggle
+/// instead of folding the module header.
+const FLICK_HIT: egui::Vec2 = vec2(FLICK_SIZE.x + 16.0, 22.0);
+
+/// Compact flicktoggle: muted orange rail with a faint orange border when
+/// on, dark rail with a grey outline when off.
+pub fn flicktoggle(enabled: &mut bool) -> impl Widget + '_ {
+    use super::theme;
+    use egui::{Color32, StrokeKind};
+    move |ui: &mut Ui| {
+        let (hit, mut response) = ui.allocate_exact_size(FLICK_HIT, Sense::click());
+        let rect = egui::Rect::from_min_size(
+            pos2(
+                hit.right() - FLICK_SIZE.x,
+                hit.center().y - FLICK_SIZE.y / 2.0,
+            ),
+            FLICK_SIZE,
+        );
+        if response.clicked() {
+            *enabled = !*enabled;
+            response.mark_changed();
+        }
+        response.widget_info(|| {
+            egui::WidgetInfo::selected(egui::Role::CheckBox, ui.is_enabled(), *enabled, "Display")
+        });
+        if ui.is_rect_visible(rect) {
+            let lit = response.hovered() || response.has_focus();
+            let (fill, border) = if *enabled {
+                (
+                    theme::lerp(Color32::from_gray(30), theme::ACCENT, 0.5),
+                    theme::ACCENT_BRIGHT.gamma_multiply(if lit { 0.75 } else { 0.4 }),
+                )
+            } else {
+                (
+                    Color32::from_gray(28),
+                    Color32::from_gray(if lit { 95 } else { 68 }),
+                )
+            };
+            let p = ui.painter();
+            p.rect_filled(rect, 4.0, fill);
+            p.rect_stroke(rect, 4.0, Stroke::new(1.0, border), StrokeKind::Inside);
+            let inner = rect.shrink(2.0);
+            let width = 21.0;
+            let x = if *enabled {
+                inner.right() - width
+            } else {
+                inner.left()
+            };
+            let thumb =
+                egui::Rect::from_min_size(pos2(x, inner.top()), vec2(width, inner.height()));
+            let grey = if *enabled {
+                170
+            } else if lit {
+                90
+            } else {
+                70
+            };
+            p.rect_filled(thumb, 3.0, Color32::from_gray(grey));
+            let text = if *enabled {
+                Color32::from_gray(30)
+            } else {
+                Color32::from_gray(190)
+            };
+            p.text(
+                thumb.center(),
+                Align2::CENTER_CENTER,
+                if *enabled { "On" } else { "Off" },
+                FontId::proportional(10.0),
+                text,
+            );
+        }
+        response
+    }
+}
 
 // ---- Foldout ---------------------------------------------------------------
 
@@ -29,7 +161,12 @@ impl<S: AsIdSalt> Foldout<S> {
     /// `id_salt` keeps the remembered state; keep it stable (the title may
     /// change, the salt shouldn't).
     pub fn new(salt: S, title: impl Into<String>) -> Self {
-        Self { salt, title: title.into(), summary: None, default_open: false }
+        Self {
+            salt,
+            title: title.into(),
+            summary: None,
+            default_open: false,
+        }
     }
 
     /// Short faint text at the right of the header, shown open or closed.
@@ -58,7 +195,15 @@ impl<S: AsIdSalt> Foldout<S> {
             let v = ui.style().interact(&resp);
             let painter = ui.painter();
             if resp.hovered() {
-                painter.rect_filled(rect, 2.0, ui.visuals().widgets.hovered.weak_bg_fill.gamma_multiply(0.5));
+                painter.rect_filled(
+                    rect,
+                    2.0,
+                    ui.visuals()
+                        .widgets
+                        .hovered
+                        .weak_bg_fill
+                        .gamma_multiply(0.5),
+                );
             }
             let arrow = if open { "⏷" } else { "⏵" };
             painter.text(
@@ -81,7 +226,15 @@ impl<S: AsIdSalt> Foldout<S> {
         if !open {
             return None;
         }
-        let inner = Frame::NONE.inner_margin(Margin { left: 10, right: 0, top: 0, bottom: 4 }).show(ui, body).inner;
+        let inner = Frame::NONE
+            .inner_margin(Margin {
+                left: 10,
+                right: 0,
+                top: 0,
+                bottom: 4,
+            })
+            .show(ui, body)
+            .inner;
         Some(inner)
     }
 }
@@ -108,7 +261,14 @@ pub enum Grab {
 
 impl<'a> RangeSlider<'a> {
     pub fn new(lo: &'a mut f32, hi: &'a mut f32, bounds: RangeInclusive<f32>) -> Self {
-        Self { lo, hi, bounds, min_gap: 0.0, text: String::new(), decimals: 0 }
+        Self {
+            lo,
+            hi,
+            bounds,
+            min_gap: 0.0,
+            text: String::new(),
+            decimals: 0,
+        }
     }
 
     /// Smallest allowed `hi - lo`.
@@ -153,7 +313,14 @@ pub fn clamp_pair(lo: &mut f32, hi: &mut f32, (min, max): (f32, f32), gap: f32, 
 
 impl Widget for RangeSlider<'_> {
     fn ui(self, ui: &mut Ui) -> Response {
-        let Self { lo, hi, bounds, min_gap, text, decimals } = self;
+        let Self {
+            lo,
+            hi,
+            bounds,
+            min_gap,
+            text,
+            decimals,
+        } = self;
         let (min, max) = (*bounds.start(), *bounds.end());
         let span = (max - min).max(f32::EPSILON);
         let (lo0, hi0) = (*lo, *hi);
@@ -189,11 +356,17 @@ impl Widget for RangeSlider<'_> {
                 if g != Grab::Both {
                     // Jump the picked handle to the pointer.
                     let v = v_of(p.x);
-                    if g == Grab::Lo { *lo = v } else { *hi = v }
+                    if g == Grab::Lo {
+                        *lo = v
+                    } else {
+                        *hi = v
+                    }
                     clamp_pair(lo, hi, (min, max), min_gap, g);
                 }
             } else if resp.dragged() {
-                let g = ui.data(|d| d.get_temp::<Grab>(grab_id)).unwrap_or(Grab::Both);
+                let g = ui
+                    .data(|d| d.get_temp::<Grab>(grab_id))
+                    .unwrap_or(Grab::Both);
                 match g {
                     Grab::Both => {
                         let dv = resp.drag_delta().x / rail.width() * span;
@@ -215,8 +388,14 @@ impl Widget for RangeSlider<'_> {
                     *hi += dv;
                     clamp_pair(lo, hi, (min, max), min_gap, Grab::Both);
                 }
-                let between = resp.hover_pos().is_some_and(|p| p.x > x_of(*lo) + r && p.x < x_of(*hi) - r);
-                ui.ctx().set_cursor_icon(if resp.dragged() || between { CursorIcon::Grab } else { CursorIcon::ResizeHorizontal });
+                let between = resp
+                    .hover_pos()
+                    .is_some_and(|p| p.x > x_of(*lo) + r && p.x < x_of(*hi) - r);
+                ui.ctx().set_cursor_icon(if resp.dragged() || between {
+                    CursorIcon::Grab
+                } else {
+                    CursorIcon::ResizeHorizontal
+                });
             }
 
             if ui.is_rect_visible(rect) {
@@ -224,13 +403,22 @@ impl Widget for RangeSlider<'_> {
                 let vis = ui.visuals();
                 let wv = ui.style().interact(&resp);
                 let cy = rect.center().y;
-                let rail_rect = egui::Rect::from_min_max(pos2(rail.left(), cy - 2.0), pos2(rail.right(), cy + 2.0));
+                let rail_rect = egui::Rect::from_min_max(
+                    pos2(rail.left(), cy - 2.0),
+                    pos2(rail.right(), cy + 2.0),
+                );
                 painter.rect_filled(rail_rect, 2.0, vis.widgets.inactive.bg_fill);
-                let fill = egui::Rect::from_min_max(pos2(x_of(*lo), cy - 2.0), pos2(x_of(*hi), cy + 2.0));
+                let fill =
+                    egui::Rect::from_min_max(pos2(x_of(*lo), cy - 2.0), pos2(x_of(*hi), cy + 2.0));
                 painter.rect_filled(fill, 2.0, vis.selection.bg_fill);
                 for v in [*lo, *hi] {
                     let c = pos2(x_of(v), cy);
-                    painter.circle(c, r * 0.8 + wv.expansion * 0.5, wv.bg_fill, Stroke::new(1.0, wv.fg_stroke.color));
+                    painter.circle(
+                        c,
+                        r * 0.8 + wv.expansion * 0.5,
+                        wv.bg_fill,
+                        Stroke::new(1.0, wv.fg_stroke.color),
+                    );
                 }
             }
 
@@ -238,12 +426,22 @@ impl Widget for RangeSlider<'_> {
             let (l, hh) = (*lo, *hi);
             let gap = min_gap.min(span);
             let dl = ui.add(
-                egui::DragValue::new(lo).range(min..=hh - gap).speed(speed).max_decimals(decimals).min_decimals(decimals),
+                egui::DragValue::new(lo)
+                    .range(min..=hh - gap)
+                    .speed(speed)
+                    .max_decimals(decimals)
+                    .min_decimals(decimals),
             );
             if dl.changed() {
                 clamp_pair(lo, hi, (min, max), min_gap, Grab::Lo);
             }
-            let dh = ui.add(egui::DragValue::new(hi).range(l + gap..=max).speed(speed).max_decimals(decimals).min_decimals(decimals));
+            let dh = ui.add(
+                egui::DragValue::new(hi)
+                    .range(l + gap..=max)
+                    .speed(speed)
+                    .max_decimals(decimals)
+                    .min_decimals(decimals),
+            );
             if dh.changed() {
                 clamp_pair(lo, hi, (min, max), min_gap, Grab::Hi);
             }

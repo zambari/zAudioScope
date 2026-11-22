@@ -1,5 +1,5 @@
-//! Window layout: top bar (input device, module toggles), a scroll view of
-//! foldout analyser rows, and a status bar.
+//! Window layout: input toolbar, scrollable inspector, proportional display
+//! stack, and a status bar.
 
 use serde::{Deserialize, Serialize};
 
@@ -7,7 +7,7 @@ use crate::audio::mic_permission::{self, MicAuth};
 use crate::audio::{ChannelSel, DeviceInfo, HISTORY_CHOICES, Input, InputSettings};
 use crate::modules::{self, FftPlans, Shared, Slot};
 use crate::relaunch::BuildWatch;
-use crate::ui::noterange::{self, NoteRange};
+use crate::ui::noterange::NoteRange;
 use crate::ui::{self, theme};
 
 const STATE_KEY: &str = "zaudioscope_state";
@@ -26,11 +26,21 @@ struct Saved {
     gain: f32,
     /// Shared note range of the frequency-axis analysers.
     range: NoteRange,
+    layout: ui::layout::Workspace,
+    debug: bool,
 }
 
 impl Default for Saved {
     fn default() -> Self {
-        Self { device_id: None, input: InputSettings::default(), modules: Vec::new(), gain: 1.0, range: NoteRange::default() }
+        Self {
+            device_id: None,
+            input: InputSettings::default(),
+            modules: Vec::new(),
+            gain: 1.0,
+            range: NoteRange::default(),
+            layout: Default::default(),
+            debug: false,
+        }
     }
 }
 
@@ -40,6 +50,8 @@ pub struct App {
     slots: Vec<Slot>,
     gain: f32,
     range: NoteRange,
+    layout: ui::layout::Workspace,
+    profiler: ui::profiler::Profiler,
     meter: ui::meter::Meter,
     /// Levels of every channel, shown in the channel picker.
     ch_meters: ui::meter::ChannelMeters,
@@ -62,10 +74,22 @@ pub struct App {
 impl App {
     pub fn new(ctx: &egui::Context, storage: Option<&dyn eframe::Storage>) -> Self {
         ui::theme::apply(ctx);
-        let saved: Saved = storage.and_then(|s| eframe::get_value(s, STATE_KEY)).unwrap_or_default();
+        let saved: Saved = storage
+            .and_then(|s| eframe::get_value(s, STATE_KEY))
+            .unwrap_or_default();
         let mut slots = modules::all();
         for slot in &mut slots {
-            if let Some((_, v, o)) = saved.modules.iter().find(|m| m.0 == slot.module.title()) {
+            if let Some((_, v, o)) = saved
+                .modules
+                .iter()
+                .find(|m| m.0 == slot.module.title())
+                .or_else(|| {
+                    saved
+                        .modules
+                        .iter()
+                        .find(|m| slot.module.title() == "Waterfall3D" && m.0 == "Waterfall")
+                })
+            {
                 (slot.visible, slot.open) = (*v, *o);
             }
             if let Some(s) = storage {
@@ -74,11 +98,16 @@ impl App {
             }
         }
         Self {
-            input: Input::open(&InputSettings { device_id: saved.device_id.clone(), ..saved.input.clone() }),
+            input: Input::open(&InputSettings {
+                device_id: saved.device_id.clone(),
+                ..saved.input.clone()
+            }),
             devices: Input::devices(),
             slots,
             gain: saved.gain.clamp(0.0, ui::meter::GAIN_MAX),
             range: saved.range.sanitized(),
+            layout: saved.layout,
+            profiler: ui::profiler::Profiler::new(saved.debug),
             meter: Default::default(),
             ch_meters: Default::default(),
             build_watch: BuildWatch::new(),
@@ -118,7 +147,10 @@ impl App {
         match self.mic {
             MicAuth::Authorized => return,
             MicAuth::NotDetermined => {
-                ui.colored_label(err, format!("No microphone permission yet for {owner}: input is silent."));
+                ui.colored_label(
+                    err,
+                    format!("No microphone permission yet for {owner}: input is silent."),
+                );
                 if ui.button("Ask for access").clicked() {
                     mic_permission::request();
                 }
@@ -153,17 +185,28 @@ impl App {
             self.listen_toggle(ui);
             if self.build_watch.ready() {
                 ui.separator();
-                let btn = egui::Button::new(egui::RichText::new("New build: relaunch").color(theme::ON_ACCENT))
-                    .fill(theme::ACCENT);
-                if ui.add(btn).on_hover_text("A newer build is on disk. Quit and start it.").clicked() {
+                let btn = egui::Button::new(
+                    egui::RichText::new("New build: relaunch").color(theme::ON_ACCENT),
+                )
+                .fill(theme::ACCENT);
+                if ui
+                    .add(btn)
+                    .on_hover_text("A newer build is on disk. Quit and start it.")
+                    .clicked()
+                {
                     self.relaunch = true;
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             }
             ui.separator();
             for slot in &mut self.slots {
-                ui.toggle_value(&mut slot.visible, slot.module.title());
+                if !matches!(slot.module.title(), "Tuner" | "Spectrogram" | "Waterfall3D" | "MIDI") {
+                    ui.toggle_value(&mut slot.visible, slot.module.title());
+                }
             }
+            ui.label("Debug");
+            ui.add(ui::widgets::flicktoggle(&mut self.profiler.enabled))
+                .on_hover_text("Show UI-thread load and per-module timings");
             ui.separator();
             ui.label("Input");
             let mut picked = None;
@@ -188,10 +231,13 @@ impl App {
             ui.separator();
             self.meter.show(ui, &self.input, &mut self.gain);
         });
-        // Rows of device-level settings from modules that have them.
-        for slot in self.slots.iter_mut().filter(|s| s.visible && s.module.has_top_row()) {
-            ui.separator();
-            ui.push_id(slot.module.title(), |ui| ui.horizontal(|ui| slot.module.top_row(ui)));
+        for slot in &mut self.slots {
+            if slot.module.has_top_row() {
+                ui.separator();
+                ui.push_id(slot.module.title(), |ui| {
+                    ui.horizontal_wrapped(|ui| slot.module.top_row(ui));
+                });
+            }
         }
     }
 
@@ -344,7 +390,9 @@ impl App {
             });
         // Measure every channel only while the picker is open.
         self.input.set_meter_all(popup.inner.is_some());
-        popup.response.on_hover_text("Input channel or pair, sample rate and buffer size");
+        popup
+            .response
+            .on_hover_text("Input channel or pair, sample rate and buffer size");
 
         if let Some(sel) = pick_ch {
             self.input.set_channel(sel);
@@ -408,53 +456,56 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let timing = self.profiler.begin();
         self.build_watch.poll(ui.ctx());
         self.poll_mic(ui.ctx());
         // Snapshot only as much as the visible modules need; the ring itself
         // may hold far more (the capture length).
         let rate = self.input.rate;
-        let n = self.slots.iter().filter(|s| s.visible).map(|s| s.module.lookback(rate)).max().unwrap_or(0);
+        let n = self
+            .slots
+            .iter()
+            .filter(|s| s.visible)
+            .map(|s| s.module.lookback(rate))
+            .max()
+            .unwrap_or(0);
         // Analysis is clocked by the audio, not the repaint: modules look at
         // how far the stream has moved since last frame and do nothing when
         // no new audio arrived.
         let frame = self.input.frame(n);
         let reset = frame.end() < self.last_end;
         self.last_end = frame.end();
-        let mut shared = Shared::new(frame, reset, self.range, std::mem::take(&mut self.fft_plans));
+        let mut shared = Shared::new(
+            frame,
+            reset,
+            self.range,
+            std::mem::take(&mut self.fft_plans),
+        );
         // Analysis runs in slot order, so the scope sets the gate first.
         for slot in self.slots.iter_mut().filter(|s| s.visible) {
+            let start = self.profiler.start();
             slot.module.update(&mut shared);
+            self.profiler.record("Analysis", slot.module.title(), start);
         }
 
         egui::Panel::top("top_bar").show(ui, |ui| self.top_bar(ui));
         egui::Panel::bottom("status_bar").show(ui, |ui| self.status_bar(ui));
-        // Declared after the status bar, so it sits just above it.
         let mut marks = Vec::new();
         for slot in self.slots.iter().filter(|s| s.visible) {
             slot.module.marks(&mut marks);
         }
-        egui::Panel::bottom("note_range").show(ui, |ui| {
-            let mut r = shared.range.get();
-            if noterange::bar(ui, &mut r, &marks) {
-                shared.range.set(r);
-            }
-        });
+        let debug_origin = ui.available_rect_before_wrap().min + egui::vec2(6.0, 6.0);
         let paused = self.input.paused();
         egui::CentralPanel::default().show(ui, |ui| {
             if paused {
                 ui.multiply_opacity(0.5);
             }
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                for slot in self.slots.iter_mut().filter(|s| s.visible) {
-                    ui.push_id(slot.module.title(), |ui| {
-                        ui::module_row(ui, slot.module.as_mut(), &mut slot.open, &shared);
-                    });
-                }
-            });
+            self.layout.show(ui, &mut self.slots, &shared, &marks, &mut self.profiler);
         });
         self.range = shared.range.get().sanitized();
         // Frame done: drop the cached spectra, keep the plans.
         self.fft_plans = shared.finish();
+        self.profiler.finish(ui, timing, debug_origin);
         ui.ctx().request_repaint();
     }
 
@@ -465,9 +516,15 @@ impl eframe::App for App {
             Saved {
                 device_id: self.input.device_id.clone(),
                 input: self.input.settings(),
-                modules: self.slots.iter().map(|s| (s.module.title().to_owned(), s.visible, s.open)).collect(),
+                modules: self
+                    .slots
+                    .iter()
+                    .map(|s| (s.module.title().to_owned(), s.visible, s.open))
+                    .collect(),
                 gain: self.gain,
                 range: self.range,
+                layout: self.layout.clone(),
+                debug: self.profiler.enabled,
             }
         };
         eframe::set_value(storage, STATE_KEY, &saved);
@@ -490,7 +547,11 @@ impl eframe::App for App {
         }
         // The dev build on disk, else (Reset state in a release build) the
         // running binary.
-        let exe = self.build_watch.exe().cloned().or_else(|| std::env::current_exe().ok());
+        let exe = self
+            .build_watch
+            .exe()
+            .cloned()
+            .or_else(|| std::env::current_exe().ok());
         if let Some(exe) = exe {
             if let Err(e) = std::process::Command::new(exe).spawn() {
                 eprintln!("relaunch failed: {e}");
@@ -501,5 +562,9 @@ impl eframe::App for App {
 
 /// "48k", "44.1k".
 fn short_rate(r: u32) -> String {
-    if r % 1000 == 0 { format!("{}k", r / 1000) } else { format!("{:.1}k", r as f32 / 1000.0) }
+    if r % 1000 == 0 {
+        format!("{}k", r / 1000)
+    } else {
+        format!("{:.1}k", r as f32 / 1000.0)
+    }
 }
