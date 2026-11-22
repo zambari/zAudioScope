@@ -79,6 +79,7 @@ impl Workspace {
         scroll.bar_outer_margin = 0.0;
         scroll.foreground_color = false;
         let mut anchors = BTreeMap::new();
+        let mut viewport = Rect::NOTHING;
         egui::ScrollArea::vertical()
             .id_salt("parameters")
             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
@@ -86,6 +87,7 @@ impl Workspace {
             .show(&mut left, |ui| {
                 // Keep labels readable while letting tracks grow with the inspector.
                 ui.spacing_mut().slider_width = (ui.available_width() - 150.0).clamp(90.0, 260.0);
+                viewport = ui.clip_rect();
                 for slot in slots.iter_mut() {
                     let start = profiler.start();
                     let title = slot.module.title();
@@ -96,9 +98,7 @@ impl Workspace {
                             &mut slot.open,
                             &mut slot.visible,
                         );
-                        if ui.clip_rect().contains(anchor.0) {
-                            anchors.insert(title.to_owned(), anchor);
-                        }
+                        anchors.insert(title.to_owned(), anchor);
                         if slot.open {
                             // Reserve the background before painting controls so its
                             // padding does not move or resize the parameter layout.
@@ -124,12 +124,7 @@ impl Workspace {
                         ui.separator();
                     });
                     profiler.record("Foldout", title, start);
-                    // Observe the press without taking interaction from child controls.
-                    if ui.input(|i| i.pointer.primary_pressed())
-                        && let Some(pos) = ui.input(|i| i.pointer.interact_pos())
-                        && section.response.rect.intersect(ui.clip_rect()).contains(pos)
-                        && ui.rect_contains_pointer(section.response.rect)
-                    {
+                    if pressed_in(ui, section.response.rect) {
                         self.touched = Some(title.to_owned());
                     }
                 }
@@ -140,13 +135,17 @@ impl Workspace {
             && let Some(panel) = panels.get(title)
         {
             let end = panel.left_center();
-            let start = pos2(start.x.min(turn_x), start.y);
-            let points = [start, pos2(turn_x, start.y), pos2(turn_x, end.y), end];
+            let y = start.y.clamp(viewport.top(), viewport.bottom());
+            // A header scrolled out of view keeps only the corner, pointing at it.
+            let points = if y == start.y {
+                vec![pos2(start.x.min(turn_x), y), pos2(turn_x, y), pos2(turn_x, end.y), end]
+            } else {
+                vec![pos2(turn_x, y), pos2(turn_x, end.y), end]
+            };
             let painter = ui.painter().with_clip_rect(area.intersect(ui.clip_rect()));
             let stroke = Stroke::new(1.0, theme::ACCENT_BRIGHT.gamma_multiply(0.35));
-            for path in [points.as_slice(), &[panel.left_top(), panel.left_bottom()]] {
-                painter.extend(egui::Shape::dashed_line(path, stroke, 5.0, 4.0));
-            }
+            painter.extend(egui::Shape::dashed_line(&points, stroke, 5.0, 4.0));
+            painter.vline(panel.left(), panel.y_range(), Stroke::new(2.0, theme::ACCENT_BRIGHT));
         }
         // Draw after both columns so graphs cannot cover a cross-panel guide.
         plot::paint_links(ui, area);
@@ -269,6 +268,9 @@ impl Workspace {
                     ui.visuals().weak_text_color(),
                 );
             }
+            if pressed_in(ui, rect) {
+                self.touched = Some(slot.module.title().to_owned());
+            }
             profiler.record("Display", slot.module.title(), start);
             y += height + DIVIDER;
         }
@@ -285,6 +287,16 @@ fn child(ui: &mut Ui, salt: impl egui::AsIdSalt, rect: Rect) -> Ui {
     );
     child.set_clip_rect(rect.intersect(ui.clip_rect()));
     child
+}
+
+/// Observe a primary press inside `rect` without taking interaction from the
+/// controls drawn there; links an inspector foldout with its display.
+fn pressed_in(ui: &Ui, rect: Rect) -> bool {
+    ui.input(|i| i.pointer.primary_pressed())
+        && ui
+            .input(|i| i.pointer.interact_pos())
+            .is_some_and(|pos| rect.intersect(ui.clip_rect()).contains(pos))
+        && ui.rect_contains_pointer(rect)
 }
 
 /// Shared visual and hit target for both axes. Double-click resets the split.

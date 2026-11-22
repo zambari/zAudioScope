@@ -8,6 +8,7 @@ pub struct Profiler {
     samples: BTreeMap<(&'static str, &'static str), f64>,
     previous: Option<Instant>,
     interval: f64,
+    interval_bar: super::level_bar::Smoothed,
 }
 
 impl Profiler {
@@ -28,6 +29,7 @@ impl Profiler {
             self.previous = None;
             self.interval = 0.0;
             self.rows.clear();
+            self.interval_bar.reset();
             return None;
         }
         let now = Instant::now();
@@ -49,11 +51,9 @@ impl Profiler {
             return;
         }
         self.rows.retain(|key, _| self.samples.contains_key(key));
-        let alpha = if self.interval > 0.0 {
-            1.0 - (-self.interval / 0.5).exp()
-        } else {
-            1.0
-        };
+        let alpha = super::level_bar::ema_alpha(self.interval as f32, 0.5) as f64;
+        self.interval_bar
+            .update((self.interval / 0.050) as f32, self.interval as f32);
         for (&key, &sample) in &self.samples {
             let average = self.rows.entry(key).or_insert(sample);
             *average += alpha * (sample - *average);
@@ -99,7 +99,7 @@ impl Profiler {
             egui::pos2(rect.right() - 8.0, rect.bottom() - 6.0),
         );
         painter.rect_filled(bar, 1.0, ui.visuals().extreme_bg_color);
-        super::level_bar::paint(&painter, bar, (self.interval / 0.050) as f32, None);
+        self.interval_bar.paint(&painter, bar);
         painter.galley(origin + egui::vec2(8.0, 6.0), galley, egui::Color32::WHITE);
     }
 }

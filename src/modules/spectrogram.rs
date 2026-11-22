@@ -48,6 +48,7 @@ impl Module for Spectrogram {
     }
 
     fn update(&mut self, shared: &mut Shared) {
+        self.p.db.sync(&shared.db);
         let added = self.rows.update(&self.p, shared);
         if added.cleared {
             self.colored.clear();
@@ -59,8 +60,8 @@ impl Module for Spectrogram {
         self.dirty |= added.cleared || added.rows > 0;
     }
 
-    fn params(&mut self, ui: &mut Ui, _shared: &Shared) {
-        self.p.ui(ui, &mut self.link);
+    fn params(&mut self, ui: &mut Ui, shared: &Shared) {
+        self.p.ui(ui, shared, &mut self.link);
     }
 
     fn graph(&mut self, ui: &mut Ui, rect: Rect, shared: &Shared) {
@@ -69,7 +70,7 @@ impl Module for Spectrogram {
             return;
         }
         // Colour scale changed: recolour what we have.
-        let key = (self.p.floor_db, self.p.ceil_db, self.p.rows);
+        let key = (self.p.db.range.floor, self.p.db.range.ceil, self.p.rows);
         if self.colored_for != key {
             self.colored_for = key;
             self.colored = self.rows.history.iter().map(|r| r.iter().map(|&db| self.p.color(db)).collect()).collect();

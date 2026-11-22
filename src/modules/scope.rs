@@ -9,6 +9,7 @@ use egui::{Align2, Color32, Pos2, Rect, Sense, Stroke, Ui};
 
 use super::{Gate, Module, Shared};
 use crate::audio::loudness;
+use crate::ui::dynamic_range::DynamicRange;
 use crate::ui::handle::EdgeHandle;
 use crate::ui::plot::{self, Axis, Edge, Link, Scale};
 use crate::ui::theme;
@@ -43,6 +44,11 @@ struct Params {
     /// Gate: analyse from `win_start_ms` to `win_end_ms` after the trigger.
     win_start_ms: f32,
     win_end_ms: f32,
+    /// Vertical view: the ceiling is the top edge (0 dB = full scale), the
+    /// floor the lowest labelled tick.
+    db: DynamicRange,
+    /// Legacy linear zoom, read once and migrated to the ceiling.
+    #[serde(skip_serializing)]
     gain: f32,
 }
 
@@ -55,7 +61,8 @@ impl Default for Params {
             view_ms: 600.0,
             win_start_ms: 80.0,
             win_end_ms: 400.0,
-            gain: 1.0,
+            db: DynamicRange::new(-60.0, 0.0),
+            gain: f32::NAN,
         }
     }
 }
@@ -64,11 +71,20 @@ impl Params {
     /// Pull loaded values back into the ranges the UI allows.
     fn sanitize(&mut self) {
         self.view_ms = self.view_ms.clamp(50.0, 2000.0);
-        self.gain = self.gain.clamp(0.5, 16.0);
+        if self.gain.is_finite() && self.gain > 0.0 {
+            self.db.range.ceil = -20.0 * self.gain.log10();
+            self.gain = f32::NAN;
+        }
+        self.db.sanitize();
         self.threshold = self.threshold.clamp(0.01, 1.0);
         self.holdoff_ms = self.holdoff_ms.clamp(0.0, 1000.0);
         self.win_start_ms = self.win_start_ms.clamp(0.0, self.view_ms);
         self.win_end_ms = self.win_end_ms.clamp(self.win_start_ms, self.view_ms);
+    }
+
+    /// Linear zoom that puts the ceiling at the top edge.
+    fn zoom(&self) -> f32 {
+        10f32.powf(-self.db.range.ceil / 20.0)
     }
 }
 
@@ -132,6 +148,7 @@ impl Module for Scope {
     }
 
     fn update(&mut self, shared: &mut Shared) {
+        self.p.db.sync(&shared.db);
         match self.p.mode {
             Mode::Free => shared.gate = Gate { window: None },
             Mode::Trigger => {
@@ -146,14 +163,14 @@ impl Module for Scope {
         }
     }
 
-    fn params(&mut self, ui: &mut Ui, _shared: &Shared) {
+    fn params(&mut self, ui: &mut Ui, shared: &Shared) {
+        self.p.db.ui(ui, &shared.db);
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.p.mode, Mode::Trigger, "Trigger");
             ui.selectable_value(&mut self.p.mode, Mode::Free, "Free");
         });
         let link = &mut self.link;
         link.slider(ui, Key::View, egui::Slider::new(&mut self.p.view_ms, 50.0..=2000.0).text("view ms"));
-        ui.add(egui::Slider::new(&mut self.p.gain, 0.5..=16.0).logarithmic(true).text("gain"));
         ui.add_enabled_ui(self.p.mode == Mode::Trigger, |ui| {
             link.slider(ui, Key::Threshold, egui::Slider::new(&mut self.p.threshold, 0.01..=1.0).text("threshold"));
             link.slider(ui, Key::Holdoff, egui::Slider::new(&mut self.p.holdoff_ms, 0.0..=1000.0).text("holdoff ms"));
@@ -182,7 +199,8 @@ impl Module for Scope {
             Scale::linear((-self.p.view_ms, 0.0), (rect.left(), rect.right()))
         };
         let x_of_ms = |ms: f32| rect.left() + rect.width() * ms / self.p.view_ms;
-        let amp = Scale::linear((-1.0 / self.p.gain, 1.0 / self.p.gain), (rect.bottom(), rect.top()));
+        let gain = self.p.zoom();
+        let amp = Scale::linear((-1.0 / gain, 1.0 / gain), (rect.bottom(), rect.top()));
 
         // Gate window, with drag-to-select.
         if trig {
@@ -202,7 +220,7 @@ impl Module for Scope {
             painter.rect_filled(gate, 0.0, theme::ACCENT.gamma_multiply(0.25));
         }
         Axis::new(Edge::Bottom, xs).draw(&painter, rect, plot::fmt_ms);
-        draw_db_axis(&painter, rect, &amp, self.p.gain);
+        draw_db_axis(&painter, rect, &amp, gain, self.p.db.range.floor);
         painter.hline(rect.x_range(), rect.center().y, Stroke::new(1.0, Color32::from_gray(40)));
 
         // Min/max per pixel column.
@@ -221,14 +239,14 @@ impl Module for Scope {
             let yc = rect.center().y;
             painter.vline(
                 x,
-                (yc - (mx * self.p.gain).clamp(-1.0, 1.0) * half)..=(yc - (mn * self.p.gain).clamp(-1.0, 1.0) * half),
+                (yc - (mx * gain).clamp(-1.0, 1.0) * half)..=(yc - (mn * gain).clamp(-1.0, 1.0) * half),
                 Stroke::new(1.0, theme::WAVE),
             );
         }
 
         // Handles: threshold on the left edge, gate ends along the bottom.
         if trig {
-            let thr = Scale::linear((0.0, 1.0 / self.p.gain), (rect.center().y, rect.top()));
+            let thr = Scale::linear((0.0, 1.0 / gain), (rect.center().y, rect.top()));
             let fmt = |v: f32| format!("thr {v:.2}  {:.1} dB", 20.0 * v.log10());
             let r = EdgeHandle::new("scope_thr", Edge::Left, thr, &mut self.p.threshold).clamp(0.01, 1.0).reset(0.3).label(&fmt).show(ui, rect);
             if r.hovered() || r.dragged() {
@@ -269,7 +287,7 @@ impl Module for Scope {
         let settle = f.ms_to_samples(100.0);
         if let Some((peak, lufs)) = loudness::measure(&f.samples, f.rate, lo, lo + view, settle) {
             let fmt = |v: f32| if v.is_finite() { format!("{v:.1}") } else { "-inf".to_owned() };
-            let text = format!("peak {} dBFS · {} LUFS · zoom ×{}", fmt(loudness::db(peak)), fmt(lufs), plot::trim(self.p.gain));
+            let text = format!("peak {} dBFS · {} LUFS · zoom ×{}", fmt(loudness::db(peak)), fmt(lufs), plot::trim(gain));
             plot::caption(&painter, rect, Align2::CENTER_TOP, text);
         }
 
@@ -287,12 +305,15 @@ impl Module for Scope {
 /// Left-edge amplitude ticks labelled in dBFS. The trace stays linear, so
 /// the ticks bunch towards the centre line; ones too close to a kept one
 /// are dropped. Labels go on the upper half, ticks on both.
-fn draw_db_axis(painter: &egui::Painter, rect: Rect, amp: &Scale, gain: f32) {
-    const DBS: [f32; 15] = [0.0, -3.0, -6.0, -9.0, -12.0, -18.0, -24.0, -30.0, -36.0, -42.0, -48.0, -54.0, -60.0, -72.0, -84.0];
+fn draw_db_axis(painter: &egui::Painter, rect: Rect, amp: &Scale, gain: f32, floor_db: f32) {
+    const DBS: [f32; 20] = [
+        6.0, 3.0, 0.0, -3.0, -6.0, -9.0, -12.0, -18.0, -24.0, -30.0, -36.0, -42.0, -48.0, -54.0, -60.0, -72.0, -84.0, -96.0,
+        -108.0, -120.0,
+    ];
     const MIN_GAP: f32 = 14.0;
     let top = 1.0 / gain;
     let mut kept: Vec<f32> = Vec::new();
-    for db in DBS {
+    for db in DBS.into_iter().filter(|&db| db >= floor_db) {
         let v = 10f32.powf(db / 20.0);
         if v > top * 1.0001 {
             continue;

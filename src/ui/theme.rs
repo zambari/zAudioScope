@@ -16,6 +16,11 @@ pub const HANDLE: Color32 = Color32::from_rgb(222, 78, 60);
 /// In tune / within tolerance.
 pub const GOOD: Color32 = Color32::from_rgb(80, 200, 120);
 
+/// Level-meter palette (green / amber / red), lowest zone first.
+pub const VU_OK: Color32 = Color32::from_rgb(96, 168, 104);
+pub const VU_WARN: Color32 = Color32::from_rgb(240, 205, 65);
+pub const VU_CLIP: Color32 = Color32::from_rgb(222, 60, 50);
+
 /// Straight RGB blend from `a` (u = 0) to `b` (u = 1); opaque result.
 pub fn lerp(a: Color32, b: Color32, u: f32) -> Color32 {
     let u = u.clamp(0.0, 1.0);

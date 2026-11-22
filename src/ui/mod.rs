@@ -1,3 +1,4 @@
+pub mod dynamic_range;
 pub mod handle;
 pub mod infobox;
 pub mod layout;

@@ -9,6 +9,8 @@
 //!   down by x" advice fade in, snapping to the nearest enabled note (or the
 //!   nearest semitone when none are enabled).
 
+use std::time::Instant;
+
 use serde::{Deserialize, Serialize};
 
 use egui::{Align2, Color32, FontId, Mesh, Pos2, Rect, Shape, Stroke, Ui, pos2, vec2};
@@ -18,17 +20,9 @@ use crate::pitch::{self, Method};
 use crate::ui::noterange::NoteRange;
 use crate::ui::plot::{Axis, Edge, Lanes, Scale};
 use crate::ui::theme;
-use crate::ui::widgets::{Foldout, RangeSlider};
+use crate::ui::dynamic_range::DynamicRange;
+use crate::ui::widgets::Foldout;
 
-/// Spectrum view level limits and the smallest floor-to-ceiling span, dB.
-const DB_BOUNDS: (f32, f32) = (-140.0, 6.0);
-const DB_MIN_GAP: f32 = 12.0;
-/// Spectrum points per semitone.
-const STEPS: usize = 12;
-/// Free-running: one analysis per this much new audio.
-const DETECT_MS: f32 = 20.0;
-/// High notes need no more than this many periods of window.
-const MAX_CYCLES: f32 = 48.0;
 /// Candidates shown at most.
 const MAX_CANDIDATES: usize = 6;
 /// Below this NSDF clarity a candidate is ignored.
@@ -64,9 +58,23 @@ struct Params {
     /// Analysis window: longer resolves low notes better, shorter responds faster.
     window_ms: f32,
     /// Bottom and top of the spectrum view (fixed, no auto-follow).
+    db: DynamicRange,
+    // ---- performance ----
+    /// Free-running analyses per second.
+    rate_hz: f32,
+    /// Spectrum points per semitone, 0 = no spectrum.
+    steps: usize,
+    /// The spectrum window spans at most this many periods of each note.
+    max_cycles: f32,
+    /// Decimated rate is at least this many times the top note.
+    oversample: f32,
+    /// Below this input level (dB) nothing is analysed.
+    gate_db: f32,
+    /// Legacy flat floor / ceiling and top / span, read once and migrated to `db`.
+    #[serde(skip_serializing)]
     floor_db: f32,
+    #[serde(skip_serializing)]
     ceil_db: f32,
-    /// Legacy top / span pair, read once and migrated to floor / ceiling.
     #[serde(skip_serializing)]
     top_db: f32,
     #[serde(skip_serializing)]
@@ -87,8 +95,14 @@ impl Default for Params {
             units_per_semitone: 1.0,
             notes: vec![false; 128],
             window_ms: 300.0,
-            floor_db: -108.0,
-            ceil_db: -48.0,
+            db: DynamicRange::new(),
+            floor_db: f32::NAN,
+            ceil_db: f32::NAN,
+            rate_hz: 50.0,
+            steps: 12,
+            max_cycles: 48.0,
+            oversample: 10.0,
+            gate_db: -90.0,
             top_db: f32::NAN,
             range_db: f32::NAN,
             base_midi: -1,
@@ -120,8 +134,13 @@ impl Params {
             self.floor_db = self.top_db - self.range_db;
             (self.top_db, self.range_db) = (f32::NAN, f32::NAN);
         }
-        self.floor_db = self.floor_db.clamp(DB_BOUNDS.0, DB_BOUNDS.1 - DB_MIN_GAP);
-        self.ceil_db = self.ceil_db.clamp(self.floor_db + DB_MIN_GAP, DB_BOUNDS.1);
+        self.rate_hz = self.rate_hz.clamp(2.0, 60.0);
+        self.steps = self.steps.min(16);
+        self.max_cycles = self.max_cycles.clamp(4.0, 64.0);
+        self.oversample = self.oversample.clamp(3.0, 20.0);
+        self.gate_db = self.gate_db.clamp(-140.0, -20.0);
+        self.db.migrate(&mut self.floor_db, &mut self.ceil_db);
+        self.db.sanitize();
     }
 }
 
@@ -135,17 +154,16 @@ struct Decimator {
 
 impl Decimator {
     /// Largest power-of-two factor (≤ 32) that keeps the new rate at least
-    /// ten times the top frequency, so NSDF lags stay well resolved.
-    fn factor_for(rate: u32, f_top: f32) -> usize {
+    /// `oversample` times the top frequency, so NSDF lags stay well resolved.
+    fn factor_for(rate: u32, f_top: f32, oversample: f32) -> usize {
         let mut factor = 1;
-        while factor < 32 && rate as f32 / (2 * factor) as f32 >= 10.0 * f_top {
+        while factor < 32 && rate as f32 / (2 * factor) as f32 >= oversample * f_top {
             factor *= 2;
         }
         factor
     }
 
-    fn new(rate: u32, f_top: f32) -> Self {
-        let factor = Self::factor_for(rate, f_top);
+    fn new(rate: u32, factor: usize) -> Self {
         // Blackman windowed sinc, cutoff at the new Nyquist, transition
         // about 0.2 of the new rate: content that aliases lands above 0.4.
         let len = if factor == 1 { 1 } else { 28 * factor + 1 };
@@ -207,6 +225,54 @@ struct Track {
     weight: f32,
 }
 
+/// Smoothed wall time of one analysis stage, µs.
+#[derive(Default)]
+struct Cost(f32);
+
+impl Cost {
+    fn time<T>(&mut self, f: impl FnOnce() -> T) -> T {
+        let t = Instant::now();
+        let out = f();
+        self.add(t.elapsed().as_secs_f32() * 1e6);
+        out
+    }
+
+    /// Fold in one sample, µs (0 when the stage was skipped).
+    fn add(&mut self, us: f32) {
+        self.0 += (us - self.0) * 0.1;
+    }
+}
+
+/// Per-stage costs, shown under "performance".
+#[derive(Default)]
+struct Costs {
+    decimate: Cost,
+    spectrum: Cost,
+    nsdf: Cost,
+    /// Smoothed seconds between analyses, and when the last one ran.
+    interval: f32,
+    last_run: Option<Instant>,
+}
+
+impl Costs {
+    fn total_us(&self) -> f32 {
+        self.decimate.0 + self.spectrum.0 + self.nsdf.0
+    }
+
+    /// Share of one core spent analysing, %.
+    fn load(&self) -> f32 {
+        if self.interval > 0.0 { self.total_us() * 1e-4 / self.interval } else { 0.0 }
+    }
+
+    fn tick(&mut self) {
+        let now = Instant::now();
+        if let Some(prev) = self.last_run.replace(now) {
+            let dt = now.duration_since(prev).as_secs_f32().min(1.0);
+            self.interval += (dt - self.interval) * if self.interval == 0.0 { 1.0 } else { 0.1 };
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct Tuner {
     p: Params,
@@ -230,6 +296,8 @@ pub struct Tuner {
     tracks: Vec<Track>,
     readout: f32,
     shown_midi: f32,
+
+    costs: Costs,
 }
 
 impl Tuner {
@@ -253,17 +321,23 @@ impl Tuner {
         self.spec_target[k(midi - 0.5)..=k(midi + 0.5)].iter().copied().fold(spectrum_floor(), f32::max)
     }
 
+    /// Spectrum points for the analysed range at the current resolution.
+    fn spectrum_points(&self) -> usize {
+        if self.p.steps == 0 { 0 } else { self.analysed.count() * self.p.steps + 1 }
+    }
+
     /// Hann-windowed DFT magnitude (dB re full-scale sine) at each display
-    /// point. Window length follows the frequency (up to `MAX_CYCLES`
+    /// point. Window length follows the frequency (up to `max_cycles`
     /// periods), capped by what's available.
     fn spectrum(&self, y: &[f32], rate: u32) -> Vec<f32> {
         let (lo, hi) = self.analysed.span();
-        let points = self.analysed.count() * STEPS + 1;
+        let points = self.spectrum_points();
+        let max_cycles = self.p.max_cycles as f64;
         (0..points)
             .map(|k| {
                 let m = lo + (hi - lo) * k as f32 / (points - 1) as f32;
                 let f = pitch::midi_to_freq(m, self.p.a4) as f64;
-                let l = ((MAX_CYCLES as f64 * rate as f64 / f) as usize).min(y.len());
+                let l = ((max_cycles * rate as f64 / f) as usize).min(y.len());
                 if l < 16 {
                     return spectrum_floor();
                 }
@@ -300,6 +374,35 @@ fn ease(dt: f32, tau: f32) -> f32 {
     1.0 - (-dt / tau.max(1e-4)).exp()
 }
 
+impl Tuner {
+    /// Knobs that trade detail or responsiveness for CPU, with live costs.
+    fn performance_ui(&mut self, ui: &mut Ui) {
+        let c = &self.costs;
+        let summary = format!("~{:.1}% core · {:.0} µs", c.load(), c.total_us());
+        Foldout::new("tuner_perf", "performance").summary(summary).show(ui, |ui| {
+            let c = &self.costs;
+            let text = format!(
+                "decimate {:5.0} µs\nspectrum {:5.0} µs\nnsdf     {:5.0} µs\nevery {:.0} ms",
+                c.decimate.0,
+                c.spectrum.0,
+                c.nsdf.0,
+                c.interval * 1000.0
+            );
+            ui.label(egui::RichText::new(text).monospace().size(10.0).weak());
+            ui.add(egui::Slider::new(&mut self.p.rate_hz, 2.0..=60.0).logarithmic(true).suffix(" Hz").text("update rate"))
+                .on_hover_text("Free-running analyses per second (gated mode analyses once per window)");
+            ui.add(egui::Slider::new(&mut self.p.steps, 0..=16).text("spectrum pts/semi"))
+                .on_hover_text("Spectrum resolution; 0 turns the spectrum off (NSDF still runs)");
+            ui.add(egui::Slider::new(&mut self.p.max_cycles, 4.0..=64.0).logarithmic(true).text("spectrum cycles"))
+                .on_hover_text("Spectrum window length in periods: fewer is cheaper but blurs peaks");
+            ui.add(egui::Slider::new(&mut self.p.oversample, 3.0..=20.0).text("oversample"))
+                .on_hover_text("Decimated rate vs top note: lower decimates harder (cheaper), coarser NSDF lags");
+            ui.add(egui::Slider::new(&mut self.p.gate_db, -140.0..=-20.0).suffix(" dB").text("silence gate"))
+                .on_hover_text("Below this input level spectrum and NSDF are skipped");
+        });
+    }
+}
+
 impl Module for Tuner {
     fn title(&self) -> &'static str {
         "Tuner"
@@ -326,13 +429,14 @@ impl Module for Tuner {
     }
 
     fn update(&mut self, shared: &mut Shared) {
+        self.p.db.sync(&shared.db);
         let f = &shared.frame;
         let rate = f.rate;
         let key = match shared.gate.window {
             Some(w) => w,
             None => {
                 let end = f.end();
-                let hop = f.ms_to_samples(DETECT_MS) as u64;
+                let hop = f.ms_to_samples(1000.0 / self.p.rate_hz) as u64;
                 match self.last {
                     Some((0, t)) if !shared.reset && end >= t && end - t < hop => return,
                     _ => (0, end),
@@ -348,21 +452,31 @@ impl Module for Tuner {
 
         let (lo, hi) = range.span();
         let (f_lo, f_hi) = (pitch::midi_to_freq(lo - 0.5, self.p.a4), pitch::midi_to_freq(hi + 0.5, self.p.a4));
-        if !self.decim.as_ref().is_some_and(|d| d.rate == rate && d.factor == Decimator::factor_for(rate, f_hi)) {
-            self.decim = Some(Decimator::new(rate, f_hi));
+        let factor = Decimator::factor_for(rate, f_hi, self.p.oversample);
+        if !self.decim.as_ref().is_some_and(|d| d.rate == rate && d.factor == factor) {
+            self.decim = Some(Decimator::new(rate, factor));
         }
+        self.costs.tick();
         let d = self.decim.as_ref().unwrap();
         let window = (self.p.window_ms / 1000.0 * rate as f32) as usize;
         let x = shared.analysis_slice(self.lookback(rate));
-        let y = d.run(&x[x.len().saturating_sub(window + d.taps.len())..]);
+        let y = self.costs.decimate.time(|| d.run(&x[x.len().saturating_sub(window + d.taps.len())..]));
         let r = d.out_rate();
         let y = &y[y.len().saturating_sub((self.p.window_ms / 1000.0 * r as f32) as usize)..];
 
         let rms = (y.iter().map(|s| s * s).sum::<f32>() / y.len().max(1) as f32).sqrt();
         self.level_db = 20.0 * rms.max(1e-9).log10();
-        self.spec_target = self.spectrum(y, r);
+        let gated = self.level_db < self.p.gate_db;
+        if gated {
+            self.costs.spectrum.add(0.0);
+            self.costs.nsdf.add(0.0);
+        }
+        // Gated: keep the length so the display decays instead of resetting.
+        let mut cost = std::mem::take(&mut self.costs.spectrum);
+        self.spec_target = if gated { vec![spectrum_floor(); self.spectrum_points()] } else { cost.time(|| self.spectrum(y, r)) };
+        self.costs.spectrum = cost;
 
-        let c = pitch::candidates(y, r, f_lo, f_hi);
+        let c = if gated { pitch::Candidates::default() } else { self.costs.nsdf.time(|| pitch::candidates(y, r, f_lo, f_hi)) };
         let peak_db = self.spec_target.iter().copied().fold(spectrum_floor(), f32::max);
         let mut raw: Vec<(f32, f32, bool)> = c
             .list
@@ -394,6 +508,7 @@ impl Module for Tuner {
     }
 
     fn params(&mut self, ui: &mut Ui, shared: &Shared) {
+        self.p.db.ui(ui, &shared.db);
         egui::ComboBox::from_id_salt("tuner_method").selected_text(self.p.method.label()).show_ui(ui, |ui| {
             for m in Method::ALL {
                 ui.selectable_value(&mut self.p.method, m, m.label());
@@ -401,9 +516,9 @@ impl Module for Tuner {
         });
         ui.add(egui::Slider::new(&mut self.p.smoothing, 0.0..=0.98).text("smoothing"));
         ui.add(egui::Slider::new(&mut self.p.window_ms, 60.0..=1000.0).logarithmic(true).suffix(" ms").text("window"));
-        ui.add(RangeSlider::new(&mut self.p.floor_db, &mut self.p.ceil_db, DB_BOUNDS.0..=DB_BOUNDS.1).min_gap(DB_MIN_GAP).text("dB"));
         ui.add(egui::Slider::new(&mut self.p.a4, 415.0..=466.0).text("A4 Hz"));
         ui.add(egui::Slider::new(&mut self.p.units_per_semitone, 0.01..=10.0).logarithmic(true).text("units/semi"));
+        self.performance_ui(ui);
         let NoteRange { lo, hi } = shared.range.get();
         let count = (lo..=hi).filter(|&m| self.is_enabled(m)).count();
         let summary = if count == 0 { "any semitone".to_owned() } else { format!("{count} toggled notes") };
@@ -568,7 +683,7 @@ impl Module for Tuner {
                 painter.text(pos2(x, rect.bottom() - 1.0), Align2::CENTER_BOTTOM, text, small.clone(), c);
             }
         }
-        let (bottom_db, top_db) = (self.p.floor_db, self.p.ceil_db);
+        let (bottom_db, top_db) = (self.p.db.range.floor, self.p.db.range.ceil);
         let db_scale = Scale::linear((bottom_db, top_db), (plot.bottom(), plot.top()));
         let y_of = |db: f32| db_scale.px(db.clamp(bottom_db, top_db));
         Axis::new(Edge::Left, db_scale).spacing(28.0).minor(false).draw(&painter, plot, |db| format!("{db:.0}"));
@@ -679,7 +794,7 @@ mod tests {
                 0.3 * t.sin() + 0.4 * (2.0 * t).sin() + 0.2 * (3.0 * t).sin()
             })
             .collect();
-        let d = Decimator::new(rate, 300.0);
+        let d = Decimator::new(rate, Decimator::factor_for(rate, 300.0, 10.0));
         assert!(d.factor > 1);
         let y = d.run(&x);
         let f = pitch::candidates(&y, d.out_rate(), 30.0, 300.0).pick().unwrap();

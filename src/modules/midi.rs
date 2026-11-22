@@ -287,14 +287,16 @@ impl MidiMonitor {
                     None => 0.0,
                 };
                 let selected = self.p.channel == Some(ch);
+                // Green when the channel passes the filter, amber when it's
+                // active but filtered out by a single-channel source.
+                let passes = self.p.channel.is_none() || selected;
+                let flash = if passes { theme::VU_OK } else { theme::VU_WARN };
                 let dim = Color32::from_gray(34);
-                let fill = theme::lerp(dim, theme::ACCENT_BRIGHT, lit);
+                let fill = theme::lerp(dim, flash, lit);
                 let p = ui.painter();
                 p.rect_filled(rect, 1.0, fill);
                 let stroke = if selected {
                     Stroke::new(1.5, theme::ON_ACCENT)
-                } else if self.p.channel.is_none() {
-                    Stroke::new(1.0, theme::ACCENT.gamma_multiply(0.8))
                 } else {
                     Stroke::new(1.0, Color32::from_gray(52))
                 };

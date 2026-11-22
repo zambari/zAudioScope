@@ -6,7 +6,7 @@
 
 use egui::{Align2, Mesh, Rect, Stroke, Ui, pos2, vec2};
 
-use super::spectrum_rows::{BANDS, Key, Params, Rows, heat};
+use super::spectrum_rows::{self, BANDS, Key, Params, Rows, heat};
 use super::{Module, Shared};
 use crate::ui::noterange::NoteRange;
 use crate::ui::plot::{self, Link, Scale};
@@ -22,6 +22,10 @@ const ZOOM_LIMITS: (f32, f32) = (0.25, 8.0);
 const LABEL_H: f32 = 16.0;
 /// Least pixels between points along a row; denser bands are merged (peak).
 const POINT_PX: f32 = 2.0;
+/// Time span covered front to back, ms, and the number of slices across it.
+const WINDOW_MS: (f32, f32) = (50.0, 4000.0);
+const DEFAULT_WINDOW_MS: f32 = 500.0;
+const SLICES: (usize, usize) = (20, 100);
 
 pub struct Waterfall {
     p: Params,
@@ -30,6 +34,9 @@ pub struct Waterfall {
     rotation: (f32, f32),
     zoom: f32,
     fade_speed: f32,
+    /// Time from the front slice to the back one; rows and ms/row follow.
+    window_ms: f32,
+    slices: usize,
     /// Pan as fractions of the viewport, so resizing preserves the framing.
     pan: (f32, f32),
     rows: Rows,
@@ -40,6 +47,8 @@ impl Default for Waterfall {
     fn default() -> Self {
         Self {
             p: Params::with_rows(48),
+            window_ms: DEFAULT_WINDOW_MS,
+            slices: 48,
             range_hz: (40.0, NoteRange::BOUNDS.hz().1),
             rotation: DEFAULT_ROTATION,
             zoom: DEFAULT_ZOOM,
@@ -61,6 +70,7 @@ impl Module for Waterfall {
         eframe::set_value(storage, &format!("{key}.3d"), &self.p);
         eframe::set_value(storage, &format!("{key}.range_hz"), &self.range_hz);
         eframe::set_value(storage, &format!("{key}.fade_speed"), &self.fade_speed);
+        eframe::set_value(storage, &format!("{key}.window"), &(self.window_ms, self.slices));
     }
 
     fn load_params(&mut self, storage: &dyn eframe::Storage, key: &str) {
@@ -76,6 +86,14 @@ impl Module for Waterfall {
         ) {
             self.p = p;
         }
+        // Older saves only had rows and ms/row: keep the same depth.
+        let (window, slices) = eframe::get_value::<(f32, usize)>(storage, &format!("{key}.window"))
+            .unwrap_or(((self.p.rows.max(2) - 1) as f32 * self.p.row_ms, self.p.rows));
+        if window.is_finite() {
+            self.window_ms = window.clamp(WINDOW_MS.0, WINDOW_MS.1);
+        }
+        self.slices = slices.clamp(SLICES.0, SLICES.1);
+        self.apply_window();
         if let Some((lo, hi)) = eframe::get_value::<(f32, f32)>(storage, &format!("{key}.range_hz"))
         {
             if lo.is_finite() && hi.is_finite() {
@@ -95,10 +113,13 @@ impl Module for Waterfall {
     }
 
     fn update(&mut self, shared: &mut Shared) {
+        self.p.db.sync(&shared.db);
+        self.apply_window();
         self.rows.update(&self.p, shared);
     }
 
-    fn params(&mut self, ui: &mut Ui, _shared: &Shared) {
+    fn params(&mut self, ui: &mut Ui, shared: &Shared) {
+        self.p.db.ui(ui, &shared.db);
         ui.add(
             RangeSlider::new(
                 &mut self.range_hz.0,
@@ -109,7 +130,19 @@ impl Module for Waterfall {
             .decimals(0)
             .text("range Hz"),
         );
-        self.p.ui(ui, &mut self.link);
+        self.p.ui_fft(ui);
+        self.link.slider(
+            ui,
+            Key::Speed,
+            egui::Slider::new(&mut self.window_ms, WINDOW_MS.0..=WINDOW_MS.1)
+                .logarithmic(true)
+                .integer()
+                .text("window ms"),
+        )
+        .on_hover_text("Time span from the front slice to the back one.");
+        ui.add(egui::Slider::new(&mut self.slices, SLICES.0..=SLICES.1).text("slices"))
+            .on_hover_text("Number of spectra spread evenly across the window.");
+        self.p.ui_gate(ui);
         ui.add(egui::Slider::new(&mut self.fade_speed, 0.0..=10.0).text("fade speed"))
             .on_hover_text("Higher values fade older rows sooner along the history axis. Zero disables fading.");
         ui.weak("Drag: orbit · middle-drag: pan · scroll: zoom");
@@ -326,7 +359,32 @@ impl Module for Waterfall {
             );
         }
 
-        self.p
-            .speed_handle(ui, rect, "waterfall_speed", &mut self.link);
+        let slices = self.slices;
+        let fmt = |ms: f32| {
+            format!(
+                "{} ms · {} slices · {} ms/slice",
+                plot::trim(ms),
+                slices,
+                plot::trim(ms / (slices - 1) as f32)
+            )
+        };
+        spectrum_rows::time_handle(
+            ui,
+            rect,
+            "waterfall_speed",
+            &mut self.link,
+            &mut self.window_ms,
+            WINDOW_MS,
+            DEFAULT_WINDOW_MS,
+            &fmt,
+        );
+    }
+}
+
+impl Waterfall {
+    /// Derive rows and ms/row so `slices` rows span exactly `window_ms`.
+    fn apply_window(&mut self) {
+        self.p.rows = self.slices;
+        self.p.row_ms = self.window_ms / (self.slices - 1) as f32;
     }
 }

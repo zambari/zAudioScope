@@ -7,6 +7,7 @@ use crate::audio::mic_permission::{self, MicAuth};
 use crate::audio::{ChannelSel, DeviceInfo, HISTORY_CHOICES, Input, InputSettings};
 use crate::modules::{self, FftPlans, Shared, Slot};
 use crate::relaunch::BuildWatch;
+use crate::ui::dynamic_range::DbRange;
 use crate::ui::noterange::NoteRange;
 use crate::ui::{self, theme};
 
@@ -26,6 +27,8 @@ struct Saved {
     gain: f32,
     /// Shared note range of the frequency-axis analysers.
     range: NoteRange,
+    /// dB range shared by the locked level controls.
+    db: DbRange,
     layout: ui::layout::Workspace,
     debug: bool,
 }
@@ -38,6 +41,7 @@ impl Default for Saved {
             modules: Vec::new(),
             gain: 1.0,
             range: NoteRange::default(),
+            db: DbRange::default(),
             layout: Default::default(),
             debug: false,
         }
@@ -50,6 +54,7 @@ pub struct App {
     slots: Vec<Slot>,
     gain: f32,
     range: NoteRange,
+    db: DbRange,
     layout: ui::layout::Workspace,
     profiler: ui::profiler::Profiler,
     meter: ui::meter::Meter,
@@ -106,6 +111,7 @@ impl App {
             slots,
             gain: saved.gain.clamp(0.0, ui::meter::GAIN_MAX),
             range: saved.range.sanitized(),
+            db: saved.db.sanitized(),
             layout: saved.layout,
             profiler: ui::profiler::Profiler::new(saved.debug),
             meter: Default::default(),
@@ -225,7 +231,7 @@ impl App {
                 self.devices = Input::devices();
             }
             if let Some(id) = picked {
-                self.input.switch(Some(&id));
+                self.input.select_device(&id);
             }
             self.input_controls(ui);
             ui.separator();
@@ -479,6 +485,7 @@ impl eframe::App for App {
             frame,
             reset,
             self.range,
+            self.db,
             std::mem::take(&mut self.fft_plans),
         );
         // Analysis runs in slot order, so the scope sets the gate first.
@@ -503,6 +510,7 @@ impl eframe::App for App {
             self.layout.show(ui, &mut self.slots, &shared, &marks, &mut self.profiler);
         });
         self.range = shared.range.get().sanitized();
+        self.db = shared.db.get().sanitized();
         // Frame done: drop the cached spectra, keep the plans.
         self.fft_plans = shared.finish();
         self.profiler.finish(ui, timing, debug_origin);
@@ -523,6 +531,7 @@ impl eframe::App for App {
                     .collect(),
                 gain: self.gain,
                 range: self.range,
+                db: self.db,
                 layout: self.layout.clone(),
                 debug: self.profiler.enabled,
             }

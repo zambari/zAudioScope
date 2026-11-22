@@ -32,6 +32,7 @@ use egui::{Rect, Ui};
 
 use crate::audio::Frame;
 use crate::audio::spectrum::Fft;
+use crate::ui::dynamic_range::DbRange;
 use crate::ui::noterange::NoteRange;
 
 /// Which part of the recent audio the analysers should look at.
@@ -66,17 +67,21 @@ pub struct Shared {
     /// The shared note range every frequency axis shows (the bar above the
     /// status bar). A module may set it (e.g. "fit"); the app keeps it.
     pub range: Cell<NoteRange>,
+    /// The dB range every locked [`DynamicRange`](crate::ui::dynamic_range::DynamicRange)
+    /// control shares. The app keeps it.
+    pub db: Cell<DbRange>,
     plans: RefCell<FftPlans>,
     cache: RefCell<FrameCache>,
 }
 
 impl Shared {
-    pub fn new(frame: Frame, reset: bool, range: NoteRange, plans: FftPlans) -> Self {
+    pub fn new(frame: Frame, reset: bool, range: NoteRange, db: DbRange, plans: FftPlans) -> Self {
         Self {
             frame,
             gate: Gate::default(),
             reset,
             range: Cell::new(range),
+            db: Cell::new(db),
             plans: RefCell::new(plans),
             cache: Default::default(),
         }

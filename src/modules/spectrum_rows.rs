@@ -10,22 +10,21 @@ use serde::{Deserialize, Serialize};
 use egui::{Color32, Rect, Ui};
 
 use super::Shared;
-use crate::audio::spectrum::{self, Bands};
+use crate::audio::spectrum::Bands;
 use crate::ui::handle::EdgeHandle;
 use crate::ui::noterange::NoteRange;
 use crate::ui::plot::{self, Edge, Link, Scale};
 use crate::ui::theme;
-use crate::ui::widgets::RangeSlider;
+use crate::ui::dynamic_range::DynamicRange;
 
 /// Across the note bar's whole span (8 per semitone); a module shows the
 /// slice in the selected range, so changing the range keeps the history.
 pub const BANDS: usize = 640;
 const ROW_MS: (f32, f32) = (2.0, 100.0);
-/// Highest colour-scale ceiling and the smallest floor-to-ceiling span, dB.
-const DB_CEIL: f32 = 0.0;
-const DB_MIN_GAP: f32 = 12.0;
 /// Most rows added in one frame; further behind than that, skip ahead.
 const MAX_ROWS_PER_FRAME: usize = 16;
+/// Longest catch-up span, ms, so slow rows don't inflate the per-frame snapshot.
+const MAX_CATCHUP_MS: f32 = 400.0;
 const ROWS: (usize, usize) = (20, 600);
 
 #[derive(Clone, Copy, PartialEq)]
@@ -40,9 +39,12 @@ pub struct Params {
     pub fft_pow: u32,
     pub rows: usize,
     /// Colour scale: dark at the floor, white at the ceiling.
-    pub floor_db: f32,
-    pub ceil_db: f32,
-    /// Legacy span above the floor, read once and migrated to the ceiling.
+    pub db: DynamicRange,
+    /// Legacy flat floor / span / ceiling, read once and migrated to `db`.
+    #[serde(skip_serializing)]
+    floor_db: f32,
+    #[serde(skip_serializing)]
+    ceil_db: f32,
     #[serde(skip_serializing)]
     range_db: f32,
     /// Only analyse the gated window (when the scope has one).
@@ -53,7 +55,7 @@ pub struct Params {
 
 impl Default for Params {
     fn default() -> Self {
-        Self { fft_pow: 12, rows: 160, floor_db: -90.0, ceil_db: -10.0, range_db: f32::NAN, follow_gate: false, row_ms: 15.0 }
+        Self { fft_pow: 12, rows: 160, db: DynamicRange::new(-90.0, -10.0), floor_db: f32::NAN, ceil_db: f32::NAN, range_db: f32::NAN, follow_gate: false, row_ms: 15.0 }
     }
 }
 
@@ -70,8 +72,8 @@ impl Params {
             self.ceil_db = self.floor_db + self.range_db;
             self.range_db = f32::NAN;
         }
-        self.floor_db = self.floor_db.clamp(spectrum::FLOOR_DB, DB_CEIL - DB_MIN_GAP);
-        self.ceil_db = self.ceil_db.clamp(self.floor_db + DB_MIN_GAP, DB_CEIL);
+        self.db.migrate(&mut self.floor_db, &mut self.ceil_db);
+        self.db.sanitize();
         self.row_ms = self.row_ms.clamp(ROW_MS.0, ROW_MS.1);
     }
 
@@ -84,7 +86,7 @@ impl Params {
 
     /// Level on the colour scale, 0 at the floor, 1 at the ceiling.
     pub fn level(&self, db: f32) -> f32 {
-        ((db - self.floor_db) / (self.ceil_db - self.floor_db)).clamp(0.0, 1.0)
+        self.db.level(db)
     }
 
     pub fn color(&self, db: f32) -> Color32 {
@@ -99,31 +101,51 @@ impl Params {
     /// Samples of recent audio needed per frame: one FFT plus the rows it
     /// may still have to catch up on.
     pub fn lookback(&self, rate: u32) -> usize {
-        (1usize << self.fft_pow) + (self.row_ms * MAX_ROWS_PER_FRAME as f32 * rate as f32 / 1000.0) as usize
+        (1usize << self.fft_pow) + (self.catchup_ms() * rate as f32 / 1000.0) as usize
     }
 
-    pub fn ui(&mut self, ui: &mut Ui, link: &mut Link<Key>) {
-        ui.add(egui::Slider::new(&mut self.fft_pow, 10..=15).text("FFT 2^n"));
+    /// How far behind "now" rows may still be caught up; further, skip ahead.
+    fn catchup_ms(&self) -> f32 {
+        (self.row_ms * MAX_ROWS_PER_FRAME as f32).min(MAX_CATCHUP_MS.max(self.row_ms))
+    }
+
+    pub fn ui(&mut self, ui: &mut Ui, shared: &Shared, link: &mut Link<Key>) {
+        self.db.ui(ui, &shared.db);
+        self.ui_fft(ui);
         ui.add(egui::Slider::new(&mut self.rows, ROWS.0..=ROWS.1).text("history rows"))
             .on_hover_text("Number of spectrum rows retained. Time between rows is set by ms / row.");
-        ui.add(RangeSlider::new(&mut self.floor_db, &mut self.ceil_db, spectrum::FLOOR_DB..=DB_CEIL).min_gap(DB_MIN_GAP).text("dB"));
         link.slider(ui, Key::Speed, egui::Slider::new(&mut self.row_ms, ROW_MS.0..=ROW_MS.1).logarithmic(true).text("ms / row"));
+        self.ui_gate(ui);
+    }
+
+    pub fn ui_fft(&mut self, ui: &mut Ui) {
+        ui.add(egui::Slider::new(&mut self.fft_pow, 10..=15).text("FFT 2^n"));
+    }
+
+    pub fn ui_gate(&mut self, ui: &mut Ui) {
         ui.checkbox(&mut self.follow_gate, "only gated window");
     }
 
     /// Speed handle on the right edge (up is faster), tied to its slider.
     /// Call [`Link::tick`] earlier in the frame.
     pub fn speed_handle(&mut self, ui: &mut Ui, rect: Rect, id: &str, link: &mut Link<Key>) {
-        let speed = Scale::log(ROW_MS, (rect.top() + 6.0, rect.bottom() - 6.0));
         let rows = self.rows as f32;
         let fmt = |ms: f32| format!("{} ms/row · {}", plot::trim(ms), plot::fmt_secs(rows * ms / 1000.0));
-        let r = EdgeHandle::new(id, Edge::Right, speed, &mut self.row_ms).reset(15.0).guide(false).label(&fmt).show(ui, rect);
-        if r.hovered() || r.dragged() {
-            link.touch(Key::Speed);
-        }
-        if link.shown() == Some(Key::Speed) {
-            link.point_y(ui, rect, speed.px(self.row_ms));
-        }
+        time_handle(ui, rect, id, link, &mut self.row_ms, ROW_MS, 15.0, &fmt);
+    }
+}
+
+/// Log-scaled time handle on the right edge (up is shorter), linked to the
+/// [`Key::Speed`] slider. Call [`Link::tick`] earlier in the frame.
+#[allow(clippy::too_many_arguments)]
+pub fn time_handle(ui: &mut Ui, rect: Rect, id: &str, link: &mut Link<Key>, value: &mut f32, range: (f32, f32), reset: f32, fmt: &dyn Fn(f32) -> String) {
+    let scale = Scale::log(range, (rect.top() + 6.0, rect.bottom() - 6.0));
+    let r = EdgeHandle::new(id, Edge::Right, scale, value).reset(reset).guide(false).label(fmt).show(ui, rect);
+    if r.hovered() || r.dragged() {
+        link.touch(Key::Speed);
+    }
+    if link.shown() == Some(Key::Speed) {
+        link.point_y(ui, rect, scale.px(*value));
     }
 }
 
@@ -175,10 +197,11 @@ impl Rows {
         }
         let hop = f.ms_to_samples(p.row_ms).max(32) as u64;
         let end = f.end();
+        let catchup = f.ms_to_samples(p.catchup_ms()) as u64;
         // Start at "now" on the first frame, after a restart, or when too far
         // behind to catch up: missed rows are skipped, not burst out.
         let mut t = match self.next_at {
-            Some(t) if !shared.reset && t <= end + hop && end - t.min(end) <= hop * MAX_ROWS_PER_FRAME as u64 => t,
+            Some(t) if !shared.reset && t <= end + hop && end - t.min(end) <= catchup => t,
             _ => end,
         };
         let Some(bands) = self.bands.as_ref() else { return out };

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -212,6 +213,8 @@ pub struct InputSettings {
     pub buffer: Option<u32>,
     /// Seconds of audio the capture ring holds, whatever the callback size.
     pub history_secs: u32,
+    /// Last channel picked on each device, restored when switching back.
+    pub device_channels: BTreeMap<String, ChannelSel>,
 }
 
 impl Default for InputSettings {
@@ -223,6 +226,7 @@ impl Default for InputSettings {
             paused: false,
             buffer: None,
             history_secs: DEFAULT_HISTORY_SECS,
+            device_channels: BTreeMap::new(),
         }
     }
 }
@@ -261,6 +265,8 @@ pub struct Input {
     /// `ChannelSel::to_bits`, read by the callback, so changing channel needs
     /// no reopen.
     channel: Arc<AtomicU32>,
+    /// Last channel picked on each device id.
+    device_channels: BTreeMap<String, ChannelSel>,
 }
 
 impl Input {
@@ -285,6 +291,7 @@ impl Input {
             open_error: None,
             gain: Arc::new(AtomicU32::new(1f32.to_bits())),
             channel: Arc::new(AtomicU32::new(settings.channel.to_bits())),
+            device_channels: settings.device_channels.clone(),
         };
         me.switch(settings.device_id.as_deref());
         me
@@ -298,6 +305,7 @@ impl Input {
             paused: self.paused,
             buffer: self.want_buffer,
             history_secs: self.history_secs,
+            device_channels: self.device_channels.clone(),
         }
     }
 
@@ -319,6 +327,22 @@ impl Input {
     pub fn switch(&mut self, device_id: Option<&str>) {
         self.stream = None;
         self.open_error = self.open_stream(device_id).err();
+    }
+
+    /// Switch to another device picked by the user, restoring the channel
+    /// last used on it (the current device's pick is remembered first).
+    pub fn select_device(&mut self, device_id: &str) {
+        self.remember_channel();
+        if let Some(&sel) = self.device_channels.get(device_id) {
+            self.channel.store(sel.to_bits(), Ordering::Relaxed);
+        }
+        self.switch(Some(device_id));
+    }
+
+    fn remember_channel(&mut self) {
+        if let Some(id) = &self.device_id {
+            self.device_channels.insert(id.clone(), self.channel());
+        }
     }
 
     /// Reopen the current device at `rate` (`None`: its default).
@@ -407,6 +431,7 @@ impl Input {
 
     pub fn set_channel(&mut self, sel: ChannelSel) {
         self.channel.store(sel.to_bits(), Ordering::Relaxed);
+        self.remember_channel();
         self.sync_channels();
     }
 
