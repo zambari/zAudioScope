@@ -4,6 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::audio::mic_permission::{self, MicAuth};
+use crate::midi::MidiHub;
 use crate::audio::{ChannelSel, DeviceInfo, HISTORY_CHOICES, Input, InputSettings};
 use crate::modules::{self, FftPlans, Shared, Slot};
 use crate::relaunch::BuildWatch;
@@ -31,6 +32,8 @@ struct Saved {
     db: DbRange,
     layout: ui::layout::Workspace,
     debug: bool,
+    /// MIDI input port, reopened whenever it is present.
+    midi_port: Option<String>,
 }
 
 impl Default for Saved {
@@ -44,12 +47,15 @@ impl Default for Saved {
             db: DbRange::default(),
             layout: Default::default(),
             debug: false,
+            midi_port: None,
         }
     }
 }
 
 pub struct App {
     input: Input,
+    /// Always open, whichever MIDI analysers are shown.
+    midi: MidiHub,
     devices: Vec<DeviceInfo>,
     slots: Vec<Slot>,
     gain: f32,
@@ -109,6 +115,7 @@ impl App {
                 ..saved.input.clone()
             }),
             devices: Input::devices(),
+            midi: MidiHub::new(saved.midi_port.clone().or_else(|| legacy_midi_port(storage?))),
             slots,
             gain: saved.gain.clamp(0.0, ui::meter::GAIN_MAX),
             range: saved.range.sanitized(),
@@ -239,14 +246,14 @@ impl App {
             ui.separator();
             self.meter.show(ui, &self.input, &mut self.gain);
         });
-        for slot in &mut self.slots {
-            if slot.module.has_top_row() {
+        ui.separator();
+        ui.horizontal_wrapped(|ui| {
+            self.midi.picker(ui);
+            for slot in self.slots.iter_mut().filter(|s| s.module.has_top_row()) {
                 ui.separator();
-                ui.push_id(slot.module.title(), |ui| {
-                    ui.horizontal_wrapped(|ui| slot.module.top_row(ui));
-                });
+                ui.push_id(slot.module.title(), |ui| slot.module.top_row(ui));
             }
-        }
+        });
     }
 
     /// Listening is the lit, active state; clicking releases the interface
@@ -484,6 +491,9 @@ impl eframe::App for App {
         let reset = frame.end() < self.last_end;
         self.last_end = frame.end();
         let start = self.profiler.start();
+        self.midi.poll();
+        self.profiler.record("Ingest", "MIDI", start);
+        let start = self.profiler.start();
         self.levels.ingest(&frame, reset);
         self.profiler.record("Ingest", "Level histo", start);
         let mut shared = Shared::new(
@@ -494,6 +504,7 @@ impl eframe::App for App {
             self.levels.dist(),
             std::mem::take(&mut self.fft_plans),
         );
+        shared.midi = self.midi.frame();
         // Analysis runs in slot order, so the scope sets the gate first.
         for slot in self.slots.iter_mut().filter(|s| s.visible) {
             let start = self.profiler.start();
@@ -540,6 +551,7 @@ impl eframe::App for App {
                 db: self.db,
                 layout: self.layout.clone(),
                 debug: self.profiler.enabled,
+                midi_port: self.midi.port().cloned(),
             }
         };
         eframe::set_value(storage, STATE_KEY, &saved);
@@ -573,6 +585,15 @@ impl eframe::App for App {
             }
         }
     }
+}
+
+/// The port the MIDI module chose before the app owned the MIDI input.
+fn legacy_midi_port(storage: &dyn eframe::Storage) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Old {
+        port: Option<String>,
+    }
+    eframe::get_value::<Old>(storage, "zaudioscope_module.MIDI")?.port
 }
 
 /// "48k", "44.1k".

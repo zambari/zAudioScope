@@ -3,6 +3,7 @@
 
 mod app;
 mod audio;
+mod midi;
 mod modules;
 mod pitch;
 mod relaunch;

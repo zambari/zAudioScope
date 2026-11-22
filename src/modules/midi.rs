@@ -3,13 +3,10 @@
 //! down a piano-roll waterfall (newest at the top). The key range is the
 //! shared note range (the bar above the status bar).
 //!
-//! The midir callback runs on its own thread; it timestamps each channel
-//! message and pushes it onto a shared queue that `update` drains every
-//! frame into a ring of notes.
+//! Messages come from the app's [`MidiHub`](crate::midi::MidiHub), which
+//! owns the port and keeps it alive while this module is hidden.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -28,15 +25,11 @@ const HOLD_S: f64 = 0.020;
 const FADE_S: f64 = 0.250;
 /// Short notes (drum triggers) still get a box this tall.
 const MIN_BOX_PX: f32 = 7.0;
-/// How often the port list is rescanned to notice devices coming and going.
-const WATCHDOG: Duration = Duration::from_secs(1);
 
 /// The persisted settings.
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
 struct Params {
-    /// Input port name, reconnected on start when present.
-    port: Option<String>,
     /// Source channel 0..16; `None` means all.
     channel: Option<u8>,
     /// Seconds of history shown down the graph.
@@ -49,7 +42,6 @@ struct Params {
 impl Default for Params {
     fn default() -> Self {
         Self {
-            port: None,
             channel: None,
             span_s: 8.0,
             octave: 0,
@@ -67,9 +59,6 @@ impl Params {
     }
 }
 
-/// A channel message as received: seconds since `epoch`, raw bytes.
-type Raw = (f64, [u8; 3]);
-
 struct Note {
     ch: u8,
     key: u8,
@@ -81,64 +70,34 @@ struct Note {
 
 pub struct MidiMonitor {
     p: Params,
-    epoch: Instant,
-    ports: Vec<String>,
-    conn: Option<midir::MidiInputConnection<()>>,
-    /// Port the connection is open on.
-    connected: Option<String>,
-    error: Option<String>,
-    queue: Arc<Mutex<Vec<Raw>>>,
+    /// Hub state as of the last update, for the "no device" text.
+    connected: bool,
+    missing: bool,
     notes: VecDeque<Note>,
     /// Time of the last message per channel.
     last: [Option<f64>; 16],
     count: [u64; 16],
     /// Last message on the source channel(s), for the readout.
     last_msg: Option<(u8, [u8; 3])>,
-    /// Last port rescan; `None` until the first update.
-    last_scan: Option<Instant>,
 }
 
 impl Default for MidiMonitor {
     fn default() -> Self {
         Self {
             p: Params::default(),
-            epoch: Instant::now(),
-            ports: Vec::new(),
-            conn: None,
-            connected: None,
-            error: None,
-            queue: Default::default(),
+            connected: false,
+            missing: false,
             notes: VecDeque::new(),
             last: [None; 16],
             count: [0; 16],
             last_msg: None,
-            last_scan: None,
         }
-    }
-}
-
-fn input(name: &str) -> Result<midir::MidiInput, String> {
-    let mut i = midir::MidiInput::new(name).map_err(|e| e.to_string())?;
-    // Channel messages only: no SysEx, clock or active sensing.
-    i.ignore(midir::Ignore::All);
-    Ok(i)
-}
-
-fn list_ports() -> Vec<String> {
-    // A fresh client each time: a long-lived one may not see ports come and go.
-    match input("zAudioScope scan") {
-        Ok(i) => i
-            .ports()
-            .iter()
-            .filter_map(|p| i.port_name(p).ok())
-            .collect(),
-        Err(_) => Vec::new(),
     }
 }
 
 impl MidiMonitor {
     fn now(&self) -> f64 {
-        self.epoch.elapsed().as_secs_f64()
+        crate::midi::now()
     }
 
     fn passes(&self, ch: u8) -> bool {
@@ -156,81 +115,11 @@ impl MidiMonitor {
             .filter(|n| n.off.is_none() && self.passes(n.ch))
     }
 
-    fn disconnect(&mut self) {
-        self.conn = None;
-        self.connected = None;
+    /// The connection went away: nothing is held any more.
+    fn end_held(&mut self) {
         let now = self.now();
         for n in self.notes.iter_mut().filter(|n| n.off.is_none()) {
             n.off = Some(now);
-        }
-    }
-
-    fn connect(&mut self, name: &str) {
-        self.disconnect();
-        self.error = None;
-        let result = (|| {
-            let i = input("zAudioScope")?;
-            let port = i
-                .ports()
-                .into_iter()
-                .find(|p| i.port_name(p).ok().as_deref() == Some(name))
-                .ok_or_else(|| format!("{name}: not found"))?;
-            let (queue, epoch) = (self.queue.clone(), self.epoch);
-            i.connect(
-                &port,
-                "zAudioScope in",
-                move |_, msg, _| {
-                    let Some(&status) = msg.first() else { return };
-                    if !(0x80..0xF0).contains(&status) {
-                        return;
-                    }
-                    let b = [
-                        status,
-                        msg.get(1).copied().unwrap_or(0),
-                        msg.get(2).copied().unwrap_or(0),
-                    ];
-                    if let Ok(mut q) = queue.lock() {
-                        q.push((epoch.elapsed().as_secs_f64(), b));
-                    }
-                },
-                (),
-            )
-            .map_err(|e| e.to_string())
-        })();
-        match result {
-            Ok(c) => {
-                self.conn = Some(c);
-                self.connected = Some(name.to_owned());
-            }
-            Err(e) => self.error = Some(e),
-        }
-    }
-
-    /// Whether the chosen port is set but not currently open (unplugged).
-    fn missing(&self) -> bool {
-        self.p.port.is_some() && self.connected.is_none()
-    }
-
-    /// Rescan ports; drop the connection if its device vanished, reopen the
-    /// chosen port once it is back.
-    fn watchdog(&mut self) {
-        if self.last_scan.is_some_and(|t| t.elapsed() < WATCHDOG) {
-            return;
-        }
-        self.last_scan = Some(Instant::now());
-        self.ports = list_ports();
-        if self
-            .connected
-            .as_ref()
-            .is_some_and(|n| !self.ports.contains(n))
-        {
-            self.disconnect();
-            self.error = None;
-        }
-        if self.connected.is_none()
-            && let Some(name) = self.p.port.clone().filter(|n| self.ports.contains(n))
-        {
-            self.connect(&name);
         }
     }
 
@@ -364,11 +253,14 @@ impl Module for MidiMonitor {
         0
     }
 
-    fn update(&mut self, _shared: &mut Shared) {
-        self.watchdog();
-        let raw = std::mem::take(&mut *self.queue.lock().unwrap_or_else(|e| e.into_inner()));
-        for (t, b) in raw {
-            self.handle(t, b);
+    fn update(&mut self, shared: &mut Shared) {
+        let midi = &shared.midi;
+        (self.connected, self.missing) = (midi.connected, midi.missing);
+        for e in midi.events.iter() {
+            self.handle(e.t, e.b);
+        }
+        if midi.dropped {
+            self.end_held();
         }
     }
 
@@ -381,62 +273,6 @@ impl Module for MidiMonitor {
     }
 
     fn top_row(&mut self, ui: &mut Ui) {
-        ui.label("MIDI in");
-        let missing = self.missing();
-        let shown = match &self.p.port {
-            Some(name) if missing => egui::RichText::new(name).color(Color32::from_gray(100)),
-            Some(name) => egui::RichText::new(name),
-            None => egui::RichText::new("— none —"),
-        };
-        let combo = egui::ComboBox::from_id_salt("midi_port")
-            .width(200.0)
-            .selected_text(shown)
-            .show_ui(ui, |ui| {
-                let mut pick = None;
-                if ui
-                    .selectable_label(self.p.port.is_none(), "— none —")
-                    .clicked()
-                {
-                    pick = Some(None);
-                }
-                // The chosen port while unplugged: shown, but not pickable.
-                if let Some(name) = self.p.port.as_ref().filter(|_| missing) {
-                    ui.add_enabled(
-                        false,
-                        egui::Button::selectable(true, format!("{name} (not connected)")),
-                    );
-                }
-                for name in &self.ports {
-                    if ui
-                        .selectable_label(self.connected.as_ref() == Some(name), name)
-                        .clicked()
-                    {
-                        pick = Some(Some(name.clone()));
-                    }
-                }
-                pick
-            });
-        if missing {
-            combo
-                .response
-                .on_hover_text("Device not connected; it reopens when it comes back");
-        }
-        match combo.inner.flatten() {
-            Some(Some(name)) => {
-                self.p.port = Some(name.clone());
-                self.connect(&name);
-            }
-            Some(None) => {
-                self.p.port = None;
-                self.disconnect();
-            }
-            None => {}
-        }
-        if let Some(e) = &self.error {
-            ui.colored_label(theme::HANDLE, e);
-        }
-
-        ui.separator();
         ui.label("Source");
         if ui
             .selectable_label(self.p.channel.is_none(), "all")
@@ -507,11 +343,27 @@ impl Module for MidiMonitor {
     }
 
     fn graph(&mut self, ui: &mut Ui, rect: Rect, shared: &Shared) {
+        self.paint(ui, rect, shared, true);
+    }
+
+    fn layer_depth(&self) -> Option<u8> {
+        Some(3)
+    }
+
+    fn layer(&mut self, ui: &mut Ui, rect: Rect, shared: &Shared) {
+        self.paint(ui, rect, shared, false);
+    }
+}
+
+impl MidiMonitor {
+    /// `full`: with key lanes, time grid and status text; otherwise the
+    /// notes and held keys alone.
+    fn paint(&mut self, ui: &mut Ui, rect: Rect, shared: &Shared, full: bool) {
         let now = self.now();
         let range = shared.range.get();
         let (lo, hi) = (range.lo, range.hi);
         let span = self.p.span_s as f64;
-        let plot = Rect::from_min_max(rect.min, pos2(rect.right(), rect.bottom() - 14.0));
+        let plot = if full { Rect::from_min_max(rect.min, pos2(rect.right(), rect.bottom() - 14.0)) } else { rect.with_max_y(rect.bottom() - 3.0) };
         let kw = plot.width() / range.count() as f32;
         // Left edge of key `k`'s lane: lanes are centred on the note.
         let x_scale = range.scale(plot);
@@ -519,52 +371,54 @@ impl Module for MidiMonitor {
         let time_y = |t: f64| plot.top() + ((now - t) / span) as f32 * plot.height();
         let p = ui.painter_at(rect);
 
-        // Lanes: black keys slightly lighter, a line at each C.
-        for k in lo..=hi {
-            let x = key_x(k);
-            if is_black(k) {
-                p.rect_filled(
-                    Rect::from_min_max(pos2(x, plot.top()), pos2(x + kw, plot.bottom())),
-                    0.0,
-                    Color32::from_gray(19),
-                );
+        if full {
+            // Lanes: black keys slightly lighter, a line at each C.
+            for k in lo..=hi {
+                let x = key_x(k);
+                if is_black(k) {
+                    p.rect_filled(
+                        Rect::from_min_max(pos2(x, plot.top()), pos2(x + kw, plot.bottom())),
+                        0.0,
+                        Color32::from_gray(19),
+                    );
+                }
+                if k.rem_euclid(12) == 0 {
+                    p.line_segment(
+                        [pos2(x, plot.top()), pos2(x, rect.bottom())],
+                        Stroke::new(1.0, Color32::from_gray(40)),
+                    );
+                    p.text(
+                        pos2(x + 2.0, rect.bottom() - 1.0),
+                        Align2::LEFT_BOTTOM,
+                        pitch::note_name(k),
+                        FontId::proportional(9.0),
+                        Color32::from_gray(120),
+                    );
+                }
             }
-            if k.rem_euclid(12) == 0 {
+            // Seconds ago.
+            let step = [0.25, 0.5, 1.0, 2.0, 5.0, 10.0]
+                .into_iter()
+                .find(|s| span / s <= 10.0)
+                .unwrap_or(10.0);
+            let mut s = step;
+            while s < span {
+                let y = time_y(now - s);
                 p.line_segment(
-                    [pos2(x, plot.top()), pos2(x, rect.bottom())],
-                    Stroke::new(1.0, Color32::from_gray(40)),
+                    [pos2(plot.left(), y), pos2(plot.right(), y)],
+                    Stroke::new(1.0, Color32::from_gray(30)),
                 );
                 p.text(
-                    pos2(x + 2.0, rect.bottom() - 1.0),
-                    Align2::LEFT_BOTTOM,
-                    pitch::note_name(k),
+                    pos2(plot.right() - 3.0, y - 1.0),
+                    Align2::RIGHT_BOTTOM,
+                    format!("-{s}s"),
                     FontId::proportional(9.0),
-                    Color32::from_gray(120),
+                    Color32::from_gray(90),
                 );
+                s += step;
             }
-        }
-        // Seconds ago.
-        let step = [0.25, 0.5, 1.0, 2.0, 5.0, 10.0]
-            .into_iter()
-            .find(|s| span / s <= 10.0)
-            .unwrap_or(10.0);
-        let mut s = step;
-        while s < span {
-            let y = time_y(now - s);
-            p.line_segment(
-                [pos2(plot.left(), y), pos2(plot.right(), y)],
-                Stroke::new(1.0, Color32::from_gray(30)),
-            );
-            p.text(
-                pos2(plot.right() - 3.0, y - 1.0),
-                Align2::RIGHT_BOTTOM,
-                format!("-{s}s"),
-                FontId::proportional(9.0),
-                Color32::from_gray(90),
-            );
-            s += step;
-        }
 
+        }
         let (mut below, mut above) = (0, 0);
         let style = &self.p.style;
         let min_hold = MIN_BOX_PX as f64 * span / plot.height().max(1.0) as f64;
@@ -619,7 +473,7 @@ impl Module for MidiMonitor {
         }
         // Notes the key range hides.
         let small = FontId::proportional(10.0);
-        if below > 0 {
+        if full && below > 0 {
             p.text(
                 plot.left_top() + vec2(4.0, 3.0),
                 Align2::LEFT_TOP,
@@ -628,7 +482,7 @@ impl Module for MidiMonitor {
                 theme::ACCENT_BRIGHT,
             );
         }
-        if above > 0 {
+        if full && above > 0 {
             p.text(
                 plot.right_top() + vec2(-4.0, 3.0),
                 Align2::RIGHT_TOP,
@@ -651,8 +505,8 @@ impl Module for MidiMonitor {
             }
         }
 
-        if self.connected.is_none() {
-            let text = if self.missing() {
+        if full && !self.connected {
+            let text = if self.missing {
                 "no device"
             } else {
                 "no MIDI input selected"

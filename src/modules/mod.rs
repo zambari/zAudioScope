@@ -18,6 +18,9 @@
 //!    result and hands the FFT plans back for the next frame.
 
 pub mod midi;
+mod note_input;
+pub mod note_spectrum;
+mod perf;
 pub mod scope;
 pub mod spectrogram;
 mod spectrum_rows;
@@ -33,6 +36,7 @@ use egui::{Rect, Ui};
 use crate::audio::Frame;
 use crate::audio::levels::LevelDist;
 use crate::audio::spectrum::Fft;
+use crate::midi::MidiFrame;
 use crate::ui::dynamic_range::DbRange;
 use crate::ui::noterange::NoteRange;
 
@@ -73,6 +77,8 @@ pub struct Shared {
     pub db: Cell<DbRange>,
     /// Recent block-RMS level distribution, for the dB controls' meters.
     pub levels: Rc<LevelDist>,
+    /// MIDI received since the last frame; the app fills it in.
+    pub midi: MidiFrame,
     plans: RefCell<FftPlans>,
     cache: RefCell<FrameCache>,
 }
@@ -86,6 +92,7 @@ impl Shared {
             range: Cell::new(range),
             db: Cell::new(db),
             levels,
+            midi: MidiFrame::default(),
             plans: RefCell::new(plans),
             cache: Default::default(),
         }
@@ -141,6 +148,20 @@ impl Shared {
         };
         self.cache.borrow_mut().spectra.insert(key, power.clone());
         power
+    }
+
+    /// The largest spectrum some module already computed this frame, as
+    /// `(fft size, power, true)`; failing that, a fresh `fallback`-point one
+    /// of the latest audio, `(fallback, power, false)`.
+    pub fn any_spectrum(&self, fallback: usize) -> (usize, Rc<[f32]>, bool) {
+        let cached = self.cache.borrow().spectra.iter().max_by_key(|(k, _)| (k.0, k.2)).map(|(k, v)| (k.0, v.clone()));
+        match cached {
+            Some((n, p)) => (n, p, true),
+            None => {
+                let end = self.frame.end();
+                (fallback, self.spectrum(fallback, (end.saturating_sub(fallback as u64), end)), false)
+            }
+        }
     }
 
     /// The snapshot at `1/factor` of the rate (`factor` a power of two),
@@ -208,14 +229,37 @@ pub trait Module {
     fn update(&mut self, _shared: &mut Shared) {}
     /// Live pitches (fractional MIDI) to light on the shared range bar.
     fn marks(&self, _out: &mut Vec<f32>) {}
-    /// Whether this module has global device controls below the audio toolbar.
+    /// Whether this module has controls in the row below the audio toolbar
+    /// (beside the MIDI input picker).
     fn has_top_row(&self) -> bool {
         false
     }
     /// Global device controls shown above the workspace layout.
     fn top_row(&mut self, _ui: &mut Ui) {}
     fn params(&mut self, ui: &mut Ui, shared: &Shared);
+    /// The full display: background, axes, data and value labels.
     fn graph(&mut self, ui: &mut Ui, rect: Rect, shared: &Shared);
+    /// `Some` for modules whose [`Self::layer`] can be stacked in the
+    /// Composite view (mostly drawn across the shared note range; the scope
+    /// stretches its time axis over the panel instead).
+    /// The value is the default stacking depth (0 = bottom).
+    fn layer_depth(&self) -> Option<u8> {
+        None
+    }
+    /// Data only (no background, axes or value labels), for the Composite
+    /// view, which draws a shared note grid underneath. Animates like `graph`.
+    fn layer(&mut self, _ui: &mut Ui, _rect: Rect, _shared: &Shared) {}
+    /// Title of a module whose full graph this one draws on top of (with
+    /// [`Self::overlay`]) in the stack and in this module's solo page,
+    /// while that module is on, instead of in a panel of its own.
+    fn stack_over(&self) -> Option<&'static str> {
+        None
+    }
+    /// Everything `graph` draws except the background and grid, over the
+    /// [`Self::stack_over`] module's full graph in the same rect.
+    fn overlay(&mut self, ui: &mut Ui, rect: Rect, shared: &Shared) {
+        self.layer(ui, rect, shared)
+    }
 }
 
 /// A module plus its visibility (top bar toggle) and foldout state.
@@ -240,6 +284,7 @@ pub fn all() -> Vec<Slot> {
     };
     vec![
         slot(Box::new(scope::Scope::default())),
+        slot(Box::new(note_spectrum::NoteSpectrum::default())),
         slot(Box::new(tuner::Tuner::default())),
         slot(Box::new(spectrogram::Spectrogram::default())),
         slot(Box::new(waterfall::Waterfall::default())),

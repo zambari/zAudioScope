@@ -13,6 +13,7 @@ use egui::{Align2, Color32, CursorIcon, FontId, Rect, Sense, Stroke, Ui, pos2, v
 use serde::{Deserialize, Serialize};
 
 use super::plot::{self, Scale};
+use super::outside::Outside;
 use super::theme;
 use super::widgets::{Grab, clamp_pair};
 use crate::pitch;
@@ -93,7 +94,7 @@ const EDGE_PX: f32 = 6.0;
 
 /// The range control. `marks` are live pitches (fractional MIDI) reported
 /// by the analysers, lit on the keys. Returns true when the range changed.
-pub fn bar(ui: &mut Ui, range: &mut NoteRange, marks: &[f32], readout_width: f32) -> bool {
+pub fn bar(ui: &mut Ui, range: &mut NoteRange, marks: &[f32], readout_width: f32, outside: Option<&Outside>) -> bool {
     let before = *range;
     ui.horizontal(|ui| {
         // Readout in the parameter column, so the strip lines up with graphs.
@@ -119,12 +120,12 @@ pub fn bar(ui: &mut Ui, range: &mut NoteRange, marks: &[f32], readout_width: f32
                 ));
             },
         );
-        strip(ui, range, marks);
+        strip(ui, range, marks, outside);
     });
     *range != before
 }
 
-fn strip(ui: &mut Ui, range: &mut NoteRange, marks: &[f32]) {
+fn strip(ui: &mut Ui, range: &mut NoteRange, marks: &[f32], outside: Option<&Outside>) {
     let (rect, resp) =
         ui.allocate_exact_size(vec2(ui.available_width(), 36.0), Sense::click_and_drag());
     let full = NoteRange::BOUNDS;
@@ -290,6 +291,13 @@ fn strip(ui: &mut Ui, range: &mut NoteRange, marks: &[f32]) {
         0.0,
         shade,
     );
+    if let Some(o) = outside {
+        o.paint(
+            &p,
+            Rect::from_min_max(keys.min, pos2(sel.left(), keys.bottom())),
+            Rect::from_min_max(pos2(sel.right(), keys.top()), keys.max),
+        );
+    }
     p.rect_filled(sel, 0.0, theme::ACCENT.gamma_multiply(0.18));
     p.rect_stroke(
         sel,
@@ -327,8 +335,12 @@ fn strip(ui: &mut Ui, range: &mut NoteRange, marks: &[f32]) {
 
     if let Some(h) = resp.hover_pos() {
         let m = notes.value(h.x);
+        let side = outside
+            .filter(|_| h.y > keys.top() && (h.x < sel.left() || h.x > sel.right()))
+            .map(|o| format!("\n\n{}", o.describe(h.x < sel.left())))
+            .unwrap_or_default();
         resp.on_hover_text_at_pointer(format!(
-            "{} · {} Hz\nDrag an edge or the selection, scroll to shift, double-click to reset.",
+            "{} · {} Hz{side}\nDrag an edge or the selection, scroll to shift, double-click to reset.",
             pitch::note_name(m.round() as i32),
             plot::trim(pitch::midi_to_freq(m, A4).round())
         ));

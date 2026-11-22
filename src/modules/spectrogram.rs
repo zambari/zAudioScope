@@ -65,10 +65,21 @@ impl Module for Spectrogram {
     }
 
     fn graph(&mut self, ui: &mut Ui, rect: Rect, shared: &Shared) {
-        self.link.tick(ui.input(|i| i.stable_dt).clamp(0.0, 0.1));
-        if self.rows.history.is_empty() {
-            return;
-        }
+        self.paint(ui, rect, shared, true);
+    }
+
+    fn layer_depth(&self) -> Option<u8> {
+        Some(0)
+    }
+
+    fn layer(&mut self, ui: &mut Ui, rect: Rect, shared: &Shared) {
+        self.paint(ui, rect, shared, false);
+    }
+}
+
+impl Spectrogram {
+    /// Bring the texture up to date with the rows and colour scale.
+    fn refresh(&mut self, ui: &Ui) {
         // Colour scale changed: recolour what we have.
         let key = (self.p.db.range.floor, self.p.db.range.ceil, self.p.rows);
         if self.colored_for != key {
@@ -88,17 +99,23 @@ impl Module for Spectrogram {
                 None => self.texture = Some(ui.ctx().load_texture("spectrogram", img, TextureOptions::LINEAR)),
             }
         }
-        self.paint(ui, rect, shared);
     }
-}
 
-impl Spectrogram {
-    fn paint(&mut self, ui: &mut Ui, rect: Rect, shared: &Shared) {
+    /// `full`: with axes and the speed handle; otherwise the image alone.
+    fn paint(&mut self, ui: &mut Ui, rect: Rect, shared: &Shared, full: bool) {
+        self.link.tick(ui.input(|i| i.stable_dt).clamp(0.0, 0.1));
+        if self.rows.history.is_empty() {
+            return;
+        }
+        self.refresh(ui);
         let Some(tex) = self.texture.as_ref().map(|t| t.id()) else { return };
         let painter = ui.painter_at(rect);
         let range = shared.range.get();
         let (_, (u0, u1)) = visible_bands(range);
         painter.image(tex, rect, Rect::from_min_max(pos2(u0, 0.0), pos2(u1, 1.0)), Color32::WHITE);
+        if !full {
+            return;
+        }
 
         // Frequency along the bottom, time ago down the left.
         Axis::new(Edge::Bottom, range.hz_scale(rect)).spacing(48.0).draw(&painter, rect, plot::fmt_hz);

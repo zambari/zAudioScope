@@ -143,6 +143,47 @@ impl Scope {
         }
         found
     }
+
+    /// Sample offset into the frame and length of what's on screen: after
+    /// the trigger, or the latest audio in free mode (or before one fires).
+    fn span(&self, shared: &Shared) -> (usize, usize) {
+        let f = &shared.frame;
+        let view = f.ms_to_samples(self.p.view_ms).max(2);
+        let start = match (self.p.mode, self.trigger) {
+            (Mode::Trigger, Some(t)) => t.saturating_sub(f.start) as usize,
+            _ => f.samples.len().saturating_sub(view),
+        };
+        (start, view)
+    }
+
+    /// Shaded gate window (trigger mode only).
+    fn paint_gate(&self, painter: &egui::Painter, rect: Rect) {
+        if self.p.mode != Mode::Trigger {
+            return;
+        }
+        let x_of_ms = |ms: f32| rect.left() + rect.width() * ms / self.p.view_ms;
+        let gate = Rect::from_x_y_ranges(x_of_ms(self.p.win_start_ms)..=x_of_ms(self.p.win_end_ms), rect.y_range());
+        painter.rect_filled(gate, 0.0, theme::ACCENT.gamma_multiply(0.25));
+    }
+
+    /// The trace: min/max per pixel column.
+    fn paint_wave(&self, painter: &egui::Painter, rect: Rect, shared: &Shared) {
+        let f = &shared.frame;
+        let (lo, view) = self.span(shared);
+        let fold = self.p.fold();
+        let cols = rect.width().max(1.0) as usize;
+        for c in 0..cols {
+            let a = lo + c * view / cols;
+            let b = (lo + (c + 1) * view / cols).max(a + 1);
+            let Some(seg) = f.samples.get(a..b.min(f.samples.len())) else { break };
+            if seg.is_empty() {
+                break;
+            }
+            let (mn, mx) = seg.iter().fold((f32::MAX, f32::MIN), |(mn, mx), &s| (mn.min(s), mx.max(s)));
+            let x = rect.left() + c as f32 + 0.5;
+            painter.vline(x, fold.y(rect, mx)..=fold.y(rect, mn), Stroke::new(1.0, theme::WAVE));
+        }
+    }
 }
 
 impl Module for Scope {
@@ -211,11 +252,7 @@ impl Module for Scope {
         self.link.tick(ui.input(|i| i.stable_dt).clamp(0.0, 0.1));
         let f = &shared.frame;
         let trig = self.p.mode == Mode::Trigger;
-        let view = f.ms_to_samples(self.p.view_ms).max(2);
-        let start = match (trig, self.trigger) {
-            (true, Some(t)) => t,
-            _ => f.start + f.samples.len().saturating_sub(view) as u64,
-        };
+        let (lo, view) = self.span(shared);
         let painter = ui.painter_at(rect);
         // Trigger: ms after the trigger. Free: ms before now.
         let xs = if trig {
@@ -240,27 +277,15 @@ impl Module for Scope {
             if resp.drag_stopped() {
                 self.drag_from_ms = None;
             }
-            let gate = Rect::from_x_y_ranges(x_of_ms(self.p.win_start_ms)..=x_of_ms(self.p.win_end_ms), rect.y_range());
-            painter.rect_filled(gate, 0.0, theme::ACCENT.gamma_multiply(0.25));
         }
+        self.paint_gate(&painter, rect);
         Axis::new(Edge::Bottom, xs).draw(&painter, rect, plot::fmt_ms);
         draw_db_axis(&painter, rect, fold);
-        painter.hline(rect.x_range(), rect.center().y, Stroke::new(1.0, Color32::from_gray(40)));
+        // Raised floor folds quiet signal onto the centre line: flag it orange.
+        let centre = if self.p.db.range.floor_raised() { theme::ACCENT_BRIGHT } else { Color32::from_gray(40) };
+        painter.hline(rect.x_range(), rect.center().y, Stroke::new(1.0, centre));
 
-        // Min/max per pixel column.
-        let cols = rect.width().max(1.0) as usize;
-        let lo = start.saturating_sub(f.start) as usize;
-        for c in 0..cols {
-            let a = lo + c * view / cols;
-            let b = (lo + (c + 1) * view / cols).max(a + 1);
-            let Some(seg) = f.samples.get(a..b.min(f.samples.len())) else { break };
-            if seg.is_empty() {
-                break;
-            }
-            let (mn, mx) = seg.iter().fold((f32::MAX, f32::MIN), |(mn, mx), &s| (mn.min(s), mx.max(s)));
-            let x = rect.left() + c as f32 + 0.5;
-            painter.vline(x, fold.y(rect, mx)..=fold.y(rect, mn), Stroke::new(1.0, theme::WAVE));
-        }
+        self.paint_wave(&painter, rect, shared);
 
         // Handles: threshold on the left edge, gate ends along the bottom.
         if trig {
@@ -317,6 +342,19 @@ impl Module for Scope {
             Some(Key::To) => self.link.point_x(ui, rect, x_of_ms(self.p.win_end_ms)),
             None => {}
         }
+    }
+
+    /// Above the opaque spectrogram, below the spectrum lines.
+    fn layer_depth(&self) -> Option<u8> {
+        Some(1)
+    }
+
+    /// Time runs across instead of pitch: the trace and gate stretched over
+    /// the panel, so hits line up visually with what they excite.
+    fn layer(&mut self, ui: &mut Ui, rect: Rect, shared: &Shared) {
+        let painter = ui.painter_at(rect);
+        self.paint_gate(&painter, rect);
+        self.paint_wave(&painter, rect, shared);
     }
 }
 

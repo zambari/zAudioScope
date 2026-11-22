@@ -52,6 +52,11 @@ impl DbRange {
         Self { floor, ceil: ceil.clamp(floor + MIN_GAP, BOUNDS.1) }
     }
 
+    /// Floor lifted off its minimum, so anything quieter is hidden.
+    pub fn floor_raised(&self) -> bool {
+        self.floor > BOUNDS.0
+    }
+
     /// 0 at the floor, 1 at the ceiling, clamped.
     pub fn level(&self, db: f32) -> f32 {
         ((db - self.floor) / (self.ceil - self.floor)).clamp(0.0, 1.0)

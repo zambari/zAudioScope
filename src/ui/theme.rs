@@ -28,6 +28,12 @@ pub fn lerp(a: Color32, b: Color32, u: f32) -> Color32 {
     Color32::from_rgb(c(a.r(), b.r()), c(a.g(), b.g()), c(a.b(), b.b()))
 }
 
+/// Orange bar along the left edge of the selected module, both its
+/// inspector foldout and its display panel.
+pub fn selected_edge(painter: &egui::Painter, x: f32, y: egui::Rangef) {
+    painter.vline(x, y, Stroke::new(2.0, ACCENT_BRIGHT));
+}
+
 pub fn apply(ctx: &egui::Context) {
     ctx.set_theme(egui::Theme::Dark);
     ctx.style_mut_of(egui::Theme::Dark, |style| {
@@ -73,4 +79,95 @@ pub fn apply(ctx: &egui::Context) {
         style.spacing.button_padding = egui::vec2(6.0, 2.0);
         style.spacing.item_spacing = egui::vec2(6.0, 4.0);
     });
+}
+
+/// Corner radius of a tab's top corners (the bottom is flat).
+const TAB_RADIUS: f32 = 4.0;
+
+/// A tab header (same look as sample_manager's pane tabs). Inactive tabs are
+/// a soft grey block; the active one has no fill and an orange frame on top
+/// and sides, open at the bottom so it reads as joined to the content below.
+/// A `dim` tab (e.g. a switched-off analyzer) has weak text.
+pub fn tab(label: &str, active: bool, dim: bool) -> impl egui::Widget + '_ {
+    move |ui: &mut egui::Ui| {
+        let pad = egui::vec2(10.0, 3.0);
+        let font = egui::TextStyle::Button.resolve(ui.style());
+        let color = match (active, dim) {
+            (true, _) => ACCENT_BRIGHT,
+            (false, true) => ui.visuals().weak_text_color(),
+            (false, false) => ui.visuals().text_color(),
+        };
+        let galley = ui.painter().layout_no_wrap(label.to_owned(), font, color);
+        let (rect, resp) = ui.allocate_exact_size(galley.size() + pad * 2.0, egui::Sense::click());
+        if !ui.is_rect_visible(rect) {
+            return resp;
+        }
+        let p = ui.painter();
+        let rad = TAB_RADIUS as u8;
+        let corners = CornerRadius { nw: rad, ne: rad, sw: 0, se: 0 };
+        let w = &ui.visuals().widgets;
+        if active {
+            if resp.hovered() {
+                p.rect_filled(rect, corners, w.inactive.weak_bg_fill.gamma_multiply(0.5));
+            }
+            let stroke = Stroke::new(1.0, ACCENT_BRIGHT.gamma_multiply(0.8));
+            p.add(egui::Shape::line(open_tab_outline(rect.shrink(0.5)), stroke));
+        } else {
+            let fill = if resp.hovered() { w.hovered.weak_bg_fill } else { w.inactive.weak_bg_fill };
+            p.rect_filled(rect, corners, fill);
+        }
+        p.galley(rect.min + pad, galley, color);
+        resp
+    }
+}
+
+/// A row of [`tab`]s; `current` is updated when one is clicked. A hairline
+/// runs along the bottom, broken under the active tab. Each entry is
+/// (value, label, dim).
+pub fn tab_strip<T: Copy + PartialEq>(ui: &mut egui::Ui, tabs: &[(T, &str, bool)], current: &mut T) {
+    let full = ui.available_rect_before_wrap();
+    let mut gap = None;
+    let row = ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        ui.add_space(6.0);
+        for &(value, label, dim) in tabs {
+            let resp = ui.add(tab(label, *current == value, dim));
+            if resp.clicked() {
+                *current = value;
+            }
+            if *current == value {
+                gap = Some(resp.rect.x_range());
+            }
+        }
+    });
+    let y = row.response.rect.bottom() - 0.5;
+    let stroke = Stroke::new(1.0, ACCENT_BRIGHT.gamma_multiply(0.8));
+    let p = ui.painter();
+    match gap {
+        Some(g) => {
+            p.hline(full.left()..=g.min + 0.5, y, stroke);
+            p.hline(g.max - 0.5..=full.right(), y, stroke);
+        }
+        None => {
+            p.hline(full.x_range(), y, stroke);
+        }
+    }
+}
+
+/// Left side, rounded top, right side — no bottom edge.
+fn open_tab_outline(r: egui::Rect) -> Vec<egui::Pos2> {
+    use std::f32::consts::{FRAC_PI_2, PI};
+    let rad = TAB_RADIUS.min(r.width() / 2.0).min(r.height());
+    let arc = |c: egui::Pos2, from: f32, to: f32, out: &mut Vec<egui::Pos2>| {
+        const STEPS: usize = 6;
+        for i in 0..=STEPS {
+            let a = from + (to - from) * i as f32 / STEPS as f32;
+            out.push(c + rad * egui::vec2(a.cos(), a.sin()));
+        }
+    };
+    let mut pts = vec![r.left_bottom()];
+    arc(egui::pos2(r.left() + rad, r.top() + rad), PI, PI + FRAC_PI_2, &mut pts);
+    arc(egui::pos2(r.right() - rad, r.top() + rad), -FRAC_PI_2, 0.0, &mut pts);
+    pts.push(r.right_bottom());
+    pts
 }

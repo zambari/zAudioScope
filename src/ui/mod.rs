@@ -4,6 +4,7 @@ pub mod infobox;
 pub mod layout;
 pub mod meter;
 pub mod noterange;
+pub mod outside;
 pub mod notestyle;
 pub mod plot;
 pub mod theme;

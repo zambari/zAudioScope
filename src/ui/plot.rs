@@ -710,3 +710,79 @@ mod tests {
         assert_eq!(trim(-0.0), "0");
     }
 }
+
+/// Semitone grid across the shared note range, for views layered on that
+/// axis: faint lanes, brighter at each C, with its name along the bottom.
+pub fn note_grid(painter: &Painter, rect: Rect, range: crate::ui::noterange::NoteRange) {
+    let scale = range.scale(rect);
+    for m in range.notes() {
+        let x = scale.px(m as f32);
+        let gray = match m.rem_euclid(12) {
+            0 => 58,
+            _ if crate::ui::noterange::is_black(m) => 24,
+            _ => 34,
+        };
+        painter.vline(x, rect.y_range(), Stroke::new(1.0, Color32::from_gray(gray)));
+        if gray == 58 {
+            painter.text(pos2(x + 2.0, rect.bottom() - 1.0), Align2::LEFT_BOTTOM, crate::pitch::note_name(m), font(), LABEL);
+        }
+    }
+}
+
+/// Height of one candidate-label lane above a note plot.
+pub const NOTE_LANE: f32 = 13.0;
+
+/// The data area of a labelled note-axis graph (tuner, spectrum): two label
+/// lanes on top, note names along the bottom. Graphs drawn over each other
+/// use the same rect so their lines and readouts line up.
+pub fn note_plot(rect: Rect) -> Rect {
+    Rect::from_min_max(
+        pos2(rect.left(), rect.top() + 2.0 * NOTE_LANE + 2.0),
+        pos2(rect.right(), rect.bottom() - NOTE_LANE),
+    )
+}
+
+/// Labelled semitone grid for [`note_plot`] graphs: a line per note across
+/// `plot`, names along the bottom of `rect`. Notes for which `lit` holds get
+/// an accent column, line and name; with `only_lit`, nothing else is drawn
+/// (to mark notes over a grid another graph already drew).
+pub fn note_axis(painter: &Painter, rect: Rect, range: crate::ui::noterange::NoteRange, lit: impl Fn(i32) -> bool, only_lit: bool) {
+    let plot = note_plot(rect);
+    let scale = range.scale(rect);
+    let px_per_semi = rect.width() / (range.span().1 - range.span().0);
+    let small = FontId::monospace(9.0);
+    for m in range.notes() {
+        let on = lit(m);
+        if only_lit && !on {
+            continue;
+        }
+        let x = scale.px(m as f32);
+        let n = m.rem_euclid(12) as usize;
+        let sharp = crate::ui::noterange::is_black(m);
+        if on {
+            let col = Rect::from_x_y_ranges(x - px_per_semi * 0.5..=x + px_per_semi * 0.5, plot.y_range());
+            painter.rect_filled(col, 0.0, theme::ACCENT.gamma_multiply(0.07));
+        }
+        let line = if on {
+            theme::ACCENT_BRIGHT.gamma_multiply(0.35)
+        } else if n == 0 {
+            Color32::from_gray(58)
+        } else if sharp {
+            Color32::from_gray(26)
+        } else {
+            Color32::from_gray(36)
+        };
+        painter.vline(x, plot.y_range(), Stroke::new(1.0, line));
+        if !sharp || px_per_semi > 22.0 {
+            let text = if n == 0 { crate::pitch::note_name(m) } else { crate::pitch::NOTE_NAMES[n].to_owned() };
+            let c = if on {
+                theme::ACCENT_BRIGHT.gamma_multiply(0.85)
+            } else if n == 0 {
+                Color32::from_gray(130)
+            } else {
+                Color32::from_gray(if sharp { 62 } else { 88 })
+            };
+            painter.text(pos2(x, rect.bottom() - 1.0), Align2::CENTER_BOTTOM, text, small.clone(), c);
+        }
+    }
+}
