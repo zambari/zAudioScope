@@ -410,7 +410,7 @@ impl Workspace {
             &[]
         };
         let outside = self.range_fft.then_some(&self.outside);
-        if self.glow.update(&shared.midi) {
+        if self.glow.update(&shared.midi, None) {
             ui.ctx().request_repaint();
         }
         if noterange::bar(
@@ -620,34 +620,9 @@ impl Workspace {
                 .max_rect(area.with_max_y(area.top() + HEADER).shrink2(vec2(4.0, 1.0)))
                 .layout(Layout::right_to_left(Align::Center)),
         );
-        // Stays open while the mixer is used; only the button (or Esc) closes it.
-        let popup_id = header.scope_id().with("layers_popup");
-        let open = egui::Popup::is_id_open(header.ctx(), popup_id);
-        // Trailing spaces leave room for the triangle painted at the right edge.
-        let label = egui::RichText::new("Layers    ");
-        let text_color = if open {
-            ui.visuals().text_color()
-        } else {
-            theme::ON_ACCENT
-        };
-        let button = if open {
-            egui::Button::new(label)
-        } else {
-            egui::Button::new(label.color(text_color)).fill(theme::ACCENT)
-        };
-        let button = header
-            .add(button.small())
-            .on_hover_text("Layer visibility and opacity");
-        icons::disclosure(
-            header.painter(),
-            pos2(button.rect.right() - 9.0, button.rect.center().y),
-            open,
-            text_color,
-        );
-        egui::Popup::menu(&button)
-            .id(popup_id)
-            .close_behavior(egui::PopupCloseBehavior::IgnoreClicks)
-            .show(|ui| self.mixer(ui, slots));
+        widgets::popup_button(&mut header, "Layers", "Layer visibility and opacity", |ui| {
+            self.mixer(ui, slots)
+        });
     }
 
     /// One row per layer, topmost first: on/off and opacity. Own-pane
@@ -821,7 +796,7 @@ impl Workspace {
             );
             // Tiny windows still fit; don't pass inverted plot bounds to modules.
             if slot.visible && graph.height() >= 44.0 && graph.width() >= 24.0 {
-                if let Some(label) = shared.idle_label() {
+                if let Some(label) = shared.idle_label().filter(|_| slot.module.uses_audio()) {
                     widgets::placeholder(&pane, graph, label);
                 } else {
                     slot.module.graph(&mut pane, graph, shared);

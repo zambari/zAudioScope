@@ -23,6 +23,7 @@
 pub mod impulse;
 pub mod midi;
 mod note_input;
+pub mod note_clock;
 pub mod note_spectrum;
 mod perf;
 pub mod scope;
@@ -357,6 +358,11 @@ pub trait Module {
     fn always_live(&self) -> bool {
         false
     }
+    /// Whether the display shows audio. Those that don't (MIDI) keep drawing
+    /// while the input is paused or silent instead of showing the idle label.
+    fn uses_audio(&self) -> bool {
+        true
+    }
     /// Live pitches (fractional MIDI) to light on the shared range bar.
     fn marks(&self, _out: &mut Vec<f32>) {}
     /// Whether this module has controls in the row below the audio toolbar
@@ -430,5 +436,6 @@ pub fn all() -> Vec<Slot> {
         slot(Box::<waterfall::Waterfall>::default()),
         slot(Box::<impulse::Impulse>::default()),
         slot(Box::<midi::MidiMonitor>::default()),
+        slot(Box::<note_clock::NoteClock>::default()),
     ]
 }

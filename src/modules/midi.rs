@@ -241,6 +241,10 @@ impl Module for MidiMonitor {
         0
     }
 
+    fn uses_audio(&self) -> bool {
+        false
+    }
+
     fn always_live(&self) -> bool {
         // Note on/off arrive once; skipping them would leave notes stuck held.
         true

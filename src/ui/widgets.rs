@@ -26,6 +26,65 @@ pub fn placeholder(ui: &Ui, rect: egui::Rect, label: &str) {
     );
 }
 
+/// Small accent button with a disclosure triangle that opens `body` in a
+/// popup under it. The popup stays open while it is used; only the button
+/// (or Esc) closes it. Returns `body`'s result while open.
+pub fn popup_button<R>(
+    ui: &mut Ui,
+    label: &str,
+    hover: &str,
+    body: impl FnOnce(&mut Ui) -> R,
+) -> Option<R> {
+    use super::theme;
+    let popup_id = ui.scope_id().with(("popup_button", label));
+    let open = egui::Popup::is_id_open(ui.ctx(), popup_id);
+    // Trailing spaces leave room for the triangle painted at the right edge.
+    let text = egui::RichText::new(format!("{label}    "));
+    let text_color = if open {
+        ui.visuals().text_color()
+    } else {
+        theme::ON_ACCENT
+    };
+    let button = if open {
+        egui::Button::new(text)
+    } else {
+        egui::Button::new(text.color(text_color)).fill(theme::ACCENT)
+    };
+    let button = ui.add(button.small()).on_hover_text(hover);
+    super::icons::disclosure(
+        ui.painter(),
+        pos2(button.rect.right() - 9.0, button.rect.center().y),
+        open,
+        text_color,
+    );
+    egui::Popup::menu(&button)
+        .id(popup_id)
+        .close_behavior(egui::PopupCloseBehavior::IgnoreClicks)
+        .show(body)
+        .map(|r| r.inner)
+}
+
+/// Labelled dropdown over a fixed set of choices; `name` gives each one's text.
+pub fn choice<T: Copy + PartialEq>(
+    ui: &mut Ui,
+    label: &str,
+    value: &mut T,
+    all: &[T],
+    name: impl Fn(T) -> String,
+) {
+    ui.horizontal(|ui| {
+        egui::ComboBox::from_id_salt(label)
+            .selected_text(name(*value))
+            .height(POPUP_HEIGHT)
+            .show_ui(ui, |ui| {
+                for &v in all {
+                    ui.selectable_value(value, v, name(v));
+                }
+            });
+        ui.label(label);
+    });
+}
+
 /// Max height of the device and channel popups (twice egui's default of 200).
 pub const POPUP_HEIGHT: f32 = 400.0;
 

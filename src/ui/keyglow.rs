@@ -5,7 +5,8 @@
 //! set by its heat, which cools over tens of seconds. Keys played often stay
 //! warm: after a phrase the most-used notes keep glowing for a while.
 //!
-//! Listens to every channel of the app's MIDI input, raw note numbers.
+//! Listens to the app's MIDI input (every channel, or one), raw note numbers.
+//! [`Timing`] stretches the release and the heat's cooling.
 
 use crate::midi::MidiFrame;
 
@@ -38,10 +39,29 @@ struct Key {
     level: f32,
 }
 
+/// Adjustable fade times.
+#[derive(Clone, Copy)]
+pub struct Timing {
+    /// Multiplies the release time constant.
+    pub release: f32,
+    /// Heat cooling time constant, s.
+    pub heat_tau_s: f32,
+}
+
+impl Default for Timing {
+    fn default() -> Self {
+        Self {
+            release: 1.0,
+            heat_tau_s: HEAT_TAU_S,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct KeyGlow {
     keys: [Key; 128],
     last_t: Option<f64>,
+    pub timing: Timing,
 }
 
 impl Default for KeyGlow {
@@ -49,24 +69,31 @@ impl Default for KeyGlow {
         Self {
             keys: [Key::default(); 128],
             last_t: None,
+            timing: Timing::default(),
         }
     }
 }
 
 impl KeyGlow {
-    fn release(k: &mut Key, t: f64) {
+    fn release(k: &mut Key, t: f64, scale: f32) {
         if k.held {
             k.held = false;
             let held = (t - k.on_t).max(0.0) as f32;
-            k.release_s = (RELEASE_MIN_S + RELEASE_PER_HELD * held).min(RELEASE_MAX_S);
+            k.release_s = (RELEASE_MIN_S + RELEASE_PER_HELD * held).min(RELEASE_MAX_S) * scale;
         }
     }
 
-    /// Once per frame: take this frame's MIDI, then advance the fades.
-    /// Returns true while anything is still lit (worth a repaint).
-    pub fn update(&mut self, midi: &MidiFrame) -> bool {
+    /// Once per frame: take this frame's MIDI (only `channel` 0..16 when
+    /// set), then advance the fades. Returns true while anything is still
+    /// lit (worth a repaint).
+    pub fn update(&mut self, midi: &MidiFrame, channel: Option<u8>) -> bool {
+        let Timing { release, heat_tau_s } = self.timing;
+        let release = release.max(0.05);
         for e in midi.events.iter() {
             let [status, note, vel] = e.b;
+            if channel.is_some_and(|c| c != status & 0x0F) {
+                continue;
+            }
             match (status & 0xF0, vel) {
                 (0x90, v) if v > 0 => {
                     let k = &mut self.keys[(note & 0x7F) as usize];
@@ -74,24 +101,24 @@ impl KeyGlow {
                     k.on_t = e.t;
                     k.heat = (k.heat + HEAT_PER_HIT).min(1.0);
                 }
-                (0x80, _) | (0x90, _) => Self::release(&mut self.keys[(note & 0x7F) as usize], e.t),
+                (0x80, _) | (0x90, _) => Self::release(&mut self.keys[(note & 0x7F) as usize], e.t, release),
                 // All sound off / all notes off.
                 (0xB0, _) if note == 120 || note == 123 => {
-                    self.keys.iter_mut().for_each(|k| Self::release(k, e.t))
+                    self.keys.iter_mut().for_each(|k| Self::release(k, e.t, release))
                 }
                 _ => {}
             }
         }
         let now = crate::midi::now();
         if midi.dropped {
-            self.keys.iter_mut().for_each(|k| Self::release(k, now));
+            self.keys.iter_mut().for_each(|k| Self::release(k, now, release));
         }
         // Cap the step so a stalled frame doesn't jump.
         let dt = self
             .last_t
             .map_or(0.0, |t| (now - t).clamp(0.0, 0.25) as f32);
         self.last_t = Some(now);
-        let cool = (-dt / HEAT_TAU_S).exp();
+        let cool = (-dt / heat_tau_s.max(0.1)).exp();
         let mut lit = false;
         for k in &mut self.keys {
             k.heat *= cool;
@@ -103,7 +130,7 @@ impl KeyGlow {
             let tau = if k.held || target > k.level {
                 ATTACK_S
             } else {
-                k.release_s.max(RELEASE_MIN_S)
+                k.release_s.max(RELEASE_MIN_S * release)
             };
             k.level += (target - k.level) * (1.0 - (-dt / tau).exp());
             if k.level < DARK && !k.held {

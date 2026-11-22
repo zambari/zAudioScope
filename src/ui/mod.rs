@@ -9,6 +9,7 @@ pub mod monitor_bar;
 pub mod noterange;
 pub mod notestyle;
 pub mod outside;
+pub mod polar;
 pub mod plot;
 pub mod profiler;
 pub mod theme;
