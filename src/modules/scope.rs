@@ -9,7 +9,7 @@ use egui::{Align2, Color32, Pos2, Rect, Sense, Stroke, Ui};
 
 use super::{Gate, Module, Shared};
 use crate::audio::loudness;
-use crate::ui::dynamic_range::DynamicRange;
+use crate::ui::dynamic_range::{CeilCrawl, DynamicRange};
 use crate::ui::handle::EdgeHandle;
 use crate::ui::plot::{self, Axis, Edge, Link, Scale};
 use crate::ui::theme;
@@ -116,6 +116,8 @@ impl Fold {
 #[derive(Default)]
 pub struct Scope {
     p: Params,
+    /// Ceiling follower, active until the dB slider is first moved by hand.
+    crawl: CeilCrawl,
     /// Absolute sample index of the trigger being shown.
     trigger: Option<u64>,
     drag_from_ms: Option<f32>,
@@ -215,6 +217,13 @@ impl Module for Scope {
 
     fn update(&mut self, shared: &mut Shared) {
         self.p.db.sync(&shared.db);
+        // Advance the follower even while locked so it never replays old audio,
+        // but only write the ceiling back when this view owns its range.
+        let mut range = self.p.db.range;
+        self.crawl.update(&shared.frame, shared.reset, &mut range);
+        if !self.p.db.locked {
+            self.p.db.range = range;
+        }
         match self.p.mode {
             Mode::Free => shared.gate = Gate { window: None },
             Mode::Trigger => {
@@ -230,7 +239,9 @@ impl Module for Scope {
     }
 
     fn params(&mut self, ui: &mut Ui, shared: &Shared) {
-        self.p.db.ui(ui, shared);
+        if self.p.db.ui(ui, shared).changed() {
+            self.crawl.manual = true;
+        }
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.p.mode, Mode::Trigger, "Trigger");
             ui.selectable_value(&mut self.p.mode, Mode::Free, "Free");

@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use super::theme::{VU_CLIP, WAVE};
 use super::widgets::RangeSlider;
+use crate::audio::Frame;
 use crate::audio::levels::LevelDist;
 use crate::modules::Shared;
 
@@ -133,6 +134,61 @@ impl DynamicRange {
     }
 }
 
+/// Peak-hold decay, dB per second.
+const HOLD_DECAY_DB_S: f32 = 6.0;
+/// Headroom kept above the recent peak, dB.
+const HEADROOM_DB: f32 = 1.0;
+/// Time constant of the downward crawl, seconds.
+const CRAWL_TAU_S: f32 = 1.5;
+
+/// Session-only ceiling follower for the scope. Until the user first moves
+/// the slider by hand, the ceiling crawls down towards the recent peak and
+/// snaps straight up to a new one. Never persisted; a manual move ends it
+/// for the rest of the session.
+#[derive(Clone, Copy)]
+pub struct CeilCrawl {
+    /// Peak-hold of recent input, dB; decays at [`HOLD_DECAY_DB_S`].
+    hold: f32,
+    /// Absolute sample index already consumed.
+    pos: u64,
+    /// The user has moved the slider: the follower is done.
+    pub manual: bool,
+}
+
+impl Default for CeilCrawl {
+    fn default() -> Self {
+        Self { hold: BOUNDS.0, pos: 0, manual: false }
+    }
+}
+
+impl CeilCrawl {
+    /// Consume the audio in `frame` not seen yet and move `range.ceil`.
+    /// `reset` (stream restarted) forgets the history.
+    pub fn update(&mut self, frame: &Frame, reset: bool, range: &mut DbRange) {
+        if self.manual {
+            return;
+        }
+        if reset || self.pos > frame.end() {
+            *self = Self { hold: BOUNDS.0, ..Self::default() };
+        }
+        let from = self.pos.max(frame.start);
+        let new = &frame.samples[(from - frame.start) as usize..];
+        self.pos = frame.end();
+        let dt = new.len() as f32 / frame.rate.max(1) as f32;
+        let peak = new.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        let peak_db = 20.0 * peak.max(1e-6).log10();
+
+        self.hold = (self.hold - HOLD_DECAY_DB_S * dt).max(peak_db).max(BOUNDS.0);
+        let target = (self.hold + HEADROOM_DB).min(BOUNDS.1);
+        range.ceil = if target >= range.ceil {
+            target
+        } else {
+            range.ceil + (target - range.ceil) * (1.0 - (-dt / CRAWL_TAU_S).exp())
+        };
+        *range = range.sanitized();
+    }
+}
+
 /// Height of the floor / ceiling coverage meter, px.
 const ROW_H: f32 = 3.0;
 
@@ -156,4 +212,41 @@ fn coverage_row(ui: &mut Ui, under: Rect, range: DbRange, levels: &LevelDist) {
         low * 100.0,
         high * 100.0
     ));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(samples: Vec<f32>, start: u64) -> Frame {
+        Frame { samples, rate: 1000, start }
+    }
+
+    #[test]
+    fn crawls_down_then_snaps_up_then_stops_after_manual() {
+        let mut crawl = CeilCrawl::default();
+        let mut range = DbRange::default();
+        let mut pos = 0u64;
+        // A steady 0.5 (about -6 dB) signal for 5 s, in 100 ms blocks.
+        for _ in 0..50 {
+            let s = vec![0.5f32; 100];
+            crawl.update(&frame(s, pos), false, &mut range);
+            pos += 100;
+        }
+        assert!(range.ceil < BOUNDS.1 - 1.0, "ceiling should crawl down, got {}", range.ceil);
+        assert!((range.ceil - (-5.0)).abs() < 1.0, "ceiling should settle near peak + headroom, got {}", range.ceil);
+
+        // A louder peak snaps the ceiling straight up.
+        let mut loud = vec![0.0f32; 100];
+        loud[10] = 1.0;
+        crawl.update(&frame(loud, pos), false, &mut range);
+        pos += 100;
+        assert!((range.ceil - 1.0).abs() < 1e-3, "new peak should snap, got {}", range.ceil);
+
+        // Once moved by hand, nothing touches the ceiling again.
+        crawl.manual = true;
+        let before = range;
+        crawl.update(&frame(vec![0.0; 100], pos), false, &mut range);
+        assert_eq!(before, range);
+    }
 }

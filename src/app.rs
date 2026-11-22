@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::audio::mic_permission::{self, MicAuth};
 use crate::midi::MidiHub;
-use crate::audio::{ChannelSel, DeviceInfo, HISTORY_CHOICES, Input, InputSettings};
+use crate::audio::{ChannelSel, DeviceInfo, HISTORY_CHOICES, Input, InputSettings, Monitor, MonitorSettings};
 use crate::modules::{self, FftPlans, Shared, Slot};
 use crate::relaunch::BuildWatch;
 use crate::ui::dynamic_range::DbRange;
@@ -34,6 +34,8 @@ struct Saved {
     debug: bool,
     /// MIDI input port, reopened whenever it is present.
     midi_port: Option<String>,
+    /// Monitor output: on/off, device, level, feedback guard.
+    monitor: MonitorSettings,
 }
 
 impl Default for Saved {
@@ -48,12 +50,16 @@ impl Default for Saved {
             layout: Default::default(),
             debug: false,
             midi_port: None,
+            monitor: MonitorSettings::default(),
         }
     }
 }
 
 pub struct App {
     input: Input,
+    /// Plays the input out of an output device.
+    monitor: Monitor,
+    out_devices: Vec<DeviceInfo>,
     /// Always open, whichever MIDI analysers are shown.
     midi: MidiHub,
     devices: Vec<DeviceInfo>,
@@ -64,6 +70,7 @@ pub struct App {
     layout: ui::layout::Workspace,
     profiler: ui::profiler::Profiler,
     meter: ui::meter::Meter,
+    out_meter: ui::meter::Meter,
     /// Levels of every channel, shown in the channel picker.
     ch_meters: ui::meter::ChannelMeters,
     build_watch: BuildWatch,
@@ -103,11 +110,14 @@ impl App {
                 slot.module.load_params(s, &key);
             }
         }
+        let input = Input::open(&InputSettings {
+            device_id: saved.device_id.clone(),
+            ..saved.input.clone()
+        });
         Self {
-            input: Input::open(&InputSettings {
-                device_id: saved.device_id.clone(),
-                ..saved.input.clone()
-            }),
+            monitor: Monitor::new(&saved.monitor, input.monitor_tap()),
+            out_devices: Monitor::devices(),
+            input,
             devices: Input::devices(),
             midi: MidiHub::new(saved.midi_port.clone().or_else(|| legacy_midi_port(storage?))),
             slots,
@@ -117,6 +127,7 @@ impl App {
             layout: saved.layout,
             profiler: ui::profiler::Profiler::new(saved.debug),
             meter: Default::default(),
+            out_meter: Default::default(),
             ch_meters: Default::default(),
             build_watch: BuildWatch::new(),
             relaunch: false,
@@ -213,20 +224,17 @@ impl App {
                 .on_hover_text("Show UI-thread load and per-module timings");
             ui.separator();
             ui.label("Input");
-            let mut picked = None;
-            egui::ComboBox::from_id_salt("input_device")
-                .width(240.0)
-                .selected_text(&self.input.device_name)
-                .show_ui(ui, |ui| {
-                    for d in &self.devices {
-                        let on = self.input.device_id.as_deref() == Some(d.id.as_str());
-                        if ui.selectable_label(on, &d.name).clicked() {
-                            picked = Some(d.id.clone());
-                        }
-                    }
-                });
-            if ui.button("⟳").on_hover_text("Rescan devices").clicked() {
+            let (_, picked) = ui::widgets::device_picker(
+                ui,
+                "input_device",
+                240.0,
+                &self.input.device_name,
+                self.input.device_id.as_deref(),
+                &self.devices,
+            );
+            if ui.button("⟳").on_hover_text("Rescan input and output devices").clicked() {
                 self.devices = Input::devices();
+                self.out_devices = Monitor::devices();
             }
             if let Some(id) = picked {
                 self.input.select_device(&id);
@@ -234,6 +242,9 @@ impl App {
             self.input_controls(ui);
             ui.separator();
             self.meter.show(ui, &self.input, &mut self.gain);
+            ui.separator();
+            ui::monitor_bar::show(ui, &mut self.monitor, &mut self.out_meter, &self.out_devices, &self.input.device_name);
+            self.meter.phase_strip(ui, &self.input);
         });
         ui.separator();
         ui.horizontal_wrapped(|ui| {
@@ -544,6 +555,7 @@ impl eframe::App for App {
                 layout: self.layout.clone(),
                 debug: self.profiler.enabled,
                 midi_port: self.midi.port().cloned(),
+                monitor: self.monitor.settings(),
             }
         };
         eframe::set_value(storage, STATE_KEY, &saved);

@@ -4,6 +4,7 @@ pub mod infobox;
 pub mod keyglow;
 pub mod layout;
 pub mod meter;
+pub mod monitor_bar;
 pub mod noterange;
 pub mod outside;
 pub mod notestyle;

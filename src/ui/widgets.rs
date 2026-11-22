@@ -14,6 +14,26 @@ use egui::{
     vec2,
 };
 
+/// Audio device dropdown. Returns the id picked this frame.
+pub fn device_picker(
+    ui: &mut Ui,
+    salt: &str,
+    width: f32,
+    selected: &str,
+    current: Option<&str>,
+    devices: &[crate::audio::DeviceInfo],
+) -> (Response, Option<String>) {
+    let mut picked = None;
+    let r = egui::ComboBox::from_id_salt(salt).width(width).selected_text(selected).show_ui(ui, |ui| {
+        for d in devices {
+            if ui.selectable_label(current == Some(d.id.as_str()), &d.name).clicked() {
+                picked = Some(d.id.clone());
+            }
+        }
+    });
+    (r.response, picked)
+}
+
 /// Module foldout with an independent, right-aligned display switch.
 pub fn module_header(ui: &mut Ui, title: &str, open: &mut bool, enabled: &mut bool) -> (egui::Pos2, f32) {
     // Wide parameter rows (sliders, note toggles) can grow the scroll content

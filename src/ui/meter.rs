@@ -31,32 +31,32 @@ impl Meter {
         self.hold[0].max(self.hold[1])
     }
 
-    /// Gain slider, meter, then the phase strip out to the bar's right edge.
+    /// Gain slider and meter.
     pub fn show(&mut self, ui: &mut Ui, input: &Input, gain: &mut f32) {
-        gain_slider(ui, gain);
+        gain_slider(ui, gain, |db| {
+            format!("Input gain {db} (ahead of every analyser and the trigger). Tick marks 0 dB; double-click to reset to it")
+        });
         input.set_gain(*gain);
+        self.levels(ui, input.take_peaks(), "Input level after gain");
+    }
 
-        // Filled in once the meter is placed and the strip's width is known,
-        // but painted beneath the meter.
-        let strip_left = ui.cursor().left();
-        let strip_bg = ui.painter().add(Shape::Noop);
-
-        self.meter(ui, input);
-
-        // From the meter to the bar's right edge, full bar height.
+    /// The phase strip from the cursor to the bar's right edge, full bar
+    /// height, while a stereo input is open.
+    pub fn phase_strip(&self, ui: &mut Ui, input: &Input) {
         let ys = ui.clip_rect().intersect(ui.max_rect().expand2(vec2(0.0, 8.0))).y_range();
-        let strip = Rect::from_x_y_ranges(strip_left..=ui.max_rect().right(), ys);
+        let strip = Rect::from_x_y_ranges(ui.cursor().left()..=ui.max_rect().right(), ys);
         if strip.width() > 4.0 && input.is_stereo() {
             let mut shapes = Vec::new();
             phase_strip(&input.scope(1024), strip, &mut shapes);
-            ui.painter().set(strip_bg, Shape::Vec(shapes));
+            ui.painter().add(Shape::Vec(shapes));
         }
     }
 
-    fn meter(&mut self, ui: &mut Ui, input: &Input) {
+    /// The L/R peak meter fed with `peaks` since last frame; `what` heads
+    /// its tooltip.
+    pub fn levels(&mut self, ui: &mut Ui, peaks: [f32; 2], what: &str) {
         // Fast attack, ~24 dB/s fall; the hold mark falls slower.
         let dt = ui.input(|i| i.stable_dt).min(0.1);
-        let peaks = input.take_peaks();
         let fall = 10f32.powf(-24.0 * dt / 20.0);
         let hold_fall = 10f32.powf(-8.0 * dt / 20.0);
         for k in 0..2 {
@@ -101,14 +101,15 @@ impl Meter {
             }
         }
         resp.on_hover_text(format!(
-            "Input level after gain, top L, bottom R (-48..0 dBFS)\nPeak {}",
+            "{what}, top L, bottom R (-48..0 dBFS)\nPeak {}",
             if hold_db < -90.0 { "-inf dB".to_owned() } else { format!("{hold_db:.1} dB") }
         ));
     }
 }
 
-/// Input gain, 0..+12 dB. Tick marks at unity; double-click resets to it.
-fn gain_slider(ui: &mut Ui, gain: &mut f32) {
+/// Gain 0..+12 dB. Tick marks at unity; double-click resets to it.
+/// `hover` gets the gain as text ("+3.0 dB", "off").
+pub fn gain_slider(ui: &mut Ui, gain: &mut f32, hover: impl FnOnce(&str) -> String) -> egui::Response {
     ui.spacing_mut().slider_width = 80.0;
     let r = ui.add(egui::Slider::new(gain, 0.0..=GAIN_MAX).show_value(false).trailing_fill(true));
     // Tick marks at unity gain, above and below the rail. Mirrors egui's
@@ -123,13 +124,12 @@ fn gain_slider(ui: &mut Ui, gain: &mut f32) {
         p.line_segment([pos2(x, rect.bottom() - 3.0), pos2(x, rect.bottom())], stroke);
     }
     let db = to_db(*gain);
-    let r = r.on_hover_text(format!(
-        "Input gain {} (ahead of every analyser and the trigger). Tick marks 0 dB; double-click to reset to it",
-        if db.is_finite() { format!("{db:+.1} dB") } else { "off".to_owned() }
-    ));
+    let mut r = r.on_hover_text(hover(&if db.is_finite() { format!("{db:+.1} dB") } else { "off".to_owned() }));
     if r.double_clicked() {
         *gain = 1.0;
+        r.mark_changed();
     }
+    r
 }
 
 /// Goniometer (mid up, side across) scaled so side spans the strip's

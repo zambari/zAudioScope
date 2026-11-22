@@ -75,6 +75,8 @@ struct Shared {
     trip: AtomicU32,
     /// Set by the UI; the callback clears it, resets the guard and fades in.
     rearm: AtomicBool,
+    /// Output L/R peak since the UI last looked, `f32` bits.
+    peaks: [AtomicU32; 2],
     error: Mutex<Option<String>>,
 }
 
@@ -98,6 +100,7 @@ impl Monitor {
                 sensitive: AtomicBool::new(false),
                 trip: AtomicU32::new(0),
                 rearm: AtomicBool::new(false),
+                peaks: [AtomicU32::new(0), AtomicU32::new(0)],
                 error: Mutex::new(None),
             }),
             tap,
@@ -131,9 +134,9 @@ impl Monitor {
     /// Open or close the output; the input only feeds the tap while on.
     pub fn set_enabled(&mut self, on: bool) {
         self.enabled = on;
-        self.tap.on.store(on, Ordering::Relaxed);
         self.stream = None;
         self.open_error = if on { self.open().err() } else { None };
+        self.tap.on.store(self.stream.is_some(), Ordering::Relaxed);
         if let Ok(mut e) = self.sh.error.lock() {
             *e = None;
         }
@@ -177,6 +180,11 @@ impl Monitor {
     /// Unmute after a trip, fading back in.
     pub fn rearm(&self) {
         self.sh.rearm.store(true, Ordering::Relaxed);
+    }
+
+    /// Output (L, R) peak since the last call, as sent to the device.
+    pub fn take_peaks(&self) -> [f32; 2] {
+        self.sh.peaks.each_ref().map(|p| f32::from_bits(p.swap(0, Ordering::Relaxed)))
     }
 
     pub fn error(&self) -> Option<String> {
@@ -327,6 +335,7 @@ impl Player {
         let mut tripped = guard_on && sh.trip.load(Ordering::Relaxed) != 0;
         let fade_step = 1.0 / (FADE_IN_S * self.out_rate);
         let mute_step = 1.0 / (MUTE_S * self.out_rate);
+        let mut pk = [0f32; 2];
         for frame in data.chunks_exact_mut(ch) {
             let i = pos.floor();
             let t = (pos - i) as f32;
@@ -344,6 +353,7 @@ impl Player {
             self.fade = (self.fade + fade_step).min(1.0);
             let g = gain * self.mute * self.fade * self.fade;
             let (l, r) = (soft_clip(l * g), soft_clip(r * g));
+            pk = [pk[0].max(l.abs()), pk[1].max(r.abs())];
             match frame {
                 [m] => *m = T::from_sample((l + r) * 0.5),
                 [a, b, rest @ ..] => {
@@ -355,6 +365,9 @@ impl Player {
             }
         }
         self.pos = Some(pos);
+        for (dst, p) in sh.peaks.iter().zip(pk) {
+            dst.fetch_max(p.to_bits(), Ordering::Relaxed);
+        }
     }
 }
 
@@ -367,27 +380,35 @@ fn soft_clip(x: f32) -> f32 {
 }
 
 const GUARD_BLOCK_S: f32 = 0.01;
+/// Blocks per segment of the growth window (80 ms).
+const SEG: usize = 8;
+/// Segments in the growth window (240 ms).
+const SEGS: usize = 3;
 
-/// Acoustic feedback shows up as the input climbing on its own: block after
-/// block a little louder, close to a pure tone, until it clips. Played
-/// material rises fast and then decays (a kick, a plucked bass); a howl
-/// keeps building. The guard watches the monitored signal in 10 ms blocks
-/// and trips on either a long, steady, tonal rise or a tone held at
-/// clipping, but only while the output is loud enough to drive a room.
+/// Acoustic feedback shows up as the input climbing on its own: close to a
+/// pure tone, growing exponentially (a straight line in dB) until it clips.
+/// Played material jumps up at the onset and then holds or decays (a kick,
+/// a plucked bass, a tuning note). So, in 10 ms blocks of the monitored
+/// signal, the guard looks for the level rising by about the same amount in
+/// each of three 80 ms stretches in a row, kept up for a sizeable total rise,
+/// and also trips on a tone held at clipping. All only while the output is
+/// loud enough to drive a room.
 struct Guard {
     block: usize,
     n: usize,
     sum: f32,
     peak: f32,
-    /// Smoothed block level, dBFS.
-    level: f32,
-    /// Level where the current rising run started.
-    floor: f32,
-    /// Blocks in the current rising run.
-    run: u32,
+    /// Smoothed block levels (dBFS), newest at `at`.
+    hist: [f32; SEGS * SEG + 1],
+    at: usize,
+    /// Blocks in a row loud enough to judge; the growth window only counts
+    /// once it is all audible.
+    live: usize,
+    /// Level where the current steady climb started, if one is on.
+    climb_from: Option<f32>,
     /// Smoothed peak / RMS: 1.41 for a sine, 3+ for most programme.
     crest: f32,
-    /// Consecutive tonal blocks at clipping.
+    /// Consecutive loud tonal blocks.
     hot: u32,
 }
 
@@ -398,12 +419,18 @@ impl Guard {
             n: 0,
             sum: 0.0,
             peak: 0.0,
-            level: -120.0,
-            floor: -120.0,
-            run: 0,
+            hist: [-120.0; SEGS * SEG + 1],
+            at: 0,
+            live: 0,
+            climb_from: None,
             crest: 4.0,
             hot: 0,
         }
+    }
+
+    /// Smoothed level `k` blocks ago.
+    fn ago(&self, k: usize) -> f32 {
+        self.hist[(self.at + self.hist.len() - k) % self.hist.len()]
     }
 
     /// One monitored frame (before monitor gain). `Some` once it trips.
@@ -421,28 +448,40 @@ impl Guard {
 
         let crest = if rms > 1e-6 { peak / rms } else { 10.0 };
         self.crest = self.crest * 0.7 + crest * 0.3;
-        let prev = self.level;
-        self.level = prev * 0.6 + to_db(rms.max(1e-6)) * 0.4;
+        let level = self.ago(0) * 0.6 + to_db(rms.max(1e-6)) * 0.4;
+        self.at = (self.at + 1) % self.hist.len();
+        self.hist[self.at] = level;
 
         // Too quiet, at the output, to be driving the room.
-        if self.level + to_db(gain.max(1e-6)) < -45.0 || self.level < -70.0 {
-            (self.run, self.floor, self.hot) = (0, self.level, 0);
+        if level + to_db(gain.max(1e-6)) < -45.0 || level < -70.0 {
+            (self.climb_from, self.hot, self.live) = (None, 0, 0);
             return None;
         }
-        if self.level >= prev - 0.5 {
-            self.run += 1;
-            self.floor = self.floor.min(self.level);
+        self.live += 1;
+        let (max_crest, min_seg, rise_db) = if sensitive { (3.0, 1.0, 8.0) } else { (2.2, 1.5, 12.0) };
+        let tonal = self.crest < max_crest;
+        const SPAN: usize = SEGS * SEG;
+        let rises: [f32; SEGS] = std::array::from_fn(|k| self.ago(k * SEG) - self.ago((k + 1) * SEG));
+        let (lo, hi) = rises.iter().fold((f32::MAX, f32::MIN), |(lo, hi), &r| (lo.min(r), hi.max(r)));
+        let steady = (0..SPAN).all(|k| self.ago(k) >= self.ago(k + 1) - 0.5);
+        // Every stretch rising by about as much: a straight line in dB, not
+        // an attack settling.
+        let even = lo >= hi * 0.6;
+        let judged = self.live > SPAN;
+        if judged && tonal && steady && even && lo >= min_seg {
+            let from = *self.climb_from.get_or_insert(self.ago(SPAN));
+            if level - from >= rise_db {
+                return Some(Trip::Runaway);
+            }
         } else {
-            (self.run, self.floor) = (0, self.level);
+            self.climb_from = None;
         }
-        let (max_crest, rise_db) = if sensitive { (3.0, 9.0) } else { (2.2, 15.0) };
-        // 80 ms of steady climb, as a tone.
-        if self.crest < max_crest && self.run >= 8 && self.level - self.floor >= rise_db {
-            return Some(Trip::Runaway);
-        }
-        self.hot = if peak > 0.95 && self.crest < 2.0 { self.hot + 1 } else { 0 };
-        // 300 ms of tone at clipping.
-        (self.hot >= 30).then_some(Trip::Howl)
+        // A tone held at clipping for 300 ms; next to its own speakers, a
+        // loud tone held for a second.
+        let held = if sensitive { peak > 0.3 && self.crest < 1.8 } else { false };
+        self.hot = if (peak > 0.95 && self.crest < 2.0) || held { self.hot + 1 } else { 0 };
+        let limit = if peak > 0.95 { 30 } else { 100 };
+        (self.hot >= limit).then_some(Trip::Howl)
     }
 }
 
@@ -477,9 +516,16 @@ mod tests {
             0.9 * (-u * 12.0).exp() * (u * 50.0 * std::f32::consts::TAU).sin()
         };
         assert_eq!(run(&mut g, 4.0, false, kick), None);
-        // A steady, moderate tuning note.
+        // A steady tuning note, starting from silence.
         let mut g = Guard::new(48_000.0);
-        assert_eq!(run(&mut g, 4.0, true, |t| 0.3 * (t * 110.0 * std::f32::consts::TAU).sin()), None);
+        assert_eq!(run(&mut g, 4.0, false, |t| 0.5 * (t * 110.0 * std::f32::consts::TAU).sin()), None);
+        // A quieter one even next to the speakers.
+        let mut g = Guard::new(48_000.0);
+        assert_eq!(run(&mut g, 4.0, true, |t| 0.2 * (t * 110.0 * std::f32::consts::TAU).sin()), None);
+        // A sine pad with a slow 400 ms linear attack, every second.
+        let mut g = Guard::new(48_000.0);
+        let pad = |t: f32| 0.8 * ((t % 1.0) / 0.4).min(1.0) * (t * 220.0 * std::f32::consts::TAU).sin();
+        assert_eq!(run(&mut g, 4.0, false, pad), None);
     }
 
     #[test]
