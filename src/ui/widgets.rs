@@ -16,7 +16,14 @@ use egui::{
 
 /// Module foldout with an independent, right-aligned display switch.
 pub fn module_header(ui: &mut Ui, title: &str, open: &mut bool, enabled: &mut bool) -> (egui::Pos2, f32) {
-    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 22.0), Sense::hover());
+    // Wide parameter rows (sliders, note toggles) can grow the scroll content
+    // past the visible inspector; pin the header to the viewport's right edge
+    // so the switch stays reachable however narrow the inspector gets.
+    let width = ui
+        .available_width()
+        .min(ui.clip_rect().right() - ui.cursor().left())
+        .max(0.0);
+    let (rect, _) = ui.allocate_exact_size(vec2(width, 22.0), Sense::hover());
     let switch = egui::Rect::from_min_max(
         pos2((rect.right() - FLICK_HIT.x).max(rect.left()), rect.top()),
         rect.max,
@@ -32,8 +39,9 @@ pub fn module_header(ui: &mut Ui, title: &str, open: &mut bool, enabled: &mut bo
         ui.painter().layout_no_wrap(text, font.clone(), ui.visuals().text_color()).size().x
     };
     let name_left = label.left() + 2.0 + measure("⏷  ".to_owned());
+    // The arrow plus the title: both fold the section.
     let name = egui::Rect::from_min_max(
-        pos2(name_left, label.top()),
+        pos2(label.left(), label.top()),
         pos2(name_left + measure(title.to_owned()), label.bottom()),
     ).intersect(label);
     // Expanded sections only fold from the name; the remaining header still

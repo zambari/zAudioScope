@@ -41,7 +41,7 @@ pub struct NoteStyle {
 
 impl Default for NoteStyle {
     fn default() -> Self {
-        Self { width: 0.85, attack_s: 0.0, release_s: 0.15, velocity: 0.6, overtones: [0.0; 3], edges: 0.5 }
+        Self { width: 0.55, attack_s: 0.0, release_s: 0.15, velocity: 0.6, overtones: [0.0; 3], edges: 0.5 }
     }
 }
 

@@ -72,6 +72,7 @@ pub struct App {
     mic_owner: Option<String>,
     /// End of the audio the modules saw last frame, to spot stream restarts.
     last_end: u64,
+    levels: crate::audio::levels::LevelHistogram,
     /// FFT plans reused across frames; results are cached per frame only.
     fft_plans: FftPlans,
 }
@@ -123,6 +124,7 @@ impl App {
             mic_checked: std::time::Instant::now(),
             mic_owner: mic_permission::responsible_app(),
             last_end: 0,
+            levels: Default::default(),
             fft_plans: FftPlans::default(),
         }
     }
@@ -481,11 +483,15 @@ impl eframe::App for App {
         let frame = self.input.frame(n);
         let reset = frame.end() < self.last_end;
         self.last_end = frame.end();
+        let start = self.profiler.start();
+        self.levels.ingest(&frame, reset);
+        self.profiler.record("Ingest", "Level histo", start);
         let mut shared = Shared::new(
             frame,
             reset,
             self.range,
             self.db,
+            self.levels.dist(),
             std::mem::take(&mut self.fft_plans),
         );
         // Analysis runs in slot order, so the scope sets the gate first.

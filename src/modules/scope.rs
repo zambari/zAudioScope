@@ -61,7 +61,7 @@ impl Default for Params {
             view_ms: 600.0,
             win_start_ms: 80.0,
             win_end_ms: 400.0,
-            db: DynamicRange::new(-60.0, 0.0),
+            db: DynamicRange::default(),
             gain: f32::NAN,
         }
     }
@@ -164,7 +164,7 @@ impl Module for Scope {
     }
 
     fn params(&mut self, ui: &mut Ui, shared: &Shared) {
-        self.p.db.ui(ui, &shared.db);
+        self.p.db.ui(ui, shared);
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.p.mode, Mode::Trigger, "Trigger");
             ui.selectable_value(&mut self.p.mode, Mode::Free, "Free");
@@ -306,9 +306,8 @@ impl Module for Scope {
 /// the ticks bunch towards the centre line; ones too close to a kept one
 /// are dropped. Labels go on the upper half, ticks on both.
 fn draw_db_axis(painter: &egui::Painter, rect: Rect, amp: &Scale, gain: f32, floor_db: f32) {
-    const DBS: [f32; 20] = [
-        6.0, 3.0, 0.0, -3.0, -6.0, -9.0, -12.0, -18.0, -24.0, -30.0, -36.0, -42.0, -48.0, -54.0, -60.0, -72.0, -84.0, -96.0,
-        -108.0, -120.0,
+    const DBS: [f32; 14] = [
+        3.0, 0.0, -3.0, -6.0, -9.0, -12.0, -18.0, -24.0, -30.0, -36.0, -42.0, -48.0, -54.0, -60.0,
     ];
     const MIN_GAP: f32 = 14.0;
     let top = 1.0 / gain;

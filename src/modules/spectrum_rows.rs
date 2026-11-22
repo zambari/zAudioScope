@@ -55,7 +55,7 @@ pub struct Params {
 
 impl Default for Params {
     fn default() -> Self {
-        Self { fft_pow: 12, rows: 160, db: DynamicRange::new(-90.0, -10.0), floor_db: f32::NAN, ceil_db: f32::NAN, range_db: f32::NAN, follow_gate: false, row_ms: 15.0 }
+        Self { fft_pow: 12, rows: 160, db: DynamicRange::default(), floor_db: f32::NAN, ceil_db: f32::NAN, range_db: f32::NAN, follow_gate: false, row_ms: 15.0 }
     }
 }
 
@@ -110,7 +110,7 @@ impl Params {
     }
 
     pub fn ui(&mut self, ui: &mut Ui, shared: &Shared, link: &mut Link<Key>) {
-        self.db.ui(ui, &shared.db);
+        self.db.ui(ui, shared);
         self.ui_fft(ui);
         ui.add(egui::Slider::new(&mut self.rows, ROWS.0..=ROWS.1).text("history rows"))
             .on_hover_text("Number of spectrum rows retained. Time between rows is set by ms / row.");

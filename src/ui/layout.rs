@@ -144,7 +144,10 @@ impl Workspace {
             };
             let painter = ui.painter().with_clip_rect(area.intersect(ui.clip_rect()));
             let stroke = Stroke::new(1.0, theme::ACCENT_BRIGHT.gamma_multiply(0.35));
-            painter.extend(egui::Shape::dashed_line(&points, stroke, 5.0, 4.0));
+            // A parameter guide shares this route; pause ours so they don't overlap.
+            if !plot::links_pending(ui) {
+                painter.extend(egui::Shape::dashed_line(&points, stroke, 5.0, 4.0));
+            }
             painter.vline(panel.left(), panel.y_range(), Stroke::new(2.0, theme::ACCENT_BRIGHT));
         }
         // Draw after both columns so graphs cannot cover a cross-panel guide.
@@ -422,6 +425,7 @@ mod tests {
             },
             false,
             NoteRange::default(),
+            crate::ui::dynamic_range::DbRange::default(),
             FftPlans::default(),
         );
         let mut workspace = Workspace::default();

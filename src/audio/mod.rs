@@ -2,6 +2,7 @@
 //! the analyser modules read from on the UI thread.
 
 pub mod input;
+pub mod levels;
 pub mod loudness;
 pub mod mic_permission;
 pub mod spectrum;

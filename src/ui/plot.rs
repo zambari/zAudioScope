@@ -641,6 +641,14 @@ fn queue_link(ui: &Ui, shapes: Vec<Shape>) {
     });
 }
 
+/// Whether a parameter guide is queued this frame, so other leaders can yield.
+pub fn links_pending(ui: &Ui) -> bool {
+    ui.data(|d| {
+        d.get_temp::<Vec<Shape>>(egui::Id::unique("parameter_links"))
+            .is_some_and(|v| !v.is_empty())
+    })
+}
+
 pub fn paint_links(ui: &Ui, rect: Rect) {
     let shapes = ui.data_mut(|d| {
         std::mem::take(d.get_temp_mut_or_default::<Vec<Shape>>(egui::Id::unique("parameter_links")))

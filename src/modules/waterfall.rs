@@ -119,7 +119,7 @@ impl Module for Waterfall {
     }
 
     fn params(&mut self, ui: &mut Ui, shared: &Shared) {
-        self.p.db.ui(ui, &shared.db);
+        self.p.db.ui(ui, shared);
         ui.add(
             RangeSlider::new(
                 &mut self.range_hz.0,

@@ -95,7 +95,7 @@ impl Default for Params {
             units_per_semitone: 1.0,
             notes: vec![false; 128],
             window_ms: 300.0,
-            db: DynamicRange::new(),
+            db: DynamicRange::default(),
             floor_db: f32::NAN,
             ceil_db: f32::NAN,
             rate_hz: 50.0,
@@ -508,7 +508,7 @@ impl Module for Tuner {
     }
 
     fn params(&mut self, ui: &mut Ui, shared: &Shared) {
-        self.p.db.ui(ui, &shared.db);
+        self.p.db.ui(ui, shared);
         egui::ComboBox::from_id_salt("tuner_method").selected_text(self.p.method.label()).show_ui(ui, |ui| {
             for m in Method::ALL {
                 ui.selectable_value(&mut self.p.method, m, m.label());

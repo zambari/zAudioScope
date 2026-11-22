@@ -31,6 +31,7 @@ use std::rc::Rc;
 use egui::{Rect, Ui};
 
 use crate::audio::Frame;
+use crate::audio::levels::LevelDist;
 use crate::audio::spectrum::Fft;
 use crate::ui::dynamic_range::DbRange;
 use crate::ui::noterange::NoteRange;
@@ -70,18 +71,21 @@ pub struct Shared {
     /// The dB range every locked [`DynamicRange`](crate::ui::dynamic_range::DynamicRange)
     /// control shares. The app keeps it.
     pub db: Cell<DbRange>,
+    /// Recent block-RMS level distribution, for the dB controls' meters.
+    pub levels: Rc<LevelDist>,
     plans: RefCell<FftPlans>,
     cache: RefCell<FrameCache>,
 }
 
 impl Shared {
-    pub fn new(frame: Frame, reset: bool, range: NoteRange, db: DbRange, plans: FftPlans) -> Self {
+    pub fn new(frame: Frame, reset: bool, range: NoteRange, db: DbRange, levels: Rc<LevelDist>, plans: FftPlans) -> Self {
         Self {
             frame,
             gate: Gate::default(),
             reset,
             range: Cell::new(range),
             db: Cell::new(db),
+            levels,
             plans: RefCell::new(plans),
             cache: Default::default(),
         }
