@@ -253,6 +253,11 @@ impl Module for MidiMonitor {
         0
     }
 
+    fn always_live(&self) -> bool {
+        // Note on/off arrive once; skipping them would leave notes stuck held.
+        true
+    }
+
     fn update(&mut self, shared: &mut Shared) {
         let midi = &shared.midi;
         (self.connected, self.missing) = (midi.connected, midi.missing);

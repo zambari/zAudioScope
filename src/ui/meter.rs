@@ -10,6 +10,9 @@ use crate::audio::Input;
 /// Gain slider top: +12 dB.
 pub const GAIN_MAX: f32 = 4.0;
 
+/// Held peak below this reads as no signal: the displays stop drawing.
+pub const NO_SIGNAL_DB: f32 = -40.0;
+
 pub fn to_db(lin: f32) -> f32 {
     if lin <= 0.0 { f32::NEG_INFINITY } else { 20.0 * lin.log10() }
 }
@@ -29,6 +32,11 @@ impl Meter {
     /// The held peak of both channels, linear.
     pub fn hold(&self) -> f32 {
         self.hold[0].max(self.hold[1])
+    }
+
+    /// False while the peak readout sits under [`NO_SIGNAL_DB`].
+    pub fn has_signal(&self) -> bool {
+        to_db(self.hold().max(1e-6)) >= NO_SIGNAL_DB
     }
 
     /// Gain slider and meter.

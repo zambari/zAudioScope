@@ -1,14 +1,15 @@
 //! Trigger scope. In Trigger mode it locks onto an impulse (a kick) and
 //! shows the audio after it; the shaded window (drag on the graph, or use
 //! the sliders) becomes the gate the other modules analyse. Free mode just
-//! scrolls, and the others analyse everything.
+//! scrolls, and the others analyse everything. Auto mode is Trigger with the
+//! threshold set by [`AutoLevel`], falling back to Free when nothing hits.
 
 use serde::{Deserialize, Serialize};
 
 use egui::{Align2, Color32, Pos2, Rect, Sense, Stroke, Ui};
 
 use super::{Gate, Module, Shared};
-use crate::audio::loudness;
+use crate::audio::{Frame, loudness};
 use crate::ui::dynamic_range::{CeilCrawl, DynamicRange};
 use crate::ui::handle::EdgeHandle;
 use crate::ui::plot::{self, Axis, Edge, Link, Scale};
@@ -20,6 +21,7 @@ enum Key {
     View,
     Threshold,
     Holdoff,
+    Reach,
     From,
     To,
 }
@@ -28,6 +30,7 @@ enum Key {
 enum Mode {
     Free,
     Trigger,
+    Auto,
 }
 
 /// The persisted settings.
@@ -39,6 +42,9 @@ struct Params {
     threshold: f32,
     /// After a trigger, ignore further crossings for this long.
     holdoff_ms: f32,
+    /// Auto mode: how much quieter than the last hit the next one may be
+    /// and still trigger, dB.
+    auto_reach_db: f32,
     /// Time shown after the trigger (or in total, in free mode).
     view_ms: f32,
     /// Gate: analyse from `win_start_ms` to `win_end_ms` after the trigger.
@@ -59,6 +65,7 @@ impl Default for Params {
             mode: Mode::Trigger,
             threshold: 0.3,
             holdoff_ms: 200.0,
+            auto_reach_db: 6.0,
             view_ms: 600.0,
             win_start_ms: 80.0,
             win_end_ms: 400.0,
@@ -79,6 +86,7 @@ impl Params {
         self.db.sanitize();
         self.threshold = self.threshold.clamp(0.01, 1.0);
         self.holdoff_ms = self.holdoff_ms.clamp(0.0, 1000.0);
+        self.auto_reach_db = self.auto_reach_db.clamp(0.0, 24.0);
         self.win_start_ms = self.win_start_ms.clamp(0.0, self.view_ms);
         self.win_end_ms = self.win_end_ms.clamp(self.win_start_ms, self.view_ms);
     }
@@ -113,6 +121,54 @@ impl Fold {
     }
 }
 
+/// Auto threshold: `reach` dB under the held peak of the last hit, so a
+/// slightly quieter next hit still fires. The hold decays while nothing
+/// hits, lowering the threshold to catch quieter material, but never below
+/// [`AVG_FACTOR`] × the average level: a transient has to stand out of the
+/// signal around it, so steady tones and pads (peak ≈ 1.6 × mean) never fire
+/// and the scope falls back to passthrough instead.
+#[derive(Default)]
+struct AutoLevel {
+    /// Slow mean of |x|.
+    avg: f32,
+    /// Peak-hold of |x|, decaying.
+    hold: f32,
+    /// Absolute sample index already consumed.
+    pos: u64,
+}
+
+/// Threshold floor relative to the mean |x| (≈ +9.5 dB).
+const AVG_FACTOR: f32 = 3.0;
+const AVG_TAU_S: f32 = 1.0;
+const HOLD_DECAY_DB_S: f32 = 6.0;
+/// Absolute floor, so hiss alone never triggers (-50 dBFS).
+const AUTO_MIN: f32 = 0.003;
+/// Without a fresh trigger for this long past the view, fall back to free.
+const AUTO_STALE_MS: f32 = 1500.0;
+
+impl AutoLevel {
+    /// Consume the audio in `frame` not seen yet.
+    fn update(&mut self, frame: &Frame, reset: bool) {
+        if reset || self.pos > frame.end() {
+            *self = Self::default();
+        }
+        let from = self.pos.max(frame.start);
+        let new = &frame.samples[(from - frame.start) as usize..];
+        self.pos = frame.end();
+        let rate = frame.rate.max(1) as f32;
+        let a = 1.0 - (-1.0 / (AVG_TAU_S * rate)).exp();
+        let decay = loudness::lin(-HOLD_DECAY_DB_S / rate);
+        for s in new.iter().map(|s| s.abs()) {
+            self.avg += (s - self.avg) * a;
+            self.hold = (self.hold * decay).max(s);
+        }
+    }
+
+    fn threshold(&self, reach_db: f32) -> f32 {
+        (self.hold * loudness::lin(-reach_db)).max(self.avg * AVG_FACTOR).clamp(AUTO_MIN, 1.0)
+    }
+}
+
 #[derive(Default)]
 pub struct Scope {
     p: Params,
@@ -120,11 +176,31 @@ pub struct Scope {
     crawl: CeilCrawl,
     /// Absolute sample index of the trigger being shown.
     trigger: Option<u64>,
+    auto: AutoLevel,
     drag_from_ms: Option<f32>,
     link: Link<Key>,
 }
 
 impl Scope {
+    /// The level crossings are tested against: the slider, or the follower.
+    fn threshold(&self) -> f32 {
+        match self.p.mode {
+            Mode::Auto => self.auto.threshold(self.p.auto_reach_db),
+            _ => self.p.threshold,
+        }
+    }
+
+    /// Showing time after a trigger (with the gate) rather than the latest
+    /// audio. Trigger mode keeps that layout while waiting for the first hit;
+    /// Auto only while it's locked.
+    fn triggered(&self) -> bool {
+        match self.p.mode {
+            Mode::Free => false,
+            Mode::Trigger => true,
+            Mode::Auto => self.trigger.is_some(),
+        }
+    }
+
     /// Latest rising crossing of the threshold that has a full gate window
     /// of audio after it and is past the holdoff of the previous one.
     fn find_trigger(&self, shared: &Shared) -> Option<u64> {
@@ -132,11 +208,12 @@ impl Scope {
         let x = &f.samples;
         let need = f.ms_to_samples(self.p.win_end_ms.max(self.p.view_ms));
         let holdoff = f.ms_to_samples(self.p.holdoff_ms);
+        let thr = self.threshold();
         let last = x.len().checked_sub(need)?;
         let mut found = None;
         let mut i = 1;
         while i <= last {
-            if x[i].abs() >= self.p.threshold && x[i - 1].abs() < self.p.threshold {
+            if x[i].abs() >= thr && x[i - 1].abs() < thr {
                 found = Some(f.start + i as u64);
                 i += holdoff.max(1);
             } else {
@@ -152,15 +229,15 @@ impl Scope {
         let f = &shared.frame;
         let view = f.ms_to_samples(self.p.view_ms).max(2);
         let start = match (self.p.mode, self.trigger) {
-            (Mode::Trigger, Some(t)) => t.saturating_sub(f.start) as usize,
+            (Mode::Trigger | Mode::Auto, Some(t)) => t.saturating_sub(f.start) as usize,
             _ => f.samples.len().saturating_sub(view),
         };
         (start, view)
     }
 
-    /// Shaded gate window (trigger mode only).
+    /// Shaded gate window (triggered view only).
     fn paint_gate(&self, painter: &egui::Painter, rect: Rect) {
-        if self.p.mode != Mode::Trigger {
+        if !self.triggered() {
             return;
         }
         let x_of_ms = |ms: f32| rect.left() + rect.width() * ms / self.p.view_ms;
@@ -215,6 +292,11 @@ impl Module for Scope {
         (ms * rate as f32 / 1000.0) as usize
     }
 
+    fn always_live(&self) -> bool {
+        // Sets the gate every other analyser reads.
+        true
+    }
+
     fn update(&mut self, shared: &mut Shared) {
         self.p.db.sync(&shared.db);
         // Advance the follower even while locked so it never replays old audio,
@@ -224,13 +306,19 @@ impl Module for Scope {
         if !self.p.db.locked {
             self.p.db.range = range;
         }
+        self.auto.update(&shared.frame, shared.reset);
         match self.p.mode {
             Mode::Free => shared.gate = Gate { window: None },
-            Mode::Trigger => {
+            Mode::Trigger | Mode::Auto => {
                 if let Some(t) = self.find_trigger(shared) {
                     self.trigger = Some(t);
                 }
                 let f = &shared.frame;
+                if self.p.mode == Mode::Auto {
+                    // Nothing hit lately (or the stream restarted): passthrough.
+                    let stale = f.ms_to_samples(self.p.view_ms.max(self.p.win_end_ms) + AUTO_STALE_MS) as u64;
+                    self.trigger = self.trigger.filter(|&t| t <= f.end() && f.end() - t <= stale);
+                }
                 shared.gate.window = self.trigger.map(|t| {
                     (t + f.ms_to_samples(self.p.win_start_ms) as u64, t + f.ms_to_samples(self.p.win_end_ms) as u64)
                 });
@@ -244,12 +332,21 @@ impl Module for Scope {
         }
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.p.mode, Mode::Trigger, "Trigger");
+            ui.selectable_value(&mut self.p.mode, Mode::Auto, "Auto")
+                .on_hover_text("Trigger with the threshold following the hits: a bit under the last one, never under the average level. Free when nothing stands out.");
             ui.selectable_value(&mut self.p.mode, Mode::Free, "Free");
         });
+        let auto_thr = self.threshold();
         let link = &mut self.link;
         link.slider(ui, Key::View, egui::Slider::new(&mut self.p.view_ms, 50.0..=2000.0).text("view ms"));
-        ui.add_enabled_ui(self.p.mode == Mode::Trigger, |ui| {
-            link.slider(ui, Key::Threshold, egui::Slider::new(&mut self.p.threshold, 0.01..=1.0).text("threshold"));
+        ui.add_enabled_ui(self.p.mode != Mode::Free, |ui| {
+            if self.p.mode == Mode::Auto {
+                link.slider(ui, Key::Reach, egui::Slider::new(&mut self.p.auto_reach_db, 0.0..=24.0).text("reach dB"))
+                    .on_hover_text("How much quieter than the last hit the next one may be and still trigger.");
+                ui.label(format!("auto threshold {:.1} dBFS", loudness::db(auto_thr)));
+            } else {
+                link.slider(ui, Key::Threshold, egui::Slider::new(&mut self.p.threshold, 0.01..=1.0).text("threshold"));
+            }
             link.slider(ui, Key::Holdoff, egui::Slider::new(&mut self.p.holdoff_ms, 0.0..=1000.0).text("holdoff ms"));
             link.slider(ui, Key::From, egui::Slider::new(&mut self.p.win_start_ms, 0.0..=self.p.view_ms).text("gate from"));
             link.slider(ui, Key::To, egui::Slider::new(&mut self.p.win_end_ms, 0.0..=self.p.view_ms).text("gate to"));
@@ -262,7 +359,7 @@ impl Module for Scope {
     fn graph(&mut self, ui: &mut Ui, rect: Rect, shared: &Shared) {
         self.link.tick(ui.input(|i| i.stable_dt).clamp(0.0, 0.1));
         let f = &shared.frame;
-        let trig = self.p.mode == Mode::Trigger;
+        let trig = self.triggered();
         let (lo, view) = self.span(shared);
         let painter = ui.painter_at(rect);
         // Trigger: ms after the trigger. Free: ms before now.
@@ -298,13 +395,24 @@ impl Module for Scope {
 
         self.paint_wave(&painter, rect, shared);
 
+        // Auto threshold: a guide only, the follower owns it.
+        if self.p.mode == Mode::Auto {
+            let thr = self.threshold();
+            let stroke = Stroke::new(1.0, theme::ACCENT.gamma_multiply(if trig { 0.8 } else { 0.35 }));
+            for s in [thr, -thr] {
+                painter.hline(rect.x_range(), fold.y(rect, s), stroke);
+            }
+        }
+
         // Handles: threshold on the left edge, gate ends along the bottom.
         if trig {
-            let thr = Scale::linear((fold.floor, fold.top), (rect.center().y, rect.top()));
-            let fmt = |v: f32| format!("thr {v:.2}  {:.1} dB", 20.0 * v.log10());
-            let r = EdgeHandle::new("scope_thr", Edge::Left, thr, &mut self.p.threshold).clamp(0.01, 1.0).reset(0.3).label(&fmt).show(ui, rect);
-            if r.hovered() || r.dragged() {
-                self.link.touch(Key::Threshold);
+            if self.p.mode == Mode::Trigger {
+                let thr = Scale::linear((fold.floor, fold.top), (rect.center().y, rect.top()));
+                let fmt = |v: f32| format!("thr {v:.2}  {:.1} dB", 20.0 * v.log10());
+                let r = EdgeHandle::new("scope_thr", Edge::Left, thr, &mut self.p.threshold).clamp(0.01, 1.0).reset(0.3).label(&fmt).show(ui, rect);
+                if r.hovered() || r.dragged() {
+                    self.link.touch(Key::Threshold);
+                }
             }
             let ms = Scale::linear((0.0, self.p.view_ms), (rect.left(), rect.right()));
             let fmt = |v: f32| format!("from {}", plot::fmt_ms(v));
@@ -333,6 +441,7 @@ impl Module for Scope {
                 plot::fmt_ms(self.p.win_end_ms)
             ),
             (true, None) => format!("{} · waiting for trigger", plot::fmt_ms(self.p.view_ms)),
+            (false, _) if self.p.mode == Mode::Auto => format!("last {} · auto: no hits, passthrough", plot::fmt_ms(self.p.view_ms)),
             (false, _) => format!("last {}", plot::fmt_ms(self.p.view_ms)),
         };
         plot::caption(&painter, rect, Align2::RIGHT_TOP, caption);
@@ -347,7 +456,7 @@ impl Module for Scope {
 
         match self.link.shown() {
             Some(Key::View) => self.link.point_x(ui, rect, rect.right() - 1.0),
-            Some(Key::Threshold) => self.link.point_y(ui, rect, fold.y(rect, self.p.threshold)),
+            Some(Key::Threshold | Key::Reach) => self.link.point_y(ui, rect, fold.y(rect, self.threshold())),
             Some(Key::Holdoff) => self.link.point_x(ui, rect, x_of_ms(self.p.holdoff_ms)),
             Some(Key::From) => self.link.point_x(ui, rect, x_of_ms(self.p.win_start_ms)),
             Some(Key::To) => self.link.point_x(ui, rect, x_of_ms(self.p.win_end_ms)),

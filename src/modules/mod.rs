@@ -8,9 +8,12 @@
 //!    independent of the UI.
 //! 2. The app snapshots the newest audio into a `Shared` (as much as the
 //!    visible modules ask for via `Module::lookback`).
-//! 3. `Module::update` runs for each visible module in slot order. Modules
+//! 3. `Module::update` runs for each live module in slot order. A module is
+//!    live when it is visible and the page on screen draws it (a solo page
+//!    draws only its own analyser), or when it is `always_live`. Modules
 //!    compare `frame.end()` (the absolute sample counter) with what they
-//!    saw last time and skip work when nothing new arrived.
+//!    saw last time and skip work when nothing new arrived; a paused one
+//!    catches up when it next runs.
 //! 4. Derived data (spectra, decimated audio) is computed on first request
 //!    through `Shared` and memoized, so two modules asking for the same FFT
 //!    pay for it once.
@@ -118,6 +121,10 @@ pub struct Shared {
     pub levels: Rc<LevelDist>,
     /// MIDI received since the last frame; the app fills it in.
     pub midi: MidiFrame,
+    /// Whether the input peak reads above the no-signal floor. The app sets
+    /// it from the input meter; while false, displays stop drawing and show
+    /// "No signal" instead. Analysis still runs.
+    pub signal: bool,
     plans: RefCell<FftPlans>,
     cache: RefCell<FrameCache>,
 }
@@ -132,6 +139,7 @@ impl Shared {
             db: Cell::new(db),
             levels,
             midi: MidiFrame::default(),
+            signal: true,
             plans: RefCell::new(plans),
             cache: Default::default(),
         }
@@ -298,8 +306,15 @@ pub trait Module {
     fn lookback(&self, rate: u32) -> usize {
         rate as usize
     }
-    /// Analysis for this frame. Runs whether or not the row is open.
+    /// Analysis for this frame. Runs while the module is live (see the frame
+    /// lifecycle above).
     fn update(&mut self, _shared: &mut Shared) {}
+    /// Keeps analysing even when the page on screen does not draw it, because
+    /// others read its results through `Shared` (the scope's gate) or it
+    /// consumes events that a pause would lose (MIDI note on/off).
+    fn always_live(&self) -> bool {
+        false
+    }
     /// Live pitches (fractional MIDI) to light on the shared range bar.
     fn marks(&self, _out: &mut Vec<f32>) {}
     /// Whether this module has controls in the row below the audio toolbar

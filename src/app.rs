@@ -24,8 +24,6 @@ struct Saved {
     input: InputSettings,
     /// Per module title: (visible, open).
     modules: Vec<(String, bool, bool)>,
-    /// Input gain, linear.
-    gain: f32,
     /// Shared note range of the frequency-axis analysers.
     range: NoteRange,
     /// dB range shared by the locked level controls.
@@ -34,7 +32,7 @@ struct Saved {
     debug: bool,
     /// MIDI input port, reopened whenever it is present.
     midi_port: Option<String>,
-    /// Monitor output: on/off, device, level, feedback guard.
+    /// Monitor output: device, level, feedback guard. Never on at startup.
     monitor: MonitorSettings,
 }
 
@@ -44,7 +42,6 @@ impl Default for Saved {
             device_id: None,
             input: InputSettings::default(),
             modules: Vec::new(),
-            gain: 1.0,
             range: NoteRange::default(),
             db: DbRange::default(),
             layout: Default::default(),
@@ -85,6 +82,9 @@ pub struct App {
     mic_owner: Option<String>,
     /// End of the audio the modules saw last frame, to spot stream restarts.
     last_end: u64,
+    /// Per slot: a stream restart happened while the module was not updating,
+    /// so its next update must be told about it.
+    missed_reset: Vec<bool>,
     levels: crate::audio::levels::LevelHistogram,
     /// FFT plans reused across frames; results are cached per frame only.
     fft_plans: FftPlans,
@@ -97,6 +97,7 @@ impl App {
             .and_then(|s| eframe::get_value(s, STATE_KEY))
             .unwrap_or_default();
         let mut slots = modules::all();
+        let slots_len = slots.len();
         for slot in &mut slots {
             if let Some((_, v, o)) = saved
                 .modules
@@ -121,7 +122,8 @@ impl App {
             devices: Input::devices(),
             midi: MidiHub::new(saved.midi_port.clone().or_else(|| legacy_midi_port(storage?))),
             slots,
-            gain: saved.gain.clamp(0.0, ui::meter::GAIN_MAX),
+            // Never persisted: a drag to zero must not survive a restart.
+            gain: 1.0,
             range: saved.range.sanitized(),
             db: saved.db.sanitized(),
             layout: saved.layout,
@@ -136,6 +138,7 @@ impl App {
             mic_checked: std::time::Instant::now(),
             mic_owner: mic_permission::responsible_app(),
             last_end: 0,
+            missed_reset: vec![false; slots_len],
             levels: Default::default(),
             fft_plans: FftPlans::default(),
         }
@@ -474,14 +477,24 @@ impl eframe::App for App {
         let timing = self.profiler.begin();
         self.build_watch.poll(ui.ctx());
         self.poll_mic(ui.ctx());
-        // Snapshot only as much as the visible modules need; the ring itself
+        // Live modules: visible, and drawn by the page on screen (a solo page
+        // draws one analyser), or needed by others. The rest pause in place.
+        let requested = self.layout.requested(&self.slots);
+        let live: Vec<bool> = self
+            .slots
+            .iter()
+            .zip(&requested)
+            .map(|(s, &want)| s.visible && (want || s.module.always_live()))
+            .collect();
+        // Snapshot only as much as the live modules need; the ring itself
         // may hold far more (the capture length).
         let rate = self.input.rate;
         let n = self
             .slots
             .iter()
-            .filter(|s| s.visible)
-            .map(|s| s.module.lookback(rate))
+            .zip(&live)
+            .filter(|(_, l)| **l)
+            .map(|(s, _)| s.module.lookback(rate))
             .max()
             .unwrap_or(0);
         // Analysis is clocked by the audio, not the repaint: modules look at
@@ -505,9 +518,17 @@ impl eframe::App for App {
             std::mem::take(&mut self.fft_plans),
         );
         shared.midi = self.midi.frame();
+        // The input meter's held peak, as shown, from last frame's readout.
+        shared.signal = self.meter.has_signal();
         // Analysis runs in slot order, so the scope sets the gate first.
-        for slot in self.slots.iter_mut().filter(|s| s.visible) {
+        for (i, slot) in self.slots.iter_mut().enumerate() {
+            if !live[i] {
+                // Paused: remember a restart so it is applied on resume.
+                self.missed_reset[i] |= reset;
+                continue;
+            }
             let start = self.profiler.start();
+            shared.reset = reset || std::mem::take(&mut self.missed_reset[i]);
             slot.module.update(&mut shared);
             self.profiler.record("Analysis", slot.module.title(), start);
         }
@@ -515,10 +536,10 @@ impl eframe::App for App {
         egui::Panel::top("top_bar").show(ui, |ui| self.top_bar(ui));
         egui::Panel::bottom("status_bar").show(ui, |ui| self.status_bar(ui));
         let mut marks = Vec::new();
-        for slot in self.slots.iter().filter(|s| s.visible) {
+        for (slot, _) in self.slots.iter().zip(&live).filter(|(_, l)| **l) {
             slot.module.marks(&mut marks);
         }
-        let debug_origin = ui.available_rect_before_wrap().min + egui::vec2(6.0, 6.0);
+        let debug_anchor = ui.available_rect_before_wrap().right_top() + egui::vec2(-6.0, 6.0);
         let paused = self.input.paused();
         egui::CentralPanel::default().show(ui, |ui| {
             if paused {
@@ -533,7 +554,7 @@ impl eframe::App for App {
         if self.profiler.enabled {
             self.profiler.note = self.fft_plans.report();
         }
-        self.profiler.finish(ui, timing, debug_origin);
+        self.profiler.finish(ui, timing, debug_anchor);
         ui.ctx().request_repaint();
     }
 
@@ -549,7 +570,6 @@ impl eframe::App for App {
                     .iter()
                     .map(|s| (s.module.title().to_owned(), s.visible, s.open))
                     .collect(),
-                gain: self.gain,
                 range: self.range,
                 db: self.db,
                 layout: self.layout.clone(),

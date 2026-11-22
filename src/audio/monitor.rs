@@ -20,10 +20,11 @@ const FADE_IN_S: f32 = 0.5;
 /// Ramp to silence once the guard trips, seconds.
 const MUTE_S: f32 = 0.02;
 
+/// What the monitor remembers across restarts. Monitoring itself is never
+/// persisted: the app always starts with it off, but keeps the last device.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MonitorSettings {
-    pub enabled: bool,
     /// `None`: the system's default output.
     pub device_id: Option<String>,
     /// Linear.
@@ -34,7 +35,7 @@ pub struct MonitorSettings {
 
 impl Default for MonitorSettings {
     fn default() -> Self {
-        Self { enabled: false, device_id: None, gain: 0.5, guard: true }
+        Self { device_id: None, gain: 0.5, guard: true }
     }
 }
 
@@ -92,7 +93,7 @@ pub struct Monitor {
 
 impl Monitor {
     pub fn new(settings: &MonitorSettings, tap: Arc<MonitorTap>) -> Self {
-        let mut me = Self {
+        let me = Self {
             stream: None,
             sh: Arc::new(Shared {
                 gain: AtomicU32::new(0),
@@ -110,13 +111,11 @@ impl Monitor {
             open_error: None,
         };
         me.set_gain(settings.gain);
-        me.set_enabled(settings.enabled);
         me
     }
 
     pub fn settings(&self) -> MonitorSettings {
         MonitorSettings {
-            enabled: self.enabled,
             device_id: self.device_id.clone(),
             gain: self.gain(),
             guard: self.guard(),

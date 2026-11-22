@@ -14,6 +14,18 @@ use egui::{
     vec2,
 };
 
+/// Stand-in for a graph while the input is silent (see
+/// [`Shared::signal`](crate::modules::Shared::signal)), centred in `rect`.
+pub fn no_signal(ui: &Ui, rect: egui::Rect) {
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        "No signal",
+        FontId::proportional(14.0),
+        ui.visuals().weak_text_color(),
+    );
+}
+
 /// Audio device dropdown. Returns the id picked this frame.
 pub fn device_picker(
     ui: &mut Ui,

@@ -351,6 +351,24 @@ impl Workspace {
         profiler.record("Range", "bar draw", start);
     }
 
+    /// Which slots the page drawn this frame asks for. A solo page asks for
+    /// its analyzer and the host it draws over; Stack and Composite ask for
+    /// everything (the caller still limits this to visible slots).
+    pub fn requested(&self, slots: &[Slot]) -> Vec<bool> {
+        let all = vec![true; slots.len()];
+        let View::Solo(title) = &self.view else { return all };
+        let visible: Vec<usize> = (0..slots.len()).filter(|&i| slots[i].visible).collect();
+        let Some(solo) = visible.iter().copied().find(|&i| slots[i].module.title() == title.as_str()) else {
+            return all;
+        };
+        let mut wanted = vec![false; slots.len()];
+        wanted[solo] = true;
+        if let Some(&(host, _)) = merges(slots, &visible).iter().find(|m| m.1 == solo) {
+            wanted[host] = true;
+        }
+        wanted
+    }
+
     /// Keep one order entry per analyzer (new ones go last) and return slot
     /// indices in that order.
     fn sync_order(&mut self, slots: &[Slot]) -> Vec<usize> {
@@ -390,7 +408,10 @@ impl Workspace {
         let mut panels = BTreeMap::new();
         ui.painter().rect_filled(area, 2.0, ui.visuals().extreme_bg_color);
         let graph = Rect::from_min_max(pos2(area.left() + 1.0, area.top() + HEADER), area.max - vec2(1.0, 1.0));
-        if graph.height() >= 44.0 && graph.width() >= 24.0 {
+        let sized = graph.height() >= 44.0 && graph.width() >= 24.0;
+        if sized && !shared.signal {
+            widgets::no_signal(ui, graph);
+        } else if sized {
             plot::note_grid(&ui.painter().with_clip_rect(graph), graph, shared.range.get());
             for layer in self.mix.iter().filter(|l| l.on && l.opacity > 0.0) {
                 let Some(slot) = slots.iter_mut().find(|s| s.visible && s.module.title() == layer.title) else { continue };
@@ -565,9 +586,13 @@ impl Workspace {
             );
             // Tiny windows still fit; don't pass inverted plot bounds to modules.
             if slot.visible && graph.height() >= 44.0 && graph.width() >= 24.0 {
-                slot.module.graph(&mut pane, graph, shared);
-                if let Some(g) = guest {
-                    slots[g].module.overlay(&mut pane, graph, shared);
+                if shared.signal {
+                    slot.module.graph(&mut pane, graph, shared);
+                    if let Some(g) = guest {
+                        slots[g].module.overlay(&mut pane, graph, shared);
+                    }
+                } else {
+                    widgets::no_signal(&pane, graph);
                 }
             }
             let slot = &mut slots[i];
@@ -999,5 +1024,33 @@ mod tests {
         );
         assert_eq!(proportional_sizes(&[1.0], 400.0, 72.0), [400.0]);
         assert!(proportional_sizes(&[], 400.0, 72.0).is_empty());
+    }
+
+    #[test]
+    fn solo_page_requests_only_its_analyser_and_host() {
+        use crate::modules::{self, note_spectrum, tuner};
+        let slots = modules::all();
+        let titles = |want: &[bool]| -> Vec<&str> {
+            slots.iter().zip(want).filter(|(_, w)| **w).map(|(s, _)| s.module.title()).collect()
+        };
+        let waterfall = "Waterfall";
+        let mut workspace = Workspace::default();
+
+        // Stack asks for everything.
+        assert!(workspace.requested(&slots).iter().all(|&w| w));
+
+        // A plain solo page asks for its own analyser alone.
+        workspace.view = View::Solo(waterfall.to_owned());
+        assert_eq!(titles(&workspace.requested(&slots)), [waterfall]);
+
+        // The tuner draws over the note spectrum, so both are requested.
+        workspace.view = View::Solo(tuner::TITLE.to_owned());
+        assert_eq!(titles(&workspace.requested(&slots)), [tuner::TITLE, note_spectrum::TITLE]);
+
+        // Solo on a switched-off analyser falls back to the stack.
+        let mut off = modules::all();
+        off[2].visible = false;
+        workspace.view = View::Solo(waterfall.to_owned());
+        assert!(workspace.requested(&off).iter().all(|&w| w));
     }
 }
