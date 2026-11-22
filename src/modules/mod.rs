@@ -23,6 +23,7 @@
 pub mod impulse;
 pub mod midi;
 pub mod note_clock;
+mod note_hold;
 mod note_input;
 pub mod note_spectrum;
 mod perf;

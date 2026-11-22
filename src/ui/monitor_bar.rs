@@ -55,7 +55,7 @@ pub fn show(
     }
 
     let mut gain = monitor.gain();
-    let r = meter::gain_slider(ui, &mut gain, |db| {
+    let r = meter::gain_slider(ui, &mut gain, meter::GAIN_MAX, 80.0, |db| {
         format!("Monitor level {db}. Tick marks 0 dB; double-click to reset to it")
     });
     if r.changed() {

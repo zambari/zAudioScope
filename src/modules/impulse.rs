@@ -239,8 +239,9 @@ impl Module for Impulse {
             rect.min + vec2(4.0, 4.0),
             pos2(rect.right() - 4.0, rect.bottom() - LABEL_H),
         );
-        // Leave the right edge available for the shared speed handle.
-        let drag_rect = Rect::from_min_max(plot.min, plot.max - vec2(16.0, 0.0));
+        // Leave the right edge to the speed handle and the dB rail.
+        let side = dynamic_range::beside_rail(rect);
+        let drag_rect = Rect::from_min_max(plot.min, pos2(side.right() - 16.0, plot.bottom()));
         let response = ui.interact(
             drag_rect,
             ui.scope_id().with("impulse_rotation"),
@@ -490,7 +491,7 @@ impl Module for Impulse {
         }
         plot::caption(
             &painter,
-            rect,
+            side,
             Align2::RIGHT_TOP,
             format!("{} ms deep", plot::trim(depth_ms)),
         );
@@ -519,11 +520,10 @@ impl Module for Impulse {
         };
         spectrum_rows::time_handle(
             ui,
-            rect,
+            side,
             spectrum_rows::TimeHandle {
                 id: "impulse_speed",
                 edge: Edge::Right,
-                guide: true,
                 range: WINDOW_MS,
                 reset: DEFAULT_WINDOW_MS,
                 fmt: &fmt,
@@ -531,6 +531,7 @@ impl Module for Impulse {
             &mut self.link,
             &mut self.window_ms,
         );
+        self.p.db.rail(ui, rect, "impulse_db", shared);
     }
 }
 

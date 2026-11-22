@@ -225,9 +225,8 @@ impl Params {
         ui.checkbox(&mut self.follow_gate, "only gated window");
     }
 
-    /// Fall-time handle on the left edge (up is shorter), tied to its slider
-    /// without a horizontal guide: it has no level on the graph to point at.
-    /// Call [`Link::tick`] earlier in the frame.
+    /// Fall-time handle on the right edge (up is shorter), just inside the
+    /// dB rail. Call [`Link::tick`] earlier in the frame.
     pub fn fall_handle(&mut self, ui: &mut Ui, rect: Rect, id: &str, link: &mut Link<Key>) {
         let rows = self.rows as f32;
         let fmt = |ms: f32| {
@@ -242,8 +241,7 @@ impl Params {
             rect,
             TimeHandle {
                 id,
-                edge: Edge::Left,
-                guide: false,
+                edge: Edge::Right,
                 range: ROW_MS,
                 reset: 15.0,
                 fmt: &fmt,
@@ -258,8 +256,6 @@ impl Params {
 pub struct TimeHandle<'a> {
     pub id: &'a str,
     pub edge: Edge,
-    /// Draw a horizontal line to the linked slider's value while it is shown.
-    pub guide: bool,
     /// Value range; the top of the edge is the lower end (up is shorter).
     pub range: (f32, f32),
     pub reset: f32,
@@ -267,7 +263,9 @@ pub struct TimeHandle<'a> {
 }
 
 /// Log-scaled time handle on a graph edge, linked to the [`Key::Speed`]
-/// slider. Call [`Link::tick`] earlier in the frame.
+/// slider (the slider is outlined while the handle is in use; no guide line
+/// is drawn, a time has no level on the graph). Call [`Link::tick`] earlier
+/// in the frame.
 pub fn time_handle(ui: &mut Ui, rect: Rect, h: TimeHandle, link: &mut Link<Key>, value: &mut f32) {
     let scale = Scale::log(h.range, (rect.top() + 6.0, rect.bottom() - 6.0));
     let r = EdgeHandle::new(h.id, h.edge, scale, value)
@@ -277,9 +275,6 @@ pub fn time_handle(ui: &mut Ui, rect: Rect, h: TimeHandle, link: &mut Link<Key>,
         .show(ui, rect);
     if r.hovered() || r.dragged() {
         link.touch(Key::Speed);
-    }
-    if h.guide && link.shown() == Some(Key::Speed) {
-        link.point_y(ui, rect, scale.px(*value));
     }
 }
 

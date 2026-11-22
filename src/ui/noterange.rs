@@ -6,7 +6,7 @@
 //! (A4 = 440 Hz). Note `m` is centred at `m`, its column spans `m ± 0.5`.
 //!
 //! [`bar`] draws the control: log Hz labels (20 Hz–2 kHz, or up to 12.5 kHz
-//! when `wide`) over a piano-roll strip, with the selected range lit. Drag an edge to move one end, drag
+//! unless `narrow`) under a piano-roll strip, with the selected range lit. Drag an edge to move one end, drag
 //! inside to move both, scroll to shift, double-click to reset.
 
 use egui::{Align2, Color32, CursorIcon, FontId, Rect, Sense, Stroke, Ui, pos2, vec2};
@@ -27,10 +27,10 @@ pub struct NoteRange {
     /// Lowest and highest note shown, MIDI, inclusive.
     pub lo: i32,
     pub hi: i32,
-    /// Selectable up to [`Self::HI_WIDE`] (hi-hats, cymbals) rather than
-    /// [`Self::HI`]. Missing in older saved states, so it defaults to off.
+    /// Selectable only up to [`Self::HI`] rather than [`Self::HI_WIDE`]
+    /// (hi-hats, cymbals). Defaults to off, i.e. the wide reach.
     #[serde(default)]
-    pub wide: bool,
+    pub narrow: bool,
 }
 
 impl Default for NoteRange {
@@ -38,7 +38,7 @@ impl Default for NoteRange {
         Self {
             lo: 24,
             hi: 59,
-            wide: false,
+            narrow: false,
         } // C1 .. B3
     }
 }
@@ -48,24 +48,24 @@ impl NoteRange {
     pub const LO: i32 = 16;
     /// Highest selectable note: B6 (1976 Hz).
     pub const HI: i32 = 95;
-    /// Highest selectable note when `wide`: G9 (12.5 kHz).
+    /// Highest selectable note unless `narrow`: G9 (12.5 kHz).
     pub const HI_WIDE: i32 = 127;
     /// At least an octave is shown.
     pub const MIN_KEYS: i32 = 12;
 
-    /// The selectable limits, as a range (its `lo`/`hi`, same `wide`).
+    /// The selectable limits, as a range (its `lo`/`hi`, same `narrow`).
     pub fn bounds(self) -> Self {
         Self {
             lo: Self::LO,
-            hi: if self.wide { Self::HI_WIDE } else { Self::HI },
-            wide: self.wide,
+            hi: if self.narrow { Self::HI } else { Self::HI_WIDE },
+            narrow: self.narrow,
         }
     }
 
     /// Highest selectable frequency, Hz, with or without `wide`.
     pub fn top_hz(wide: bool) -> f32 {
         Self {
-            wide,
+            narrow: !wide,
             ..Self::default()
         }
         .bounds()
@@ -79,7 +79,7 @@ impl NoteRange {
         Self {
             lo: self.lo.clamp(b.lo, hi - gap),
             hi,
-            wide: self.wide,
+            narrow: self.narrow,
         }
     }
 
@@ -123,7 +123,7 @@ pub fn is_black(key: i32) -> bool {
     matches!(key.rem_euclid(12), 1 | 3 | 6 | 8 | 10)
 }
 
-/// Height of the range bar: Hz labels over the keys, px.
+/// Height of the range bar: the keys over their Hz labels, px.
 pub const BAR_H: f32 = 46.0;
 
 /// Pick-up distance of an edge handle, px.
@@ -168,16 +168,15 @@ pub fn bar(
                         pitch::note_name(range.hi)
                     ));
                 });
+                // Two rows fill the bar's height; a third would be clipped.
                 ui.horizontal(|ui| {
                     ui.add(widgets::flicktoggle(spectrum))
                         .on_hover_text("Live spectrum over the keys (runs its own FFTs)");
                     ui.weak("FFT");
-                    ui.weak(format!("{} notes", range.count()));
-                });
-                ui.horizontal(|ui| {
-                    ui.add(widgets::flicktoggle(&mut range.wide))
-                        .on_hover_text("Reach up to G9 (12.5 kHz) for hi-hats and cymbals");
-                    ui.weak(format!("to {}", pitch::note_name(range.bounds().hi)));
+                    ui.add_space(6.0);
+                    ui.add(widgets::flicktoggle(&mut range.narrow))
+                        .on_hover_text("Limit the reach to B6 (2 kHz); off reaches G9 (12.5 kHz) for hi-hats and cymbals");
+                    ui.weak("narrow");
                 });
             },
         );
@@ -202,7 +201,9 @@ fn strip(
     let main = Rect::from_min_max(rect.min, pos2(rect.right() - air_w, rect.bottom()));
     let notes = full.scale(main);
     let label_h = 12.0;
-    let keys = Rect::from_min_max(pos2(main.left(), main.top() + label_h), main.max);
+    // Keys on top, Hz labels below them: the labels describe the keyboard's
+    // full reach, not the selected sub-range the graphs share.
+    let keys = Rect::from_min_max(main.min, pos2(main.right(), main.bottom() - label_h));
 
     // ---- interaction ------------------------------------------------------
     let (mut lo, mut hi) = (range.lo as f32, range.hi as f32);
@@ -222,9 +223,9 @@ fn strip(
         }
     };
     if resp.double_clicked() {
-        // Reset the selection, keep the reach (`wide`) the user chose.
+        // Reset the selection, keep the reach (`narrow`) the user chose.
         *range = NoteRange {
-            wide: range.wide,
+            narrow: range.narrow,
             ..NoteRange::default()
         };
         return;
@@ -287,7 +288,7 @@ fn strip(
     *range = NoteRange {
         lo: lo as i32,
         hi: hi as i32,
-        wide: range.wide,
+        narrow: range.narrow,
     }
     .sanitized();
 
@@ -298,13 +299,14 @@ fn strip(
     let p = ui.painter_at(rect);
     p.rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
 
-    // Hz labels: log ticks across the full span.
+    // Hz labels under the keys: log ticks across the full span.
     let hz = full.hz_scale(main);
+    let label_top = keys.bottom();
     for t in hz.ticks(34.0) {
         let x = hz.px(t.value);
         p.vline(
             x,
-            rect.top()..=rect.top() + 3.0,
+            label_top..=label_top + 3.0,
             Stroke::new(1.0, plot::TICK),
         );
         let c = if t.major {
@@ -313,7 +315,7 @@ fn strip(
             Color32::from_gray(95)
         };
         p.text(
-            pos2(x, rect.top() + 1.0),
+            pos2(x, label_top + 1.0),
             Align2::CENTER_TOP,
             plot::fmt_hz(t.value),
             FontId::monospace(9.0),
@@ -370,7 +372,7 @@ fn strip(
     if let Some(o) = outside {
         o.paint(&p, keys, rect.right(), *range);
         p.text(
-            pos2(rect.right(), rect.top() + 1.0),
+            pos2(rect.right(), label_top + 1.0),
             Align2::RIGHT_TOP,
             format!(
                 "→{}",
@@ -432,7 +434,7 @@ fn strip(
     if let Some(h) = resp.hover_pos() {
         let m = notes.value(h.x);
         let side = outside
-            .filter(|_| h.y > keys.top() && (h.x < sel.left() || h.x > sel.right()))
+            .filter(|_| h.y < keys.bottom() && (h.x < sel.left() || h.x > sel.right()))
             .map(|o| format!("\n\n{}", o.describe(h.x < sel.left())))
             .unwrap_or_default();
         resp.on_hover_text_at_pointer(format!(
@@ -452,17 +454,17 @@ mod tests {
         let narrow = NoteRange {
             lo: 60,
             hi: 120,
-            wide: false,
+            narrow: true,
         }
         .sanitized();
         assert_eq!(narrow.hi, NoteRange::HI);
         let wide = NoteRange {
             lo: 60,
             hi: 120,
-            wide: true,
+            narrow: false,
         }
         .sanitized();
-        assert_eq!((wide.lo, wide.hi, wide.wide), (60, 120, true));
+        assert_eq!((wide.lo, wide.hi, wide.narrow), (60, 120, false));
         assert!(NoteRange::top_hz(true) > 12_000.0);
         // B6 plus the half-note margin the shown span adds (~2.01 kHz).
         assert!(NoteRange::top_hz(false) < 2_100.0);

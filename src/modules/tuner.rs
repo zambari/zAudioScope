@@ -2,9 +2,11 @@
 //!
 //! - Autocorrelation (NSDF) candidates are drawn as vertical lines with
 //!   note name and clarity; they fade in and out with confidence and level.
-//! - When the pick is clearly periodic, the snapped note and the "tune up /
-//!   down by x" advice fade in, snapping to the nearest enabled note (or the
-//!   nearest semitone when none are enabled).
+//! - Up to three clear candidates get a readout with the snapped note and
+//!   the "tune up / down by x" advice, snapping to the nearest enabled note
+//!   (or the nearest semitone when none are enabled). A note must stay clear
+//!   for the confirm time before it shows and lingers for the hold time
+//!   after it drops (see [`NoteHold`]), so letters don't flicker.
 //! - The spectrum is its own module now; in the stack (and the tuner's solo
 //!   page) the tuner draws on top of it when both are on.
 
@@ -12,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use egui::{Align2, Color32, FontId, Rect, Stroke, Ui, pos2, vec2};
 
+use super::note_hold::{NoteHold, Reading, Timing};
 use super::note_input::{NoteInput, Want, ease, note_db};
 use super::perf::Costs;
 use super::{Module, Shared};
@@ -40,12 +43,20 @@ const ABSORB_SEMIS: f32 = 1.2;
 const WEIGHT_TAU: f32 = 1.0;
 /// A track is drawn only once its weight reaches this (≈0.4 s of steady 0.6 clarity).
 const SHOW_WEIGHT: f32 = 0.2;
-/// The pick must be at least this clear for the note readout to show.
+/// A candidate must be at least this clear to count towards a readout.
 const SURE: f32 = 0.8;
 /// A non-picked candidate whose spectral level is this far below the
 /// loudest candidate's is a period-multiple (subharmonic) ghost of the
 /// autocorrelation.
 const GHOST_DB: f32 = 24.0;
+/// Detection ceiling: a quarter tone above E6 (≈1357 Hz). NSDF costs
+/// window × max lag, both proportional to the decimated rate, so cost goes
+/// with the square of the top frequency. With the default 8× oversample this
+/// is the highest semitone edge that still decimates by 4 at 44.1 and 48 kHz
+/// (needs top ≤ rate/32): 16× cheaper than an undecimated wide range, where
+/// a ~2 kHz cap would only decimate by 2 (4× cheaper). Fundamentals up to
+/// the top of a 24-fret guitar; spectra and waterfalls keep the full range.
+const TOP_MIDI: f32 = 88.5;
 /// Periods of each candidate the ghost check's DFT looks at.
 const GHOST_CYCLES: f32 = 24.0;
 
@@ -56,6 +67,10 @@ struct Params {
     method: Method,
     /// 0 = no smoothing, towards 1 = very slow.
     smoothing: f32,
+    /// A note must be clear this long before its readout shows.
+    confirm_ms: f32,
+    /// A readout lingers this long after its note drops out.
+    hold_ms: f32,
     a4: f32,
     /// Device tune-control units per semitone; calibrate against the
     /// outboard gear ("0.06 per ~6 cents" → 1.0).
@@ -83,12 +98,14 @@ impl Default for Params {
         Self {
             method: Method::Autocorrelation,
             smoothing: 0.8,
+            confirm_ms: 150.0,
+            hold_ms: 800.0,
             a4: 440.0,
             units_per_semitone: 1.0,
             notes: vec![false; 128],
             window_ms: 300.0,
             rate_hz: 50.0,
-            oversample: 10.0,
+            oversample: 8.0,
             gate_db: -90.0,
             base_midi: -1,
             enabled: Vec::new(),
@@ -100,6 +117,8 @@ impl Params {
     /// Pull loaded values back into the ranges the UI allows.
     fn sanitize(&mut self) {
         self.smoothing = self.smoothing.clamp(0.0, 0.98);
+        self.confirm_ms = self.confirm_ms.clamp(20.0, 1000.0);
+        self.hold_ms = self.hold_ms.clamp(0.0, 3000.0);
         self.a4 = self.a4.clamp(415.0, 466.0);
         self.units_per_semitone = self.units_per_semitone.clamp(0.01, 10.0);
         self.notes.resize(128, false);
@@ -125,6 +144,21 @@ impl Params {
             rate_hz: self.rate_hz,
             oversample: self.oversample,
             a4: self.a4,
+            max_midi: TOP_MIDI,
+        }
+    }
+
+    fn timing(&self) -> Timing {
+        // `smoothing` is a per-analysis factor; as a time constant:
+        let glide = if self.smoothing > 0.0 {
+            -1.0 / (self.rate_hz * self.smoothing.ln())
+        } else {
+            0.0
+        };
+        Timing {
+            confirm: self.confirm_ms / 1000.0,
+            hold: self.hold_ms / 1000.0,
+            glide,
         }
     }
 }
@@ -167,8 +201,7 @@ pub struct Tuner {
 
     // Display state, eased per frame.
     tracks: Vec<Track>,
-    readout: f32,
-    shown_midi: f32,
+    readings: NoteHold,
 
     costs: Costs,
 }
@@ -218,16 +251,18 @@ impl Module for Tuner {
     }
 
     fn update(&mut self, shared: &mut Shared) {
-        let Some(w) = self.input.next(shared, &self.p.want(), &mut self.costs) else {
+        let want = self.p.want();
+        let Some(w) = self.input.next(shared, &want, &mut self.costs) else {
             return;
         };
         let (y, r) = (&w.y, w.rate);
         self.level_db = w.level_db;
         let (lo, hi) = self.input.analysed.span();
+        let hi = want.top(hi);
         let a4 = self.p.a4;
         let (f_lo, f_hi) = (
             pitch::midi_to_freq(lo - 0.5, a4),
-            pitch::midi_to_freq(hi + 0.5, a4),
+            pitch::midi_to_freq(want.top(hi + 0.5), a4),
         );
         let c = if self.level_db < self.p.gate_db {
             self.costs.skip(1);
@@ -294,6 +329,19 @@ impl Module for Tuner {
                 }
             });
         ui.add(egui::Slider::new(&mut self.p.smoothing, 0.0..=0.98).text("smoothing"));
+        ui.add(
+            egui::Slider::new(&mut self.p.confirm_ms, 20.0..=1000.0)
+                .logarithmic(true)
+                .suffix(" ms")
+                .text("confirm"),
+        )
+        .on_hover_text("A note must stay clear this long before its readout shows");
+        ui.add(
+            egui::Slider::new(&mut self.p.hold_ms, 0.0..=3000.0)
+                .suffix(" ms")
+                .text("hold"),
+        )
+        .on_hover_text("A readout lingers this long after its note drops out");
         ui.add(
             egui::Slider::new(&mut self.p.window_ms, 60.0..=1000.0)
                 .logarithmic(true)
@@ -447,17 +495,15 @@ impl Tuner {
         }
         self.tracks.retain(|t| t.weight > 0.01 || t.alpha > 0.004);
 
-        let sure = self.midi.is_some() && self.pick_clarity >= SURE;
-        if let (true, Some(m)) = (sure, self.midi) {
-            self.shown_midi = m;
-        }
-        let want = if sure { level } else { 0.0 };
-        self.readout += (want - self.readout)
-            * if want > self.readout {
-                ease(dt, 0.2)
-            } else {
-                ease(dt, 0.6)
-            };
+
+        let clear: Vec<(f32, f32)> = self
+            .raw
+            .iter()
+            .filter(|&&(_, cl, _)| cl >= SURE)
+            .map(|&(m, cl, _)| (m, cl))
+            .collect();
+        let targets = self.enabled_notes();
+        self.readings.step(dt, &clear, &targets, &self.p.timing());
     }
 
     fn paint(&mut self, ui: &mut Ui, rect: Rect, shared: &Shared, draw: Draw) {
@@ -480,15 +526,12 @@ impl Tuner {
             Draw::Layer => {}
         }
 
-        // Target note of the readout, faint, under the lines.
-        let target = pitch::snap(self.shown_midi, self.enabled_notes());
-        if let Some((n, _)) = target
-            && self.readout > 0.01
-        {
+        // Target notes of the readouts, faint, under the lines.
+        for r in self.readings.visible() {
             painter.vline(
-                x_of(n as f32),
+                x_of(r.note as f32),
                 plot.y_range(),
-                Stroke::new(2.0, theme::GOOD.gamma_multiply(0.25 * self.readout)),
+                Stroke::new(2.0, theme::GOOD.gamma_multiply(0.25 * r.alpha)),
             );
         }
 
@@ -528,76 +571,104 @@ impl Tuner {
             );
         }
 
-        // ---- readout ------------------------------------------------------
-        if labelled
-            && self.readout > 0.01
-            && let Some((n, cents)) = target
-        {
-            let a = self.readout;
-            let in_tune = cents.abs() < 3.0;
-            let col = if in_tune {
-                theme::GOOD
-            } else {
-                theme::ACCENT_BRIGHT
+        // ---- readouts ----------------------------------------------------
+        if labelled {
+            let hold = self.p.hold_ms / 1000.0;
+            for r in self.readings.visible() {
+                self.paint_reading(&painter, plot, r, hold);
             }
-            .gamma_multiply(a);
-            let dim = Color32::from_gray(170).gamma_multiply(a);
-            let units = cents / 100.0 * self.p.units_per_semitone;
-            let (advice, arrow) = if in_tune {
-                ("in tune".to_owned(), None)
-            } else if cents > 0.0 {
-                (format!("down {:.2}", units.abs()), Some(Dir::Down))
-            } else {
-                (format!("up {:.2}", units.abs()), Some(Dir::Up))
-            };
-            let hz = pitch::midi_to_freq(self.shown_midi, self.p.a4);
-
-            let w = 176.0;
-            let panel = Rect::from_min_size(
-                pos2(plot.right() - w - 8.0, plot.top() + 6.0),
-                vec2(w, 64.0),
-            );
-            painter.rect_filled(panel, 2.0, Color32::from_black_alpha((150.0 * a) as u8));
-            painter.text(
-                panel.left_top() + vec2(8.0, 4.0),
-                Align2::LEFT_TOP,
-                pitch::note_name(n),
-                FontId::proportional(26.0),
-                col,
-            );
-            let advice_rect = painter.text(
-                panel.right_top() + vec2(-8.0, 6.0),
-                Align2::RIGHT_TOP,
-                &advice,
-                FontId::proportional(14.0),
-                col,
-            );
-            if let Some(dir) = arrow {
-                let c = pos2(advice_rect.left() - 9.0, advice_rect.center().y);
-                icons::triangle(&painter, c, dir, 4.5, col);
-            }
-            painter.text(
-                panel.right_top() + vec2(-8.0, 24.0),
-                Align2::RIGHT_TOP,
-                format!("{cents:+.1}¢  {hz:.2} Hz"),
-                FontId::monospace(10.0),
-                dim,
-            );
-            // ±50 cent strip.
-            let strip =
-                Rect::from_min_size(panel.left_bottom() + vec2(8.0, -14.0), vec2(w - 16.0, 6.0));
-            painter.hline(
-                strip.x_range(),
-                strip.center().y,
-                Stroke::new(1.0, Color32::from_gray(70).gamma_multiply(a)),
-            );
-            painter.vline(
-                strip.center().x,
-                strip.y_range(),
-                Stroke::new(1.0, theme::GOOD.gamma_multiply(0.6 * a)),
-            );
-            let mx = strip.center().x + (cents / 50.0).clamp(-1.0, 1.0) * strip.width() / 2.0;
-            painter.circle_filled(pos2(mx, strip.center().y), 3.0, col);
         }
+    }
+
+    /// One readout panel, stacked top-right by its eased slot; slot 0 is big.
+    fn paint_reading(&self, painter: &egui::Painter, plot: Rect, r: &Reading, hold: f32) {
+        const W: f32 = 176.0;
+        const BIG: f32 = 64.0;
+        const SMALL: f32 = 36.0;
+        const GAP: f32 = 4.0;
+        let big = r.slot < 0.5;
+        let y = r.slot.min(1.0) * (BIG + GAP) + (r.slot - 1.0).max(0.0) * (SMALL + GAP);
+        let panel = Rect::from_min_size(
+            pos2(plot.right() - W - 8.0, plot.top() + 6.0 + y),
+            vec2(W, if big { BIG } else { SMALL }),
+        );
+        let a = r.alpha;
+        let cents = r.cents();
+        let in_tune = cents.abs() < 3.0;
+        let col = if in_tune {
+            theme::GOOD
+        } else {
+            theme::ACCENT_BRIGHT
+        }
+        .gamma_multiply(a);
+        let dim = Color32::from_gray(170).gamma_multiply(a);
+        let units = cents / 100.0 * self.p.units_per_semitone;
+        let (advice, arrow) = if in_tune {
+            ("in tune".to_owned(), None)
+        } else if cents > 0.0 {
+            (format!("down {:.2}", units.abs()), Some(Dir::Down))
+        } else {
+            (format!("up {:.2}", units.abs()), Some(Dir::Up))
+        };
+        let hz = pitch::midi_to_freq(r.midi, self.p.a4);
+        let (name_pt, advice_pt, detail_y) = if big {
+            (26.0, 14.0, 24.0)
+        } else {
+            (18.0, 12.0, 20.0)
+        };
+
+        painter.rect_filled(panel, 2.0, Color32::from_black_alpha((150.0 * a) as u8));
+        // Remaining hold, a shrinking line along the top once the note drops.
+        if !r.live {
+            let left = r.hold_left(hold);
+            painter.hline(
+                panel.left()..=panel.left() + panel.width() * left,
+                panel.top() + 0.5,
+                Stroke::new(1.0, dim),
+            );
+        }
+        painter.text(
+            panel.left_top() + vec2(8.0, 4.0),
+            Align2::LEFT_TOP,
+            pitch::note_name(r.note),
+            FontId::proportional(name_pt),
+            col,
+        );
+        let advice_rect = painter.text(
+            panel.right_top() + vec2(-8.0, 6.0),
+            Align2::RIGHT_TOP,
+            &advice,
+            FontId::proportional(advice_pt),
+            col,
+        );
+        if let Some(dir) = arrow {
+            let c = pos2(advice_rect.left() - 9.0, advice_rect.center().y);
+            icons::triangle(painter, c, dir, advice_pt * 0.32, col);
+        }
+        painter.text(
+            panel.right_top() + vec2(-8.0, detail_y),
+            Align2::RIGHT_TOP,
+            format!("{cents:+.1}¢  {hz:.2} Hz"),
+            FontId::monospace(10.0),
+            dim,
+        );
+        if !big {
+            return;
+        }
+        // ±50 cent strip.
+        let strip =
+            Rect::from_min_size(panel.left_bottom() + vec2(8.0, -14.0), vec2(W - 16.0, 6.0));
+        painter.hline(
+            strip.x_range(),
+            strip.center().y,
+            Stroke::new(1.0, Color32::from_gray(70).gamma_multiply(a)),
+        );
+        painter.vline(
+            strip.center().x,
+            strip.y_range(),
+            Stroke::new(1.0, theme::GOOD.gamma_multiply(0.6 * a)),
+        );
+        let mx = strip.center().x + (cents / 50.0).clamp(-1.0, 1.0) * strip.width() / 2.0;
+        painter.circle_filled(pos2(mx, strip.center().y), 3.0, col);
     }
 }

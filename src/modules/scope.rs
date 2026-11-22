@@ -64,7 +64,7 @@ struct Params {
 impl Default for Params {
     fn default() -> Self {
         Self {
-            mode: Mode::Trigger,
+            mode: Mode::Free,
             threshold: 0.3,
             holdoff_ms: 200.0,
             auto_reach_db: 6.0,
@@ -357,10 +357,19 @@ impl Module for Scope {
             self.crawl.manual = true;
         }
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.p.mode, Mode::Trigger, "Trigger");
-            ui.selectable_value(&mut self.p.mode, Mode::Auto, "Auto")
-                .on_hover_text("Trigger with the threshold following the hits: a bit under the last one, never under the average level. Free when nothing stands out.");
-            ui.selectable_value(&mut self.p.mode, Mode::Free, "Free");
+            ui.label("mode");
+            egui::ComboBox::from_id_salt("scope_mode")
+                .selected_text(match self.p.mode {
+                    Mode::Free => "Free",
+                    Mode::Trigger => "Trigger",
+                    Mode::Auto => "Auto",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.p.mode, Mode::Free, "Free");
+                    ui.selectable_value(&mut self.p.mode, Mode::Trigger, "Trigger");
+                    ui.selectable_value(&mut self.p.mode, Mode::Auto, "Auto")
+                        .on_hover_text("Trigger with the threshold following the hits: a bit under the last one, never under the average level. Free when nothing stands out.");
+                });
         });
         let auto_thr = self.threshold();
         let link = &mut self.link;

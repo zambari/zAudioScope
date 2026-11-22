@@ -2,12 +2,13 @@
 //! shared note range (log frequency, set in the bar above the status bar):
 //! rows are kept across the bar's whole span and the texture is cropped to
 //! the selection, so changing the range keeps the history. The handle on
-//! the right sets the scroll speed.
+//! the right sets the scroll speed; the dB rail beside it the colour scale.
 
 use egui::{Color32, ColorImage, Rect, TextureHandle, TextureOptions, Ui, pos2};
 
 use super::spectrum_rows::{BANDS, Key, Palette, Params, Rows, visible_bands};
 use super::{Module, Shared};
+use crate::ui::dynamic_range;
 use crate::ui::plot::{self, Axis, Edge, Link, Scale};
 
 /// Colour of rows not yet filled.
@@ -119,6 +120,7 @@ impl Module for Waterfall {
 
     fn graph(&mut self, ui: &mut Ui, rect: Rect, shared: &Shared) {
         self.paint(ui, rect, shared, true);
+        self.p.db.rail(ui, rect, "waterfall_db", shared);
     }
 
     fn layer_depth(&self) -> Option<u8> {
@@ -233,7 +235,11 @@ impl Waterfall {
         .grid(false)
         .draw(&painter, rect, plot::fmt_secs);
 
-        self.p
-            .fall_handle(ui, rect, "waterfall_fall", &mut self.link);
+        self.p.fall_handle(
+            ui,
+            dynamic_range::beside_rail(rect),
+            "waterfall_fall",
+            &mut self.link,
+        );
     }
 }

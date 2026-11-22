@@ -11,9 +11,11 @@
 
 use std::cell::Cell;
 
-use egui::{Rect, Response, Sense, Ui, vec2};
+use egui::{Align2, CursorIcon, FontId, Rect, Response, Sense, Stroke, Ui, pos2, vec2};
 use serde::{Deserialize, Serialize};
 
+use super::handle::{self, EdgeHandle};
+use super::plot::{self, Edge, Scale};
 use super::theme::{self, VU_CLIP, WAVE};
 use super::widgets::RangeSlider;
 use crate::audio::Frame;
@@ -154,6 +156,93 @@ impl DynamicRange {
         coverage_row(ui, r.rect, self.range, &shared.levels);
         r
     }
+
+    /// The same range as an on-graph rail overlaid on the right edge of
+    /// `rect` (see [`RAIL_W`]): a floor and a ceiling handle that can't
+    /// cross or come closer than [`MIN_GAP`], the band between them (drag
+    /// it to move both), and a dB scale over [`BOUNDS`] that fades in with
+    /// the handles. Draws nothing else, so the graph keeps its full width.
+    /// Call after the graph's own interactions so the handles win the hit
+    /// test; `id` must be unique per graph.
+    pub fn rail(&mut self, ui: &mut Ui, rect: Rect, id: &str, shared: &Shared) {
+        let hub = &shared.db;
+        self.sync(hub);
+        let rail = Rect::from_min_max(pos2(rect.right() - RAIL_W, rect.top()), rect.max);
+        let scale = Scale::linear(BOUNDS, (rail.bottom() - 6.0, rail.top() + 6.0));
+        let uid = ui.scope_id().with(id);
+        let vis = handle::reveal(ui, uid, rect, Edge::Right, false);
+        let painter = ui.painter_at(rail);
+        if vis > 0.02 {
+            painter.rect_filled(
+                rail,
+                0.0,
+                ui.visuals().extreme_bg_color.gamma_multiply(0.85 * vis),
+            );
+            for t in scale.ticks(22.0) {
+                let y = scale.px(t.value);
+                let x = rail.right() - BAND_W - 2.0;
+                painter.hline(
+                    x - 3.0..=x,
+                    y,
+                    Stroke::new(1.0, plot::TICK.gamma_multiply(vis)),
+                );
+                painter.text(
+                    pos2(x - 4.0, y),
+                    Align2::RIGHT_CENTER,
+                    format!("{:.0}", t.value),
+                    FontId::monospace(9.0),
+                    WAVE.gamma_multiply(0.8 * vis),
+                );
+            }
+        }
+
+        // Band between the handles; dragging it moves the whole range.
+        let band = Rect::from_x_y_ranges(
+            rail.right() - BAND_W..=rail.right(),
+            scale.px(self.range.ceil)..=scale.px(self.range.floor),
+        );
+        painter.rect_filled(band, 0.0, theme::ACCENT.gamma_multiply(0.2 + 0.25 * vis));
+        let body = ui
+            .interact(band, uid.with("band"), Sense::drag())
+            .on_hover_cursor(CursorIcon::Grab)
+            .on_hover_text("Drag to move the dB range · drag the ends to resize");
+        if body.dragged() {
+            let y = band.center().y;
+            let d = scale.value(y + body.drag_delta().y) - scale.value(y);
+            let d = d.clamp(BOUNDS.0 - self.range.floor, BOUNDS.1 - self.range.ceil);
+            self.range.floor += d;
+            self.range.ceil += d;
+        }
+
+        let fmt_floor = |v: f32| format!("floor {v:.0} dB");
+        let fmt_ceil = |v: f32| format!("ceiling {v:.0} dB");
+        let DbRange { floor, ceil } = &mut self.range;
+        let top = *ceil - MIN_GAP;
+        EdgeHandle::new((id, "floor"), Edge::Right, scale, floor)
+            .clamp(BOUNDS.0, top)
+            .reset(BOUNDS.0)
+            .label(&fmt_floor)
+            .show(ui, rect);
+        let bottom = *floor + MIN_GAP;
+        EdgeHandle::new((id, "ceil"), Edge::Right, scale, ceil)
+            .clamp(bottom, BOUNDS.1)
+            .reset(BOUNDS.1)
+            .label(&fmt_ceil)
+            .show(ui, rect);
+        if self.locked {
+            hub.set(self.range);
+        }
+    }
+}
+
+/// Width of the strip [`DynamicRange::rail`] overlays on a graph's right edge, px.
+pub const RAIL_W: f32 = 30.0;
+/// Width of the floor-to-ceiling band at the rail's outer edge, px.
+const BAND_W: f32 = 9.0;
+
+/// `rect` short of the rail, for other handles sharing the right edge.
+pub fn beside_rail(rect: Rect) -> Rect {
+    Rect::from_min_max(rect.min, pos2(rect.right() - RAIL_W, rect.bottom()))
 }
 
 /// Peak-hold decay, dB per second.

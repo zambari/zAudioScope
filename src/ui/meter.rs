@@ -7,8 +7,17 @@ use egui::{Color32, Rect, Shape, Stroke, Ui, pos2, vec2};
 use super::theme;
 use crate::audio::Input;
 
-/// Gain slider top: +12 dB.
+/// Monitor gain slider top: +12 dB.
 pub const GAIN_MAX: f32 = 4.0;
+
+/// Input gain slider top: +18 dB.
+pub const INPUT_GAIN_MAX: f32 = 8.0;
+
+/// Slider width of the input gain (150% of the monitor's 80 px).
+const INPUT_GAIN_WIDTH: f32 = 120.0;
+
+/// Fixed width of the gain readout, so the bar doesn't jitter as the value changes.
+const GAIN_LABEL_WIDTH: f32 = 64.0;
 
 /// Input peaks below this count as quiet.
 pub const NO_SIGNAL_DB: f32 = -48.0;
@@ -51,11 +60,12 @@ impl Meter {
 
     /// Gain slider and meter.
     pub fn show(&mut self, ui: &mut Ui, input: &Input, gain: &mut f32) {
-        gain_slider(ui, gain, |db| {
+        gain_slider(ui, gain, INPUT_GAIN_MAX, INPUT_GAIN_WIDTH, |db| {
             format!(
                 "Input gain {db} (ahead of every analyser and the trigger). Tick marks 0 dB; double-click to reset to it"
             )
         });
+        gain_readout(ui, *gain);
         input.set_gain(*gain);
         self.levels(ui, input.take_peaks(), "Input level after gain");
     }
@@ -146,16 +156,18 @@ impl Meter {
     }
 }
 
-/// Gain 0..+12 dB. Tick marks at unity; double-click resets to it.
+/// Gain 0..`max` (linear). Tick marks at unity; double-click resets to it.
 /// `hover` gets the gain as text ("+3.0 dB", "off").
 pub fn gain_slider(
     ui: &mut Ui,
     gain: &mut f32,
+    max: f32,
+    width: f32,
     hover: impl FnOnce(&str) -> String,
 ) -> egui::Response {
-    ui.spacing_mut().slider_width = 80.0;
+    ui.spacing_mut().slider_width = width;
     let r = ui.add(
-        egui::Slider::new(gain, 0.0..=GAIN_MAX)
+        egui::Slider::new(gain, 0.0..=max)
             .show_value(false)
             .trailing_fill(true),
     );
@@ -164,7 +176,7 @@ pub fn gain_slider(
     {
         let rect = r.rect;
         let inset = rect.height() / 2.5;
-        let x = rect.left() + inset + (rect.width() - 2.0 * inset) / GAIN_MAX;
+        let x = rect.left() + inset + (rect.width() - 2.0 * inset) / max;
         let stroke = Stroke::new(1.0, ui.visuals().weak_text_color());
         let p = ui.painter();
         p.line_segment([pos2(x, rect.top()), pos2(x, rect.top() + 3.0)], stroke);
@@ -184,6 +196,20 @@ pub fn gain_slider(
         r.mark_changed();
     }
     r
+}
+
+/// The gain in dB as a fixed-width label, e.g. "+3.0 dB" or "off".
+pub fn gain_readout(ui: &mut Ui, gain: f32) {
+    let db = to_db(gain);
+    let text = if db.is_finite() {
+        format!("{db:+.1} dB")
+    } else {
+        "off".to_owned()
+    };
+    ui.add_sized(
+        [GAIN_LABEL_WIDTH, ui.spacing().interact_size.y],
+        egui::Label::new(egui::RichText::new(text).monospace()),
+    );
 }
 
 /// Goniometer (mid up, side across) scaled so side spans the strip's

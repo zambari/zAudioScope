@@ -96,9 +96,17 @@ pub struct Want {
     /// Decimated rate vs the top note.
     pub oversample: f32,
     pub a4: f32,
+    /// Ceiling (fractional MIDI) on the analysed band, whatever the shared
+    /// range shows. The decimated rate, and so the analysis cost, follows it.
+    pub max_midi: f32,
 }
 
 impl Want {
+    /// `midi` held to the analysis ceiling.
+    pub fn top(&self, midi: f32) -> f32 {
+        midi.min(self.max_midi)
+    }
+
     /// Samples of input needed at `rate`: the window plus the filter span.
     pub fn lookback(&self, rate: u32) -> usize {
         (self.window_ms / 1000.0 * rate as f32) as usize + MAX_TAPS
@@ -149,7 +157,7 @@ impl NoteInput {
         self.last = Some(key);
         self.analysed = range;
 
-        let f_hi = pitch::midi_to_freq(range.span().1 + 0.5, want.a4);
+        let f_hi = pitch::midi_to_freq(want.top(range.span().1 + 0.5), want.a4);
         let factor = Decimator::factor_for(rate, f_hi, want.oversample);
         if !self
             .decim

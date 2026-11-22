@@ -55,6 +55,8 @@ fn heat_colour(level: f32) -> Color32 {
 struct Params {
     db: DynamicRange,
     colour: Colour,
+    /// Stroke the outline of the curve (in either colour mode).
+    line: bool,
     /// Longest stretch of input analysed.
     window_ms: f32,
     // ---- performance ----
@@ -74,11 +76,12 @@ impl Default for Params {
         Self {
             db: DynamicRange::default(),
             colour: Colour::default(),
+            line: true,
             window_ms: 300.0,
             rate_hz: 50.0,
-            steps: 12,
+            steps: 8,
             max_cycles: 48.0,
-            oversample: 10.0,
+            oversample: 6.0,
             gate_db: -90.0,
         }
     }
@@ -101,6 +104,7 @@ impl Params {
             rate_hz: self.rate_hz,
             oversample: self.oversample,
             a4: A4,
+            max_midi: f32::INFINITY,
         }
     }
 }
@@ -196,23 +200,15 @@ impl NoteSpectrum {
             mesh.add_triangle(b, a + 1, b + 1);
         }
         painter.add(Shape::mesh(mesh));
-        if heat_on {
-            // Segment by segment, coloured by the louder end; quiet ones are skipped.
-            for (w, lv) in pts.windows(2).zip(levels.windows(2)) {
-                let lv = lv[0].max(lv[1]);
-                if heat_ramp(lv) > 0.0 {
-                    painter.line_segment(
-                        [w[0], w[1]],
-                        Stroke::new(1.2, heat_colour(lv).gamma_multiply(0.9)),
-                    );
-                }
-            }
-        } else {
-            painter.add(Shape::line(
-                pts,
-                Stroke::new(1.2, theme::WAVE.gamma_multiply(0.85)),
-            ));
+        if !self.p.line {
+            return;
         }
+        // The outline is always the plain line colour: in heat mode the
+        // ramp matches the body behind it and the line disappears.
+        painter.add(Shape::line(
+            pts,
+            Stroke::new(1.2, theme::WAVE.gamma_multiply(0.85)),
+        ));
     }
 }
 
@@ -277,9 +273,18 @@ impl Module for NoteSpectrum {
         self.p.db.ui(ui, shared);
         ui.horizontal(|ui| {
             ui.label("colour");
-            ui.selectable_value(&mut self.p.colour, Colour::Wave, "wave");
-            ui.selectable_value(&mut self.p.colour, Colour::Heat, "heat")
-                .on_hover_text("Impulse-style ramp; quiet levels below a third of the range go transparent, dB lines included");
+            egui::ComboBox::from_id_salt("note_spectrum_colour")
+                .selected_text(match self.p.colour {
+                    Colour::Wave => "wave",
+                    Colour::Heat => "heat",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.p.colour, Colour::Wave, "wave");
+                    ui.selectable_value(&mut self.p.colour, Colour::Heat, "heat")
+                        .on_hover_text("Impulse-style ramp; quiet levels below a third of the range go transparent, dB lines included");
+                });
+            ui.checkbox(&mut self.p.line, "line")
+                .on_hover_text("Draw the outline of the curve");
         });
         ui.add(
             egui::Slider::new(&mut self.p.window_ms, 60.0..=1000.0)
@@ -319,6 +324,7 @@ impl Module for NoteSpectrum {
 
     fn graph(&mut self, ui: &mut Ui, rect: Rect, shared: &Shared) {
         self.paint(ui, rect, shared, true);
+        self.p.db.rail(ui, rect, "graph_db", shared);
     }
 
     fn layer_depth(&self) -> Option<u8> {
