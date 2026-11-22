@@ -87,6 +87,21 @@ impl Candidates {
     }
 }
 
+/// Dot product with 8 independent running sums. A plain `zip().sum()` must
+/// add in order (float addition isn't associative), which keeps it scalar;
+/// separate lanes let the compiler use SIMD, ~8× faster for the NSDF.
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    let mut s = [0f32; 8];
+    let (ca, cb) = (a.chunks_exact(8), b.chunks_exact(8));
+    let tail: f32 = ca.remainder().iter().zip(cb.remainder()).map(|(x, y)| x * y).sum();
+    for (p, q) in ca.zip(cb) {
+        for k in 0..8 {
+            s[k] += p[k] * q[k];
+        }
+    }
+    s.iter().sum::<f32>() + tail
+}
+
 /// Normalized square difference (McLeod). Each positive lobe of the curve
 /// contributes its maximum, refined by parabolic interpolation; the pick is
 /// the first one close to the global best, which avoids octave errors.
@@ -110,7 +125,7 @@ pub fn candidates(x: &[f32], rate: u32, f_min: f32, f_max: f32) -> Candidates {
             if tau > 0 {
                 m -= x[n - tau] * x[n - tau] + x[tau - 1] * x[tau - 1];
             }
-            let acf: f32 = x[..n - tau].iter().zip(&x[tau..]).map(|(a, b)| a * b).sum();
+            let acf = dot(&x[..n - tau], &x[tau..]);
             if m > 0.0 { 2.0 * acf / m } else { 0.0 }
         })
         .collect();
@@ -200,5 +215,48 @@ mod tests {
     fn names() {
         assert_eq!(note_name(69), "A4");
         assert_eq!(note_name(28), "E1");
+    }
+}
+
+/// Baseline cost of the NSDF at realistic sizes, to judge whether moving it
+/// elsewhere (GPU, FFT) is worth it. Run with
+/// `cargo test --release bench_nsdf -- --ignored --nocapture`.
+#[cfg(test)]
+mod bench {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    #[ignore]
+    fn bench_nsdf() {
+        for (rate, window_ms) in [(12_000, 300.0), (12_000, 1000.0), (48_000, 300.0), (48_000, 1000.0)] {
+            let n = (rate as f32 * window_ms / 1000.0) as usize;
+            let x: Vec<f32> = (0..n)
+                .map(|i| (std::f32::consts::TAU * 41.2 * i as f32 / rate as f32).sin() * 0.5)
+                .collect();
+            let runs = 50;
+            let t = Instant::now();
+            for _ in 0..runs {
+                std::hint::black_box(candidates(std::hint::black_box(&x), rate, 30.0, 1357.0));
+            }
+            let us = t.elapsed().as_secs_f64() * 1e6 / runs as f64;
+            let lags = (rate as f32 / 30.0).ceil() as usize;
+            // The bare lag sweep with the old scalar dot product, for comparison.
+            let t = Instant::now();
+            for _ in 0..runs {
+                let x = std::hint::black_box(&x);
+                let mut acc = 0f32;
+                for tau in 0..=lags {
+                    acc += x[..n - tau].iter().zip(&x[tau..]).map(|(a, b)| a * b).sum::<f32>();
+                }
+                std::hint::black_box(acc);
+            }
+            let scalar_us = t.elapsed().as_secs_f64() * 1e6 / runs as f64;
+            println!(
+                "rate {rate:>6} window {window_ms:>5} ms: n={n:>6} lags={lags:>5} -> {us:>9.1} µs ({:.2} GMAC/s)",
+                (n * lags) as f64 / us / 1e3
+            );
+            println!("    old scalar sweep:   {scalar_us:>9.1} µs ({:.1}x slower)", scalar_us / us);
+        }
     }
 }

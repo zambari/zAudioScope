@@ -27,7 +27,7 @@ const MAX_ROWS_PER_FRAME: usize = 16;
 const MAX_CATCHUP_MS: f32 = 400.0;
 const ROWS: (usize, usize) = (20, 600);
 /// FFT sizes offered as (2^n, label).
-const FFT_SIZES: &[(u32, &str)] = &[(12, "low"), (14, "medium"), (16, "ultra")];
+const FFT_SIZES: &[(u32, &str)] = &[(12, "low"), (14, "medium"), (18, "high")];
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Key {

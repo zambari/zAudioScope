@@ -6,13 +6,14 @@
 
 use egui::{Align2, Color32, Mesh, Pos2, Rect, Stroke, Ui, pos2, vec2};
 
-use super::spectrum_rows::{self, BANDS, Key, Params, Rows, heat};
+use super::spectrum_rows::{self, Added, BANDS, Key, Params, Rows, heat};
 use super::{Module, Shared};
 use crate::ui::dynamic_range;
 use crate::ui::noterange::NoteRange;
 use crate::ui::plot::{self, Edge, Link, Scale};
 use crate::ui::theme;
 use crate::ui::widgets::RangeSlider;
+use crate::worker::Latest;
 
 /// Mouse rotation around the default camera, in degrees.
 const ROTATION_LIMIT: f32 = 60.0;
@@ -56,8 +57,15 @@ pub struct Impulse {
     /// Temporal smoothing across layers (per band, never across bands): 0 = raw,
     /// 1 = a heavy, slowly waving blanket.
     time_smooth: f32,
-    /// Scratch for the smoothed layers, reused every frame.
+    /// Smooths snapshots of the history off the UI thread; alive only
+    /// while `time_smooth` is on. Eye candy, so a frame of lag is fine.
+    smoother: Option<Latest<SmoothJob, Vec<Vec<f32>>>>,
+    /// Newest smoothed layers, drawn instead of the raw history.
     smoothed: Vec<Vec<f32>>,
+    /// The previous result's buffers, refilled for the next snapshot.
+    spare: Vec<Vec<f32>>,
+    /// (strength, layers) of the last snapshot sent, to resend on change.
+    sent: Option<(f32, usize)>,
     rows: Rows,
     link: Link<Key>,
 }
@@ -77,7 +85,10 @@ impl Default for Impulse {
             line_opacity: 1.0,
             pan: (0.0, 0.0),
             time_smooth: 0.0,
+            smoother: None,
             smoothed: Vec::new(),
+            spare: Vec::new(),
+            sent: None,
             rows: Rows::default(),
             link: Link::default(),
         }
@@ -166,7 +177,8 @@ impl Module for Impulse {
     fn update(&mut self, shared: &mut Shared) {
         self.p.db.sync(&shared.db);
         self.apply_window();
-        self.rows.update(&self.p, shared);
+        let added = self.rows.update(&self.p, shared);
+        self.queue_smoothing(&added);
     }
 
     fn params(&mut self, ui: &mut Ui, shared: &Shared) {
@@ -342,14 +354,9 @@ impl Module for Impulse {
         let step = (((hi - lo) as f32 * POINT_PX / plane_w).ceil() as usize).max(1);
 
         let total = self.p.rows.max(2);
-        smooth_time(
-            &self.rows.history,
-            self.time_smooth,
-            total,
-            &mut self.smoothed,
-        );
-        let source: Vec<&[f32]> = if self.time_smooth > 0.0 {
-            self.smoothed.iter().map(Vec::as_slice).collect()
+        // Smoothed layers lag the history by a frame or so; raw until the first arrives.
+        let source: Vec<&[f32]> = if self.time_smooth > 0.0 && !self.smoothed.is_empty() {
+            self.smoothed.iter().take(total).map(Vec::as_slice).collect()
         } else {
             self.rows.history.iter().map(Vec::as_slice).collect()
         };
@@ -542,6 +549,50 @@ impl Impulse {
         self.p.rows = layers;
         self.p.row_ms = self.window_ms / (layers - 1) as f32;
     }
+
+    /// Collect the newest smoothed layers and, when the history or the
+    /// strength changed, send the worker a fresh snapshot of it.
+    fn queue_smoothing(&mut self, added: &Added) {
+        if self.time_smooth <= 0.0 {
+            // Dropping the worker ends its thread.
+            self.smoother = None;
+            self.smoothed.clear();
+            self.sent = None;
+            return;
+        }
+        let worker = self.smoother.get_or_insert_with(|| {
+            Latest::spawn("impulse smooth", |mut job: SmoothJob| {
+                smooth_time(&mut job.rows, job.strength, job.total);
+                job.rows
+            })
+        });
+        if let Some(done) = worker.take() {
+            self.spare = std::mem::replace(&mut self.smoothed, done);
+        }
+        let key = (self.time_smooth, self.p.rows.max(2));
+        if added.rows == 0 && !added.cleared && self.sent == Some(key) {
+            return;
+        }
+        self.sent = Some(key);
+        let history = &self.rows.history;
+        let mut rows = std::mem::take(&mut self.spare);
+        rows.resize_with(history.len(), Vec::new);
+        for (dst, src) in rows.iter_mut().zip(history) {
+            dst.clone_from(src);
+        }
+        worker.submit(SmoothJob {
+            rows,
+            strength: key.0,
+            total: key.1,
+        });
+    }
+}
+
+/// A snapshot of the history (newest first) to smooth in place.
+struct SmoothJob {
+    rows: Vec<Vec<f32>>,
+    strength: f32,
+    total: usize,
 }
 
 /// Emit a run of connected points as one polyline (if it has a segment), then clear it.
@@ -553,7 +604,7 @@ fn push_run(out: &mut Vec<egui::Shape>, run: &mut Vec<Pos2>, stroke: Stroke) {
     }
 }
 
-/// Zero-phase temporal smoothing of `history` into `out`: per band, a one-pole
+/// Zero-phase temporal smoothing of `rows` in place: per band, a one-pole
 /// low-pass runs forward then backward across the layers (twice, for a
 /// near-Gaussian kernel). Cost is linear in layers × bands whatever the
 /// strength. The time constant is relative to the stack size, so the blanket
@@ -562,22 +613,12 @@ fn push_run(out: &mut Vec<egui::Shape>, run: &mut Vec<Pos2>, stroke: Stroke) {
 /// widens `tau_max` and lowers `p`, so the growth bends towards the front:
 /// ~0.3 gets blurry from about half, ~0.7 keeps detail only in the first few
 /// layers, 1 falls off steeply into the blanket.
-fn smooth_time(
-    history: &std::collections::VecDeque<Vec<f32>>,
-    strength: f32,
-    total: usize,
-    out: &mut Vec<Vec<f32>>,
-) {
-    if strength <= 0.0 {
-        return;
+fn smooth_time(rows: &mut [Vec<f32>], strength: f32, total: usize) {
+    for db in rows.iter_mut().flatten() {
+        *db = db.max(-200.0);
     }
-    let n = history.len();
-    out.resize_with(n, Vec::new);
-    for (dst, src) in out.iter_mut().zip(history) {
-        dst.clear();
-        dst.extend(src.iter().map(|&db| db.max(-200.0)));
-    }
-    if n < 2 {
+    let n = rows.len();
+    if strength <= 0.0 || n < 2 {
         return;
     }
     // Perceived blur is roughly logarithmic in the kernel width, so the
@@ -596,17 +637,24 @@ fn smooth_time(
             (1.0 + 4.0 * sigma * sigma).sqrt()
         })
         .collect();
-    let bands = out[0].len();
+    let bands = rows[0].len();
     let mut prefix = vec![0.0f32; (n + 1) * bands];
+    let mut fresh = vec![0.0f32; n * bands];
     for _ in 0..3 {
-        box_pass(out, &width, &mut prefix, bands);
+        box_pass(rows, &width, &mut prefix, &mut fresh, bands);
     }
 }
 
 /// One variable-width box blur along time, per band. Each row is a unit cell
 /// [i, i+1); row i becomes the mean over [i+½−w/2, i+½+w/2] (clamped to the
 /// stack), with fractional edges so the width varies smoothly.
-fn box_pass(rows: &mut [Vec<f32>], width: &[f32], prefix: &mut [f32], bands: usize) {
+fn box_pass(
+    rows: &mut [Vec<f32>],
+    width: &[f32],
+    prefix: &mut [f32],
+    fresh: &mut [f32],
+    bands: usize,
+) {
     let n = rows.len();
     for (i, row) in rows.iter().enumerate() {
         let (done, rest) = prefix.split_at_mut((i + 1) * bands);
@@ -620,17 +668,14 @@ fn box_pass(rows: &mut [Vec<f32>], width: &[f32], prefix: &mut [f32], bands: usi
         let k = (x.floor() as usize).min(n - 1);
         prefix[k * bands + b] + (x - k as f32) * rows[k][b]
     };
-    let mut fresh = vec![0.0f32; bands];
-    let mut out: Vec<Vec<f32>> = Vec::with_capacity(n);
-    for (i, &w) in width.iter().enumerate() {
+    for (i, (&w, out)) in width.iter().zip(fresh.chunks_exact_mut(bands)).enumerate() {
         let c = i as f32 + 0.5;
         let (a, b) = ((c - 0.5 * w).max(0.0), (c + 0.5 * w).min(n as f32));
-        for (band, f) in fresh.iter_mut().enumerate() {
+        for (band, f) in out.iter_mut().enumerate() {
             *f = (integral(rows, b, band) - integral(rows, a, band)) / (b - a);
         }
-        out.push(fresh.clone());
     }
-    for (dst, src) in rows.iter_mut().zip(out) {
-        *dst = src;
+    for (dst, src) in rows.iter_mut().zip(fresh.chunks_exact(bands)) {
+        dst.copy_from_slice(src);
     }
 }
