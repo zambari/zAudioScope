@@ -87,7 +87,9 @@ impl KeyGlow {
             self.keys.iter_mut().for_each(|k| Self::release(k, now));
         }
         // Cap the step so a stalled frame doesn't jump.
-        let dt = self.last_t.map_or(0.0, |t| (now - t).clamp(0.0, 0.25) as f32);
+        let dt = self
+            .last_t
+            .map_or(0.0, |t| (now - t).clamp(0.0, 0.25) as f32);
         self.last_t = Some(now);
         let cool = (-dt / HEAT_TAU_S).exp();
         let mut lit = false;
@@ -98,7 +100,11 @@ impl KeyGlow {
             } else {
                 k.heat * AFTERGLOW
             };
-            let tau = if k.held || target > k.level { ATTACK_S } else { k.release_s.max(RELEASE_MIN_S) };
+            let tau = if k.held || target > k.level {
+                ATTACK_S
+            } else {
+                k.release_s.max(RELEASE_MIN_S)
+            };
             k.level += (target - k.level) * (1.0 - (-dt / tau).exp());
             if k.level < DARK && !k.held {
                 k.level = 0.0;

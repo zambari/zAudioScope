@@ -24,12 +24,20 @@ const SIZE: f32 = 9.0;
 pub fn reveal(ui: &Ui, id: Id, rect: Rect, edge: Edge, force: bool) -> f32 {
     let zone = match edge {
         Edge::Left => Rect::from_x_y_ranges(rect.left() - 8.0..=rect.left() + ZONE, rect.y_range()),
-        Edge::Right => Rect::from_x_y_ranges(rect.right() - ZONE..=rect.right() + 8.0, rect.y_range()),
+        Edge::Right => {
+            Rect::from_x_y_ranges(rect.right() - ZONE..=rect.right() + 8.0, rect.y_range())
+        }
         Edge::Top => Rect::from_x_y_ranges(rect.x_range(), rect.top() - 8.0..=rect.top() + ZONE),
-        Edge::Bottom => Rect::from_x_y_ranges(rect.x_range(), rect.bottom() - ZONE..=rect.bottom() + 8.0),
+        Edge::Bottom => {
+            Rect::from_x_y_ranges(rect.x_range(), rect.bottom() - ZONE..=rect.bottom() + 8.0)
+        }
     };
-    let near = force || ui.input(|i| i.pointer.hover_pos()).is_some_and(|p| zone.contains(p));
-    ui.ctx().animate_bool_with_time(id.with("reveal"), near, 0.18)
+    let near = force
+        || ui
+            .input(|i| i.pointer.hover_pos())
+            .is_some_and(|p| zone.contains(p));
+    ui.ctx()
+        .animate_bool_with_time(id.with("reveal"), near, 0.18)
 }
 
 pub struct EdgeHandle<'a> {
@@ -46,8 +54,23 @@ pub struct EdgeHandle<'a> {
 
 impl<'a> EdgeHandle<'a> {
     /// `scale` maps the value onto pixels along `edge` (y for left/right).
-    pub fn new(id_salt: impl Hash + std::fmt::Debug, edge: Edge, scale: Scale, value: &'a mut f32) -> Self {
-        Self { salt: Id::NULL.with(id_salt), edge, scale, value, clamp: None, label: None, color: theme::HANDLE, guide: true, reset: None }
+    pub fn new(
+        id_salt: impl Hash + std::fmt::Debug,
+        edge: Edge,
+        scale: Scale,
+        value: &'a mut f32,
+    ) -> Self {
+        Self {
+            salt: Id::NULL.with(id_salt),
+            edge,
+            scale,
+            value,
+            clamp: None,
+            label: None,
+            color: theme::HANDLE,
+            guide: true,
+            reset: None,
+        }
     }
 
     /// Allowed values; defaults to the scale's range.
@@ -87,9 +110,18 @@ impl<'a> EdgeHandle<'a> {
         let n = edge.inward();
         let tip_at = |v: f32| edge.point(rect, scale.px(v).clamp(span.min, span.max));
 
-        let hit = Rect::from_center_size(tip_at(*self.value) + n * (SIZE * 0.5), vec2(SIZE + 8.0, SIZE + 8.0));
-        let cursor = if edge.vertical() { CursorIcon::ResizeVertical } else { CursorIcon::ResizeHorizontal };
-        let mut resp = ui.interact(hit, id, Sense::click_and_drag()).on_hover_cursor(cursor);
+        let hit = Rect::from_center_size(
+            tip_at(*self.value) + n * (SIZE * 0.5),
+            vec2(SIZE + 8.0, SIZE + 8.0),
+        );
+        let cursor = if edge.vertical() {
+            CursorIcon::ResizeVertical
+        } else {
+            CursorIcon::ResizeHorizontal
+        };
+        let mut resp = ui
+            .interact(hit, id, Sense::click_and_drag())
+            .on_hover_cursor(cursor);
         let (lo, hi) = self.clamp.unwrap_or_else(|| scale.range());
         if resp.dragged()
             && let Some(p) = resp.interact_pointer_pos()
@@ -111,10 +143,18 @@ impl<'a> EdgeHandle<'a> {
         let vis = reveal(ui, id, rect, edge, active);
         let tip = tip_at(*self.value);
         let painter = ui.painter_at(rect);
-        let color = if active { self.color } else { self.color.gamma_multiply(0.8) };
+        let color = if active {
+            self.color
+        } else {
+            self.color.gamma_multiply(0.8)
+        };
 
         if self.guide && active && !edge.vertical() {
-            let s = Stroke::new(1.0, self.color.gamma_multiply(if resp.dragged() { 0.5 } else { 0.3 }));
+            let s = Stroke::new(
+                1.0,
+                self.color
+                    .gamma_multiply(if resp.dragged() { 0.5 } else { 0.3 }),
+            );
             painter.vline(edge.along(tip), rect.y_range(), s);
         }
         let side = vec2(-n.y, n.x) * (SIZE * 0.6);
@@ -135,7 +175,14 @@ impl<'a> EdgeHandle<'a> {
             };
             let a = vis * if active { 1.0 } else { 0.75 };
             let c = Color32::from_rgb(255, 214, 205).gamma_multiply(a);
-            plot::tag(&painter, rect.shrink(1.0), tip + n * (SIZE + 3.0), anchor, fmt(*self.value), c);
+            plot::tag(
+                &painter,
+                rect.shrink(1.0),
+                tip + n * (SIZE + 3.0),
+                anchor,
+                fmt(*self.value),
+                c,
+            );
         }
         resp
     }

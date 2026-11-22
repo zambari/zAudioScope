@@ -28,17 +28,21 @@ pub fn lerp(a: Color32, b: Color32, u: f32) -> Color32 {
     Color32::from_rgb(c(a.r(), b.r()), c(a.g(), b.g()), c(a.b(), b.b()))
 }
 
+/// `c` with its hue rotated by `turns` of the colour wheel (0 = unchanged).
+pub fn hue_shift(c: Color32, turns: f32) -> Color32 {
+    if turns == 0.0 {
+        return c;
+    }
+    let mut h = egui::ecolor::Hsva::from(c);
+    h.h = (h.h + turns).rem_euclid(1.0);
+    Color32::from(h)
+}
+
 /// Rotate `c`'s hue by `turns` of the colour wheel, then fade it towards
 /// `bg` by `fade` per channel: channels weak in the rotated colour's hue
 /// fade faster (by `tint`, 0 = plain `lerp`), so fading leans into the hue.
 pub fn hue_fade(bg: Color32, c: Color32, turns: f32, fade: f32, tint: f32) -> Color32 {
-    let c = if turns == 0.0 {
-        c
-    } else {
-        let mut h = egui::ecolor::Hsva::from(c);
-        h.h = (h.h + turns).rem_euclid(1.0);
-        Color32::from(h)
-    };
+    let c = hue_shift(c, turns);
     let fade = fade.clamp(0.0, 1.0);
     let peak = c.r().max(c.g()).max(c.b()).max(1) as f32;
     let ch = |x: u8, y: u8| {
@@ -67,7 +71,12 @@ pub fn apply(ctx: &egui::Context) {
         v.window_stroke = Stroke::new(1.0, Color32::from_gray(56));
         v.window_corner_radius = CornerRadius::same(3);
         v.menu_corner_radius = CornerRadius::same(3);
-        v.popup_shadow = Shadow { offset: [0, 4], blur: 10, spread: 0, color: Color32::from_black_alpha(100) };
+        v.popup_shadow = Shadow {
+            offset: [0, 4],
+            blur: 10,
+            spread: 0,
+            color: Color32::from_black_alpha(100),
+        };
 
         v.selection.bg_fill = ACCENT;
         v.selection.stroke = Stroke::new(1.0, ON_ACCENT);
@@ -91,7 +100,13 @@ pub fn apply(ctx: &egui::Context) {
         w.open.bg_fill = Color32::from_gray(46);
         w.open.weak_bg_fill = Color32::from_gray(46);
         w.open.bg_stroke = Stroke::new(1.0, Color32::from_gray(70));
-        for wv in [&mut w.noninteractive, &mut w.inactive, &mut w.hovered, &mut w.active, &mut w.open] {
+        for wv in [
+            &mut w.noninteractive,
+            &mut w.inactive,
+            &mut w.hovered,
+            &mut w.active,
+            &mut w.open,
+        ] {
             wv.corner_radius = r;
             wv.expansion = 0.0;
         }
@@ -124,16 +139,28 @@ pub fn tab(label: &str, active: bool, dim: bool) -> impl egui::Widget + '_ {
         }
         let p = ui.painter();
         let rad = TAB_RADIUS as u8;
-        let corners = CornerRadius { nw: rad, ne: rad, sw: 0, se: 0 };
+        let corners = CornerRadius {
+            nw: rad,
+            ne: rad,
+            sw: 0,
+            se: 0,
+        };
         let w = &ui.visuals().widgets;
         if active {
             if resp.hovered() {
                 p.rect_filled(rect, corners, w.inactive.weak_bg_fill.gamma_multiply(0.5));
             }
             let stroke = Stroke::new(1.0, ACCENT_BRIGHT.gamma_multiply(0.8));
-            p.add(egui::Shape::line(open_tab_outline(rect.shrink(0.5)), stroke));
+            p.add(egui::Shape::line(
+                open_tab_outline(rect.shrink(0.5)),
+                stroke,
+            ));
         } else {
-            let fill = if resp.hovered() { w.hovered.weak_bg_fill } else { w.inactive.weak_bg_fill };
+            let fill = if resp.hovered() {
+                w.hovered.weak_bg_fill
+            } else {
+                w.inactive.weak_bg_fill
+            };
             p.rect_filled(rect, corners, fill);
         }
         p.galley(rect.min + pad, galley, color);
@@ -144,7 +171,11 @@ pub fn tab(label: &str, active: bool, dim: bool) -> impl egui::Widget + '_ {
 /// A row of [`tab`]s; `current` is updated when one is clicked. A hairline
 /// runs along the bottom, broken under the active tab. Each entry is
 /// (value, label, dim).
-pub fn tab_strip<T: Copy + PartialEq>(ui: &mut egui::Ui, tabs: &[(T, &str, bool)], current: &mut T) {
+pub fn tab_strip<T: Copy + PartialEq>(
+    ui: &mut egui::Ui,
+    tabs: &[(T, &str, bool)],
+    current: &mut T,
+) {
     let full = ui.available_rect_before_wrap();
     let mut gap = None;
     let row = ui.horizontal(|ui| {
@@ -186,8 +217,18 @@ fn open_tab_outline(r: egui::Rect) -> Vec<egui::Pos2> {
         }
     };
     let mut pts = vec![r.left_bottom()];
-    arc(egui::pos2(r.left() + rad, r.top() + rad), PI, PI + FRAC_PI_2, &mut pts);
-    arc(egui::pos2(r.right() - rad, r.top() + rad), -FRAC_PI_2, 0.0, &mut pts);
+    arc(
+        egui::pos2(r.left() + rad, r.top() + rad),
+        PI,
+        PI + FRAC_PI_2,
+        &mut pts,
+    );
+    arc(
+        egui::pos2(r.right() - rad, r.top() + rad),
+        -FRAC_PI_2,
+        0.0,
+        &mut pts,
+    );
     pts.push(r.right_bottom());
     pts
 }

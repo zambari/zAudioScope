@@ -7,7 +7,13 @@ use super::{meter, theme, widgets};
 use crate::audio::monitor::{Trip, risky_pair};
 use crate::audio::{DeviceInfo, Monitor};
 
-pub fn show(ui: &mut Ui, monitor: &mut Monitor, meter: &mut meter::Meter, devices: &[DeviceInfo], input_name: &str) {
+pub fn show(
+    ui: &mut Ui,
+    monitor: &mut Monitor,
+    meter: &mut meter::Meter,
+    devices: &[DeviceInfo],
+    input_name: &str,
+) {
     let risky = risky_pair(input_name, &monitor.device_name);
     monitor.set_sensitive(risky);
     let warn = ui.visuals().warn_fg_color;
@@ -18,12 +24,17 @@ pub fn show(ui: &mut Ui, monitor: &mut Monitor, meter: &mut meter::Meter, device
         label = label.color(warn);
     }
     let mut hover =
-        "Play the input out of an output device, e.g. headphones, to check what is coming in.".to_owned();
+        "Play the input out of an output device, e.g. headphones, to check what is coming in."
+            .to_owned();
     if risky {
         hover += "\n\n⚠ This looks like a built-in microphone into its own speakers: feedback is likely. \
                   Use headphones. The guard is extra sensitive with this pair.";
     }
-    if ui.toggle_value(&mut on, label).on_hover_text(hover).changed() {
+    if ui
+        .toggle_value(&mut on, label)
+        .on_hover_text(hover)
+        .changed()
+    {
         monitor.set_enabled(on);
     }
     if !monitor.enabled() {
@@ -85,6 +96,7 @@ pub fn show(ui: &mut Ui, monitor: &mut Monitor, meter: &mut meter::Meter, device
         }
     }
     if let Some(e) = monitor.error() {
-        ui.colored_label(ui.visuals().error_fg_color, "⚠ output").on_hover_text(e);
+        ui.colored_label(ui.visuals().error_fg_color, "⚠ output")
+            .on_hover_text(e);
     }
 }

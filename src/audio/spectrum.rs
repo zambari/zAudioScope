@@ -24,7 +24,9 @@ impl Fft {
     /// `n` must be a power of two.
     pub fn new(n: usize) -> Self {
         assert!(n.is_power_of_two() && n >= 16);
-        let window = (0..n).map(|i| 0.5 - 0.5 * (TAU * i as f32 / n as f32).cos()).collect();
+        let window = (0..n)
+            .map(|i| 0.5 - 0.5 * (TAU * i as f32 / n as f32).cos())
+            .collect();
         let twiddle = (0..n / 2)
             .map(|k| {
                 let a = -TAU * k as f32 / n as f32;
@@ -32,8 +34,17 @@ impl Fft {
             })
             .collect();
         let bits = n.trailing_zeros();
-        let rev = (0..n).map(|i| i.reverse_bits() >> (usize::BITS - bits)).collect();
-        Self { n, window, twiddle, rev, re: vec![0.0; n], im: vec![0.0; n] }
+        let rev = (0..n)
+            .map(|i| i.reverse_bits() >> (usize::BITS - bits))
+            .collect();
+        Self {
+            n,
+            window,
+            twiddle,
+            rev,
+            re: vec![0.0; n],
+            im: vec![0.0; n],
+        }
     }
 
     /// Windowed power spectrum of `x` (exactly `n` samples): `n/2 + 1` bins,
@@ -109,12 +120,24 @@ impl Bands {
         for j in 0..count {
             let lo = axis_freq(j as f32 / count as f32);
             let hi = axis_freq((j + 1) as f32 / count as f32);
-            let (blo, bhi) = ((lo / hz_per_bin).round() as usize, (hi / hz_per_bin).round() as usize);
-            bands.push(if bhi > blo { Band::Range(blo, bhi.min(n / 2)) } else { Band::Lerp(((lo + hi) / 2.0) / hz_per_bin) });
+            let (blo, bhi) = (
+                (lo / hz_per_bin).round() as usize,
+                (hi / hz_per_bin).round() as usize,
+            );
+            bands.push(if bhi > blo {
+                Band::Range(blo, bhi.min(n / 2))
+            } else {
+                Band::Lerp(((lo + hi) / 2.0) / hz_per_bin)
+            });
             let centre = ((lo * hi).sqrt()).max(1.0);
             tilt.push(TILT_DB_PER_OCT * (centre / 1000.0).log2());
         }
-        Self { n, rate, bands, tilt }
+        Self {
+            n,
+            rate,
+            bands,
+            tilt,
+        }
     }
 
     pub fn fits(&self, n: usize, rate: u32) -> bool {

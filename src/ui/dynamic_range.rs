@@ -22,7 +22,7 @@ use crate::modules::Shared;
 
 /// Lowest floor and highest ceiling any control allows, dB. The single
 /// source of truth: every control starts at, and is clamped to, this span.
-pub const BOUNDS: (f32, f32) = (-60.0, 4.0);
+pub const BOUNDS: (f32, f32) = (-80.0, 4.0);
 /// Smallest floor-to-ceiling span, dB.
 pub const MIN_GAP: f32 = 12.0;
 
@@ -35,7 +35,10 @@ pub struct DbRange {
 
 impl Default for DbRange {
     fn default() -> Self {
-        Self { floor: BOUNDS.0, ceil: BOUNDS.1 }
+        Self {
+            floor: BOUNDS.0,
+            ceil: BOUNDS.1,
+        }
     }
 }
 
@@ -47,10 +50,21 @@ impl DbRange {
     /// Inside [`BOUNDS`] with at least [`MIN_GAP`] between the ends.
     pub fn sanitized(self) -> Self {
         let d = Self::default();
-        let floor = if self.floor.is_finite() { self.floor } else { d.floor };
-        let ceil = if self.ceil.is_finite() { self.ceil } else { d.ceil };
+        let floor = if self.floor.is_finite() {
+            self.floor
+        } else {
+            d.floor
+        };
+        let ceil = if self.ceil.is_finite() {
+            self.ceil
+        } else {
+            d.ceil
+        };
         let floor = floor.clamp(BOUNDS.0, BOUNDS.1 - MIN_GAP);
-        Self { floor, ceil: ceil.clamp(floor + MIN_GAP, BOUNDS.1) }
+        Self {
+            floor,
+            ceil: ceil.clamp(floor + MIN_GAP, BOUNDS.1),
+        }
     }
 
     /// Floor lifted off its minimum, so anything quieter is hidden.
@@ -75,12 +89,14 @@ pub struct DynamicRange {
 impl Default for DynamicRange {
     /// The full [`BOUNDS`] span, unlocked.
     fn default() -> Self {
-        Self { range: DbRange::default(), locked: false }
+        Self {
+            range: DbRange::default(),
+            locked: false,
+        }
     }
 }
 
 impl DynamicRange {
-
     pub fn sanitize(&mut self) {
         self.range = self.range.sanitized();
     }
@@ -122,7 +138,11 @@ impl DynamicRange {
                 }
                 self.sync(hub);
                 let DbRange { floor, ceil } = &mut self.range;
-                let r = ui.add(RangeSlider::new(floor, ceil, BOUNDS.0..=BOUNDS.1).min_gap(MIN_GAP).text("dB"));
+                let r = ui.add(
+                    RangeSlider::new(floor, ceil, BOUNDS.0..=BOUNDS.1)
+                        .min_gap(MIN_GAP)
+                        .text("dB"),
+                );
                 if self.locked {
                     hub.set(self.range);
                 }
@@ -157,7 +177,11 @@ pub struct CeilCrawl {
 
 impl Default for CeilCrawl {
     fn default() -> Self {
-        Self { hold: BOUNDS.0, pos: 0, manual: false }
+        Self {
+            hold: BOUNDS.0,
+            pos: 0,
+            manual: false,
+        }
     }
 }
 
@@ -169,7 +193,10 @@ impl CeilCrawl {
             return;
         }
         if reset || self.pos > frame.end() {
-            *self = Self { hold: BOUNDS.0, ..Self::default() };
+            *self = Self {
+                hold: BOUNDS.0,
+                ..Self::default()
+            };
         }
         let from = self.pos.max(frame.start);
         let new = &frame.samples[(from - frame.start) as usize..];
@@ -178,7 +205,9 @@ impl CeilCrawl {
         let peak = new.iter().fold(0.0f32, |m, s| m.max(s.abs()));
         let peak_db = 20.0 * peak.max(1e-6).log10();
 
-        self.hold = (self.hold - HOLD_DECAY_DB_S * dt).max(peak_db).max(BOUNDS.0);
+        self.hold = (self.hold - HOLD_DECAY_DB_S * dt)
+            .max(peak_db)
+            .max(BOUNDS.0);
         let target = (self.hold + HEADROOM_DB).min(BOUNDS.1);
         range.ceil = if target >= range.ceil {
             target
@@ -204,8 +233,16 @@ fn coverage_row(ui: &mut Ui, under: Rect, range: DbRange, levels: &LevelDist) {
         let painter = ui.painter();
         painter.rect_filled(row, 0.0, ui.visuals().extreme_bg_color);
         let w = row.width();
-        painter.rect_filled(Rect::from_x_y_ranges(row.left()..=row.left() + w * low.sqrt(), row.y_range()), 0.0, WAVE.gamma_multiply(0.6));
-        painter.rect_filled(Rect::from_x_y_ranges(row.right() - w * high.sqrt()..=row.right(), row.y_range()), 0.0, VU_CLIP);
+        painter.rect_filled(
+            Rect::from_x_y_ranges(row.left()..=row.left() + w * low.sqrt(), row.y_range()),
+            0.0,
+            WAVE.gamma_multiply(0.6),
+        );
+        painter.rect_filled(
+            Rect::from_x_y_ranges(row.right() - w * high.sqrt()..=row.right(), row.y_range()),
+            0.0,
+            VU_CLIP,
+        );
     }
     resp.on_hover_text(format!(
         "Last few seconds of input, 20 ms RMS blocks:\n{:.0}% below the floor (left)\n{:.1}% above the ceiling (right)",
@@ -219,7 +256,11 @@ mod tests {
     use super::*;
 
     fn frame(samples: Vec<f32>, start: u64) -> Frame {
-        Frame { samples, rate: 1000, start }
+        Frame {
+            samples,
+            rate: 1000,
+            start,
+        }
     }
 
     #[test]
@@ -233,15 +274,27 @@ mod tests {
             crawl.update(&frame(s, pos), false, &mut range);
             pos += 100;
         }
-        assert!(range.ceil < BOUNDS.1 - 1.0, "ceiling should crawl down, got {}", range.ceil);
-        assert!((range.ceil - (-5.0)).abs() < 1.0, "ceiling should settle near peak + headroom, got {}", range.ceil);
+        assert!(
+            range.ceil < BOUNDS.1 - 1.0,
+            "ceiling should crawl down, got {}",
+            range.ceil
+        );
+        assert!(
+            (range.ceil - (-5.0)).abs() < 1.0,
+            "ceiling should settle near peak + headroom, got {}",
+            range.ceil
+        );
 
         // A louder peak snaps the ceiling straight up.
         let mut loud = vec![0.0f32; 100];
         loud[10] = 1.0;
         crawl.update(&frame(loud, pos), false, &mut range);
         pos += 100;
-        assert!((range.ceil - 1.0).abs() < 1e-3, "new peak should snap, got {}", range.ceil);
+        assert!(
+            (range.ceil - 1.0).abs() < 1e-3,
+            "new peak should snap, got {}",
+            range.ceil
+        );
 
         // Once moved by hand, nothing touches the ceiling again.
         crawl.manual = true;

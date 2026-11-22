@@ -4,11 +4,12 @@
 //! its detail / CPU knobs stand alone; in the stack the tuner draws on top
 //! of it (see [`Module::stack_over`]).
 
-use egui::{Mesh, Pos2, Rect, Shape, Stroke, Ui, pos2};
+use egui::{Color32, Mesh, Pos2, Rect, Shape, Stroke, Ui, pos2};
 use serde::{Deserialize, Serialize};
 
 use super::note_input::{FLOOR_DB, NoteInput, Want, ease, note_db};
 use super::perf::Costs;
+use super::spectrum_rows::heat;
 use super::{Module, Shared};
 use crate::pitch;
 use crate::ui::dynamic_range::DynamicRange;
@@ -21,10 +22,39 @@ pub const TITLE: &str = "Graph";
 /// Cost stages, in `Costs` order (0 is decimation, see `NoteInput::next`).
 const STAGES: [&str; 2] = ["decimate", "spectrum"];
 
+/// Heat colouring stays off (transparent) below this level; colour starts a third in.
+const HEAT_START: f32 = 1.0 / 3.0;
+
+/// How the curve is coloured.
+#[derive(Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub enum Colour {
+    /// Flat blue-grey fill and outline.
+    #[default]
+    Wave,
+    /// The impulse module's ramp (dark → orange → white), starting a third into the range.
+    Heat,
+}
+
+/// 0 below [`HEAT_START`], rising to 1 at the top of the range.
+fn heat_ramp(level: f32) -> f32 {
+    ((level - HEAT_START) / (1.0 - HEAT_START)).clamp(0.0, 1.0)
+}
+
+/// Heat colour for a level, fully transparent below the ramp.
+fn heat_colour(level: f32) -> Color32 {
+    let t = heat_ramp(level);
+    if t <= 0.0 {
+        Color32::TRANSPARENT
+    } else {
+        heat(t)
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
 struct Params {
     db: DynamicRange,
+    colour: Colour,
     /// Longest stretch of input analysed.
     window_ms: f32,
     // ---- performance ----
@@ -43,6 +73,7 @@ impl Default for Params {
     fn default() -> Self {
         Self {
             db: DynamicRange::default(),
+            colour: Colour::default(),
             window_ms: 300.0,
             rate_hz: 50.0,
             steps: 12,
@@ -65,7 +96,12 @@ impl Params {
     }
 
     fn want(&self) -> Want {
-        Want { window_ms: self.window_ms, rate_hz: self.rate_hz, oversample: self.oversample, a4: A4 }
+        Want {
+            window_ms: self.window_ms,
+            rate_hz: self.rate_hz,
+            oversample: self.oversample,
+            a4: A4,
+        }
     }
 }
 
@@ -104,7 +140,13 @@ impl NoteSpectrum {
         if full {
             painter.rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
             plot::note_axis(&painter, rect, range, |_| false, false);
-            Axis::new(Edge::Left, db_scale).spacing(28.0).minor(false).draw(&painter, plot, |db| format!("{db:.0}"));
+            let mut axis = Axis::new(Edge::Left, db_scale).spacing(28.0).minor(false);
+            if self.p.colour == Colour::Heat {
+                // Grid lines sit under the same ramp as the curve, so quiet dB lines vanish.
+                let db = self.p.db;
+                axis = axis.grid_fade(move |v| heat_ramp(db.level(v)));
+            }
+            axis.draw(&painter, plot, |db| format!("{db:.0}"));
         }
         if self.shown.len() < 2 {
             return;
@@ -117,16 +159,36 @@ impl NoteSpectrum {
             .shown
             .iter()
             .enumerate()
-            .map(|(k, &d)| pos2(x.px(lo + (hi - lo) * k as f32 / (count - 1) as f32), db_scale.px(d.clamp(bottom, top))))
+            .map(|(k, &d)| {
+                pos2(
+                    x.px(lo + (hi - lo) * k as f32 / (count - 1) as f32),
+                    db_scale.px(d.clamp(bottom, top)),
+                )
+            })
             .collect();
         let mut mesh = Mesh::default();
-        let fill_top = theme::WAVE.gamma_multiply(0.30);
-        let fill_bot = theme::WAVE.gamma_multiply(0.02);
-        for p in &pts {
-            // Brighter fill where the curve is higher.
-            let t = 1.0 - (p.y - plot.top()) / plot.height();
-            mesh.colored_vertex(*p, fill_top.gamma_multiply(0.35 + 0.65 * t));
-            mesh.colored_vertex(pos2(p.x, plot.bottom()), fill_bot);
+        let heat_on = self.p.colour == Colour::Heat;
+        // Heat: per-point level, computed once for fill and outline.
+        let levels: Vec<f32> = if heat_on {
+            self.shown.iter().map(|&d| self.p.db.level(d)).collect()
+        } else {
+            Vec::new()
+        };
+        if heat_on {
+            for (p, &lv) in pts.iter().zip(&levels) {
+                // Below the heat start the fill vanishes into the background.
+                mesh.colored_vertex(*p, heat_colour(lv));
+                mesh.colored_vertex(pos2(p.x, plot.bottom()), Color32::TRANSPARENT);
+            }
+        } else {
+            let fill_top = theme::WAVE.gamma_multiply(0.30);
+            let fill_bot = theme::WAVE.gamma_multiply(0.02);
+            for p in &pts {
+                // Brighter fill where the curve is higher.
+                let t = 1.0 - (p.y - plot.top()) / plot.height();
+                mesh.colored_vertex(*p, fill_top.gamma_multiply(0.35 + 0.65 * t));
+                mesh.colored_vertex(pos2(p.x, plot.bottom()), fill_bot);
+            }
         }
         for k in 0..count as u32 - 1 {
             let (a, b) = (2 * k, 2 * k + 2);
@@ -134,7 +196,23 @@ impl NoteSpectrum {
             mesh.add_triangle(b, a + 1, b + 1);
         }
         painter.add(Shape::mesh(mesh));
-        painter.add(Shape::line(pts, Stroke::new(1.2, theme::WAVE.gamma_multiply(0.85))));
+        if heat_on {
+            // Segment by segment, coloured by the louder end; quiet ones are skipped.
+            for (w, lv) in pts.windows(2).zip(levels.windows(2)) {
+                let lv = lv[0].max(lv[1]);
+                if heat_ramp(lv) > 0.0 {
+                    painter.line_segment(
+                        [w[0], w[1]],
+                        Stroke::new(1.2, heat_colour(lv).gamma_multiply(0.9)),
+                    );
+                }
+            }
+        } else {
+            painter.add(Shape::line(
+                pts,
+                Stroke::new(1.2, theme::WAVE.gamma_multiply(0.85)),
+            ));
+        }
     }
 }
 
@@ -151,7 +229,9 @@ impl Module for NoteSpectrum {
         // First run after the split: take the spectrum settings the tuner
         // kept (same field names; the tuner's own are ignored).
         let legacy = key.replace(TITLE, super::tuner::TITLE);
-        if let Some(p) = eframe::get_value::<Params>(storage, key).or_else(|| eframe::get_value(storage, &legacy)) {
+        if let Some(p) = eframe::get_value::<Params>(storage, key)
+            .or_else(|| eframe::get_value(storage, &legacy))
+        {
             self.p = p;
             self.p.sanitize();
         }
@@ -167,7 +247,9 @@ impl Module for NoteSpectrum {
 
     fn update(&mut self, shared: &mut Shared) {
         self.p.db.sync(&shared.db);
-        let Some(w) = self.input.next(shared, &self.p.want(), &mut self.costs) else { return };
+        let Some(w) = self.input.next(shared, &self.p.want(), &mut self.costs) else {
+            return;
+        };
         let points = self.points();
         if w.level_db < self.p.gate_db {
             // Keep the length so the display decays instead of resetting.
@@ -179,25 +261,59 @@ impl Module for NoteSpectrum {
         let max_cycles = self.p.max_cycles;
         self.target = self.costs.time(1, || {
             (0..points)
-                .map(|k| note_db(&w.y, w.rate, pitch::midi_to_freq(lo + (hi - lo) * k as f32 / (points - 1) as f32, A4), max_cycles))
+                .map(|k| {
+                    note_db(
+                        &w.y,
+                        w.rate,
+                        pitch::midi_to_freq(lo + (hi - lo) * k as f32 / (points - 1) as f32, A4),
+                        max_cycles,
+                    )
+                })
                 .collect()
         });
     }
 
     fn params(&mut self, ui: &mut Ui, shared: &Shared) {
         self.p.db.ui(ui, shared);
-        ui.add(egui::Slider::new(&mut self.p.window_ms, 60.0..=1000.0).logarithmic(true).suffix(" ms").text("window"));
+        ui.horizontal(|ui| {
+            ui.label("colour");
+            ui.selectable_value(&mut self.p.colour, Colour::Wave, "wave");
+            ui.selectable_value(&mut self.p.colour, Colour::Heat, "heat")
+                .on_hover_text("Impulse-style ramp; quiet levels below a third of the range go transparent, dB lines included");
+        });
+        ui.add(
+            egui::Slider::new(&mut self.p.window_ms, 60.0..=1000.0)
+                .logarithmic(true)
+                .suffix(" ms")
+                .text("window"),
+        );
         let p = &mut self.p;
         self.costs.foldout(ui, "spectrum_perf", &STAGES, |ui| {
-            ui.add(egui::Slider::new(&mut p.rate_hz, 2.0..=60.0).logarithmic(true).suffix(" Hz").text("update rate"))
-                .on_hover_text("Free-running analyses per second (gated mode analyses once per window)");
-            ui.add(egui::Slider::new(&mut p.steps, 1..=16).text("pts/semi")).on_hover_text("Spectrum resolution");
-            ui.add(egui::Slider::new(&mut p.max_cycles, 4.0..=64.0).logarithmic(true).text("cycles"))
-                .on_hover_text("Window length in periods: fewer is cheaper but blurs peaks");
+            ui.add(
+                egui::Slider::new(&mut p.rate_hz, 2.0..=60.0)
+                    .logarithmic(true)
+                    .suffix(" Hz")
+                    .text("update rate"),
+            )
+            .on_hover_text(
+                "Free-running analyses per second (gated mode analyses once per window)",
+            );
+            ui.add(egui::Slider::new(&mut p.steps, 1..=16).text("pts/semi"))
+                .on_hover_text("Spectrum resolution");
+            ui.add(
+                egui::Slider::new(&mut p.max_cycles, 4.0..=64.0)
+                    .logarithmic(true)
+                    .text("cycles"),
+            )
+            .on_hover_text("Window length in periods: fewer is cheaper but blurs peaks");
             ui.add(egui::Slider::new(&mut p.oversample, 3.0..=20.0).text("oversample"))
                 .on_hover_text("Decimated rate vs top note: lower decimates harder (cheaper)");
-            ui.add(egui::Slider::new(&mut p.gate_db, -140.0..=-20.0).suffix(" dB").text("silence gate"))
-                .on_hover_text("Below this input level nothing is analysed");
+            ui.add(
+                egui::Slider::new(&mut p.gate_db, -140.0..=-20.0)
+                    .suffix(" dB")
+                    .text("silence gate"),
+            )
+            .on_hover_text("Below this input level nothing is analysed");
         });
     }
 

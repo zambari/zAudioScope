@@ -10,6 +10,7 @@
 use egui::{Color32, Mesh, Rangef, Ui, pos2};
 use serde::{Deserialize, Serialize};
 
+use super::theme;
 use super::widgets::Foldout;
 
 /// Level at the very note-on when there is an attack fade, so the start
@@ -37,11 +38,22 @@ pub struct NoteStyle {
     pub overtones: [f32; 3],
     /// Opacity of the thin line marking the exact note-on / note-off (0 = hidden).
     pub edges: f32,
+    /// Hue of the notes, -1..1: 0 is the accent orange, ±1 is half a turn
+    /// round the wheel (the same range the impulse module's hue offset uses).
+    pub hue: f32,
 }
 
 impl Default for NoteStyle {
     fn default() -> Self {
-        Self { width: 0.55, attack_s: 0.0, release_s: 0.15, velocity: 0.6, overtones: [0.0; 3], edges: 0.5 }
+        Self {
+            width: 0.55,
+            attack_s: 0.0,
+            release_s: 0.15,
+            velocity: 0.6,
+            overtones: [0.0; 3],
+            edges: 0.5,
+            hue: 0.0,
+        }
     }
 }
 
@@ -55,6 +67,7 @@ impl NoteStyle {
         self.release_s = self.release_s.clamp(0.0, 4.0);
         self.velocity = self.velocity.clamp(0.0, 1.0);
         self.edges = self.edges.clamp(0.0, 1.0);
+        self.hue = self.hue.clamp(-1.0, 1.0);
         for g in &mut self.overtones {
             *g = g.clamp(0.0, 1.0);
         }
@@ -67,7 +80,11 @@ impl NoteStyle {
 
     /// The parameter-column editor, folded.
     pub fn ui(&mut self, ui: &mut Ui) {
-        let summary = format!("A {:.0} / R {:.0} ms", self.attack_s * 1e3, self.release_s * 1e3);
+        let summary = format!(
+            "A {:.0} / R {:.0} ms",
+            self.attack_s * 1e3,
+            self.release_s * 1e3
+        );
         Foldout::new("note_style", "note look").summary(summary).show(ui, |ui| {
             ui.add(egui::Slider::new(&mut self.width, 0.1..=1.0).text("width"));
             let ms = |v: &mut f32, max: f32, label: &str, ui: &mut Ui| {
@@ -80,14 +97,27 @@ impl NoteStyle {
             ms(&mut self.release_s, 4000.0, "release", ui);
             ui.add(egui::Slider::new(&mut self.velocity, 0.0..=1.0).text("velocity"));
             ui.add(egui::Slider::new(&mut self.edges, 0.0..=1.0).text("on/off edges"));
+            ui.add(egui::Slider::new(&mut self.hue, -1.0..=1.0).text("hue"))
+                .on_hover_text("Note colour: 0 is the accent orange; ±1 turns it half way round the colour wheel");
         });
         let on = self.overtones.iter().filter(|&&g| g > 0.0).count();
-        Foldout::new("note_overtones", "overtones").summary(if on == 0 { "off".into() } else { format!("{on} on") }).show(ui, |ui| {
-            for ((_, name), g) in OVERTONES.iter().zip(&mut self.overtones) {
-                ui.add(egui::Slider::new(g, 0.0..=1.0).text(*name));
-            }
-        });
+        Foldout::new("note_overtones", "overtones")
+            .summary(if on == 0 {
+                "off".into()
+            } else {
+                format!("{on} on")
+            })
+            .show(ui, |ui| {
+                for ((_, name), g) in OVERTONES.iter().zip(&mut self.overtones) {
+                    ui.add(egui::Slider::new(g, 0.0..=1.0).text(*name));
+                }
+            });
         self.sanitize();
+    }
+
+    /// The note colour for a palette colour, rotated by [`Self::hue`].
+    pub fn tint(&self, c: Color32) -> Color32 {
+        theme::hue_shift(c, self.hue * 0.5)
     }
 
     /// Seconds a note stays visible after its note-off.
@@ -107,7 +137,11 @@ impl NoteStyle {
     fn envelope(&self, on: f64, off: Option<f64>, now: f64, min_hold: f64) -> Env {
         let attack = self.attack_s as f64;
         let level = |t: f64| {
-            if attack <= 0.0 { 1.0 } else { (ATTACK_FLOOR + (1.0 - ATTACK_FLOOR) * ((t - on) / attack) as f32).min(1.0) }
+            if attack <= 0.0 {
+                1.0
+            } else {
+                (ATTACK_FLOOR + (1.0 - ATTACK_FLOOR) * ((t - on) / attack) as f32).min(1.0)
+            }
         };
         let hold_end = off.unwrap_or(now).max(on + min_hold);
         let limit = now.max(on + min_hold);
@@ -179,7 +213,11 @@ mod tests {
 
     #[test]
     fn released_note_fades_out() {
-        let s = NoteStyle { attack_s: 0.1, release_s: 0.2, ..Default::default() };
+        let s = NoteStyle {
+            attack_s: 0.1,
+            release_s: 0.2,
+            ..Default::default()
+        };
         let e = env(&s, 0.0, Some(0.5), 10.0);
         assert_eq!(e.len(), 4);
         assert!((e[1].0 - 0.1).abs() < 1e-6 && e[1].1 == 1.0);
@@ -190,8 +228,31 @@ mod tests {
     }
 
     #[test]
+    fn hue_zero_keeps_accent_and_ends_meet_opposite() {
+        let orange = theme::ACCENT;
+        assert_eq!(NoteStyle::default().tint(orange), orange);
+        // ±1 is half a turn: the same colour from either end.
+        let (lo, hi) = (
+            NoteStyle {
+                hue: -1.0,
+                ..Default::default()
+            },
+            NoteStyle {
+                hue: 1.0,
+                ..Default::default()
+            },
+        );
+        assert_eq!(lo.tint(orange), hi.tint(orange));
+        assert_ne!(hi.tint(orange), orange);
+    }
+
+    #[test]
     fn short_note_inside_attack() {
-        let s = NoteStyle { attack_s: 1.0, release_s: 0.0, ..Default::default() };
+        let s = NoteStyle {
+            attack_s: 1.0,
+            release_s: 0.0,
+            ..Default::default()
+        };
         let e = env(&s, 0.0, Some(0.5), 10.0);
         assert_eq!(e.len(), 2);
         assert!(e[1].1 < 1.0 && e[1].1 > ATTACK_FLOOR);

@@ -10,11 +10,18 @@ use crate::audio::Input;
 /// Gain slider top: +12 dB.
 pub const GAIN_MAX: f32 = 4.0;
 
-/// Held peak below this reads as no signal: the displays stop drawing.
-pub const NO_SIGNAL_DB: f32 = -40.0;
+/// Input peaks below this count as quiet.
+pub const NO_SIGNAL_DB: f32 = -48.0;
+
+/// Quiet must last this long (seconds) before the displays read as no signal.
+pub const NO_SIGNAL_HOLD_S: f32 = 2.0;
 
 pub fn to_db(lin: f32) -> f32 {
-    if lin <= 0.0 { f32::NEG_INFINITY } else { 20.0 * lin.log10() }
+    if lin <= 0.0 {
+        f32::NEG_INFINITY
+    } else {
+        20.0 * lin.log10()
+    }
 }
 
 pub fn from_db(db: f32) -> f32 {
@@ -26,6 +33,8 @@ pub fn from_db(db: f32) -> f32 {
 pub struct Meter {
     level: [f32; 2],
     hold: [f32; 2],
+    /// Seconds the input has been continuously under [`NO_SIGNAL_DB`].
+    quiet_s: f32,
 }
 
 impl Meter {
@@ -34,15 +43,18 @@ impl Meter {
         self.hold[0].max(self.hold[1])
     }
 
-    /// False while the peak readout sits under [`NO_SIGNAL_DB`].
+    /// False once the input has stayed under [`NO_SIGNAL_DB`] for
+    /// [`NO_SIGNAL_HOLD_S`] seconds. Any louder block resets the wait.
     pub fn has_signal(&self) -> bool {
-        to_db(self.hold().max(1e-6)) >= NO_SIGNAL_DB
+        self.quiet_s < NO_SIGNAL_HOLD_S
     }
 
     /// Gain slider and meter.
     pub fn show(&mut self, ui: &mut Ui, input: &Input, gain: &mut f32) {
         gain_slider(ui, gain, |db| {
-            format!("Input gain {db} (ahead of every analyser and the trigger). Tick marks 0 dB; double-click to reset to it")
+            format!(
+                "Input gain {db} (ahead of every analyser and the trigger). Tick marks 0 dB; double-click to reset to it"
+            )
         });
         input.set_gain(*gain);
         self.levels(ui, input.take_peaks(), "Input level after gain");
@@ -51,7 +63,10 @@ impl Meter {
     /// The phase strip from the cursor to the bar's right edge, full bar
     /// height, while a stereo input is open.
     pub fn phase_strip(&self, ui: &mut Ui, input: &Input) {
-        let ys = ui.clip_rect().intersect(ui.max_rect().expand2(vec2(0.0, 8.0))).y_range();
+        let ys = ui
+            .clip_rect()
+            .intersect(ui.max_rect().expand2(vec2(0.0, 8.0)))
+            .y_range();
         let strip = Rect::from_x_y_ranges(ui.cursor().left()..=ui.max_rect().right(), ys);
         if strip.width() > 4.0 && input.is_stereo() {
             let mut shapes = Vec::new();
@@ -67,10 +82,18 @@ impl Meter {
         let dt = ui.input(|i| i.stable_dt).min(0.1);
         let fall = 10f32.powf(-24.0 * dt / 20.0);
         let hold_fall = 10f32.powf(-8.0 * dt / 20.0);
-        for k in 0..2 {
-            self.level[k] = peaks[k].max(self.level[k] * fall);
-            self.hold[k] = peaks[k].max(self.hold[k] * hold_fall);
+        for (k, &peak) in peaks.iter().enumerate() {
+            self.level[k] = peak.max(self.level[k] * fall);
+            self.hold[k] = peak.max(self.hold[k] * hold_fall);
         }
+        // Signal presence runs on the raw peak, not the decaying readout,
+        // so the two-second wait starts when the audio actually stops.
+        let loudest = peaks[0].max(peaks[1]);
+        self.quiet_s = if to_db(loudest.max(1e-6)) < NO_SIGNAL_DB {
+            self.quiet_s + dt
+        } else {
+            0.0
+        };
 
         let (rect, resp) = ui.allocate_exact_size(vec2(96.0, 12.0), egui::Sense::hover());
         let p = ui.painter();
@@ -81,7 +104,11 @@ impl Meter {
         // first tick to the floor, so an idle meter is invisible.
         let bg_alpha = ((hold_db - FLOOR_DB) / (FIRST_TICK_DB - FLOOR_DB)).clamp(0.0, 1.0);
         if bg_alpha > 0.0 {
-            p.rect_filled(rect, 1.0, ui.visuals().extreme_bg_color.gamma_multiply(bg_alpha));
+            p.rect_filled(
+                rect,
+                1.0,
+                ui.visuals().extreme_bg_color.gamma_multiply(bg_alpha),
+            );
         }
         let x_of = |lin: f32| {
             let db = to_db(lin.max(1e-6));
@@ -110,16 +137,28 @@ impl Meter {
         }
         resp.on_hover_text(format!(
             "{what}, top L, bottom R (-48..0 dBFS)\nPeak {}",
-            if hold_db < -90.0 { "-inf dB".to_owned() } else { format!("{hold_db:.1} dB") }
+            if hold_db < -90.0 {
+                "-inf dB".to_owned()
+            } else {
+                format!("{hold_db:.1} dB")
+            }
         ));
     }
 }
 
 /// Gain 0..+12 dB. Tick marks at unity; double-click resets to it.
 /// `hover` gets the gain as text ("+3.0 dB", "off").
-pub fn gain_slider(ui: &mut Ui, gain: &mut f32, hover: impl FnOnce(&str) -> String) -> egui::Response {
+pub fn gain_slider(
+    ui: &mut Ui,
+    gain: &mut f32,
+    hover: impl FnOnce(&str) -> String,
+) -> egui::Response {
     ui.spacing_mut().slider_width = 80.0;
-    let r = ui.add(egui::Slider::new(gain, 0.0..=GAIN_MAX).show_value(false).trailing_fill(true));
+    let r = ui.add(
+        egui::Slider::new(gain, 0.0..=GAIN_MAX)
+            .show_value(false)
+            .trailing_fill(true),
+    );
     // Tick marks at unity gain, above and below the rail. Mirrors egui's
     // handle inset (radius = height / 2.5) so the tick lines up.
     {
@@ -129,10 +168,17 @@ pub fn gain_slider(ui: &mut Ui, gain: &mut f32, hover: impl FnOnce(&str) -> Stri
         let stroke = Stroke::new(1.0, ui.visuals().weak_text_color());
         let p = ui.painter();
         p.line_segment([pos2(x, rect.top()), pos2(x, rect.top() + 3.0)], stroke);
-        p.line_segment([pos2(x, rect.bottom() - 3.0), pos2(x, rect.bottom())], stroke);
+        p.line_segment(
+            [pos2(x, rect.bottom() - 3.0), pos2(x, rect.bottom())],
+            stroke,
+        );
     }
     let db = to_db(*gain);
-    let mut r = r.on_hover_text(hover(&if db.is_finite() { format!("{db:+.1} dB") } else { "off".to_owned() }));
+    let mut r = r.on_hover_text(hover(&if db.is_finite() {
+        format!("{db:+.1} dB")
+    } else {
+        "off".to_owned()
+    }));
     if r.double_clicked() {
         *gain = 1.0;
         r.mark_changed();
@@ -149,7 +195,10 @@ fn phase_strip(frames: &[(f32, f32)], strip: Rect, shapes: &mut Vec<Shape>) {
     let r = strip.width() / 2.0;
     let s = std::f32::consts::FRAC_1_SQRT_2;
     let guide = Stroke::new(1.0, Color32::from_gray(28));
-    shapes.push(Shape::line_segment([pos2(c.x, strip.top()), pos2(c.x, strip.bottom())], guide));
+    shapes.push(Shape::line_segment(
+        [pos2(c.x, strip.top()), pos2(c.x, strip.bottom())],
+        guide,
+    ));
 
     // Cut the trace into runs that stay inside the strip, so lines don't
     // get drawn across the clipped-away parts.
@@ -180,8 +229,15 @@ fn phase_strip(frames: &[(f32, f32)], strip: Rect, shapes: &mut Vec<Shape>) {
     if ll * rr2 > 1e-12 {
         let corr = (lr / (ll * rr2).sqrt()).clamp(-1.0, 1.0);
         let x = c.x + corr * strip.width() / 2.0;
-        let col = if corr < 0.0 { Color32::from_rgb(222, 60, 50) } else { theme::ACCENT_BRIGHT };
-        let bar = Rect::from_x_y_ranges(c.x.min(x)..=c.x.max(x), strip.bottom() - 2.0..=strip.bottom());
+        let col = if corr < 0.0 {
+            Color32::from_rgb(222, 60, 50)
+        } else {
+            theme::ACCENT_BRIGHT
+        };
+        let bar = Rect::from_x_y_ranges(
+            c.x.min(x)..=c.x.max(x),
+            strip.bottom() - 2.0..=strip.bottom(),
+        );
         shapes.push(Shape::rect_filled(bar, 0.0, col.gamma_multiply(0.6)));
     }
 }
@@ -209,7 +265,10 @@ impl ChannelMeters {
     /// A thin horizontal bar for channel `k` (-48..0 dBFS).
     pub fn bar(&self, ui: &mut Ui, k: usize, size: egui::Vec2) -> egui::Response {
         let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::hover());
-        let (level, hold) = (self.level.get(k).copied().unwrap_or(0.0), self.hold.get(k).copied().unwrap_or(0.0));
+        let (level, hold) = (
+            self.level.get(k).copied().unwrap_or(0.0),
+            self.hold.get(k).copied().unwrap_or(0.0),
+        );
         let p = ui.painter();
         p.rect_filled(rect, 1.0, ui.visuals().extreme_bg_color);
         super::level_bar::paint(
@@ -219,7 +278,11 @@ impl ChannelMeters {
             (hold > 1e-4).then(|| audio_fraction(hold)),
         );
         let db = to_db(hold.max(1e-6));
-        resp.on_hover_text(if db < -90.0 { "-inf dB".to_owned() } else { format!("Peak {db:.1} dB") })
+        resp.on_hover_text(if db < -90.0 {
+            "-inf dB".to_owned()
+        } else {
+            format!("Peak {db:.1} dB")
+        })
     }
 }
 

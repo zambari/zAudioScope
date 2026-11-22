@@ -12,7 +12,10 @@ pub struct StereoRing {
 
 impl StereoRing {
     pub fn new(len: usize) -> Self {
-        Self { buf: (0..len.max(2)).map(|_| AtomicU64::new(0)).collect(), written: AtomicUsize::new(0) }
+        Self {
+            buf: (0..len.max(2)).map(|_| AtomicU64::new(0)).collect(),
+            written: AtomicUsize::new(0),
+        }
     }
 
     pub fn len(&self) -> usize {

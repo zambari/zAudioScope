@@ -14,13 +14,13 @@ use egui::{
     vec2,
 };
 
-/// Stand-in for a graph while the input is silent (see
-/// [`Shared::signal`](crate::modules::Shared::signal)), centred in `rect`.
-pub fn no_signal(ui: &Ui, rect: egui::Rect) {
+/// Stand-in for a graph while there is no input to show (see
+/// [`Shared::idle_label`](crate::modules::Shared::idle_label)), centred in `rect`.
+pub fn placeholder(ui: &Ui, rect: egui::Rect, label: &str) {
     ui.painter().text(
         rect.center(),
         Align2::CENTER_CENTER,
-        "No signal",
+        label,
         FontId::proportional(14.0),
         ui.visuals().weak_text_color(),
     );
@@ -36,18 +36,29 @@ pub fn device_picker(
     devices: &[crate::audio::DeviceInfo],
 ) -> (Response, Option<String>) {
     let mut picked = None;
-    let r = egui::ComboBox::from_id_salt(salt).width(width).selected_text(selected).show_ui(ui, |ui| {
-        for d in devices {
-            if ui.selectable_label(current == Some(d.id.as_str()), &d.name).clicked() {
-                picked = Some(d.id.clone());
+    let r = egui::ComboBox::from_id_salt(salt)
+        .width(width)
+        .selected_text(selected)
+        .show_ui(ui, |ui| {
+            for d in devices {
+                if ui
+                    .selectable_label(current == Some(d.id.as_str()), &d.name)
+                    .clicked()
+                {
+                    picked = Some(d.id.clone());
+                }
             }
-        }
-    });
+        });
     (r.response, picked)
 }
 
 /// Module foldout with an independent, right-aligned display switch.
-pub fn module_header(ui: &mut Ui, title: &str, open: &mut bool, enabled: &mut bool) -> (egui::Pos2, f32) {
+pub fn module_header(
+    ui: &mut Ui,
+    title: &str,
+    open: &mut bool,
+    enabled: &mut bool,
+) -> (egui::Pos2, f32) {
     // Wide parameter rows (sliders, note toggles) can grow the scroll content
     // past the visible inspector; pin the header to the viewport's right edge
     // so the switch stays reachable however narrow the inspector gets.
@@ -68,14 +79,18 @@ pub fn module_header(ui: &mut Ui, title: &str, open: &mut bool, enabled: &mut bo
     );
     let font = FontId::proportional(13.0);
     let measure = |text: String| {
-        ui.painter().layout_no_wrap(text, font.clone(), ui.visuals().text_color()).size().x
+        ui.painter()
+            .layout_no_wrap(text, font.clone(), ui.visuals().text_color())
+            .size()
+            .x
     };
     let name_left = label.left() + 2.0 + measure("⏷  ".to_owned());
     // The arrow plus the title: both fold the section.
     let name = egui::Rect::from_min_max(
         pos2(label.left(), label.top()),
         pos2(name_left + measure(title.to_owned()), label.bottom()),
-    ).intersect(label);
+    )
+    .intersect(label);
     // Expanded sections only fold from the name; the remaining header still
     // selects the module for its connector without collapsing the controls.
     let hit = if *open { name } else { label };
@@ -91,7 +106,8 @@ pub fn module_header(ui: &mut Ui, title: &str, open: &mut bool, enabled: &mut bo
                 .rect_filled(hit, 2.0, ui.visuals().widgets.hovered.weak_bg_fill);
         }
         let arrow = if *open { "⏷" } else { "⏵" };
-        let text_rect = ui.painter()
+        let text_rect = ui
+            .painter()
             .with_clip_rect(label.intersect(ui.clip_rect()))
             .text(
                 label.left_center() + vec2(2.0, 0.0),

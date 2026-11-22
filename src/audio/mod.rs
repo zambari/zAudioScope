@@ -25,8 +25,8 @@ pub mod monitor;
 pub mod spectrum;
 pub mod tap;
 
-pub use monitor::{Monitor, MonitorSettings};
 pub use input::{ChannelSel, DeviceInfo, HISTORY_CHOICES, Input, InputSettings};
+pub use monitor::{Monitor, MonitorSettings};
 
 /// What the modules get each frame: the most recent samples (mono, oldest
 /// first) and where they sit in the stream.

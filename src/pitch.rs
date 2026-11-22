@@ -7,7 +7,9 @@
 //! from a short window, so that is the default. FFT stays selectable for
 //! material where it behaves better (e.g. noisy, harmonically dense sources).
 
-pub const NOTE_NAMES: [&str; 12] = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+pub const NOTE_NAMES: [&str; 12] = [
+    "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+];
 
 /// MIDI note number (fractional) for a frequency, A4 = 440 Hz = 69.
 pub fn freq_to_midi(f: f32, a4: f32) -> f32 {
@@ -19,7 +21,11 @@ pub fn midi_to_freq(m: f32, a4: f32) -> f32 {
 }
 
 pub fn note_name(midi: i32) -> String {
-    format!("{}{}", NOTE_NAMES[midi.rem_euclid(12) as usize], midi.div_euclid(12) - 1)
+    format!(
+        "{}{}",
+        NOTE_NAMES[midi.rem_euclid(12) as usize],
+        midi.div_euclid(12) - 1
+    )
 }
 
 /// Nearest enabled target note to `midi`, and the offset in cents
@@ -122,9 +128,16 @@ pub fn candidates(x: &[f32], rate: u32, f_min: f32, f_max: f32) -> Candidates {
         }
         let (a, b, c) = (curve[i - 1], curve[i], curve[i + 1]);
         let denom = a - 2.0 * b + c;
-        let shift = if denom.abs() > 1e-9 { (0.5 * (a - c) / denom).clamp(-0.5, 0.5) } else { 0.0 };
+        let shift = if denom.abs() > 1e-9 {
+            (0.5 * (a - c) / denom).clamp(-0.5, 0.5)
+        } else {
+            0.0
+        };
         let peak = b - 0.25 * (a - c) * shift;
-        out.list.push(Candidate { freq: rate as f32 / (i as f32 + shift), clarity: peak.clamp(0.0, 1.0) });
+        out.list.push(Candidate {
+            freq: rate as f32 / (i as f32 + shift),
+            clarity: peak.clamp(0.0, 1.0),
+        });
     };
     while t <= lag_max {
         let v = curve[t];
@@ -157,12 +170,21 @@ mod tests {
     use super::*;
 
     fn sine(f: f32, rate: u32, n: usize) -> Vec<f32> {
-        (0..n).map(|i| (std::f32::consts::TAU * f * i as f32 / rate as f32).sin() * 0.5).collect()
+        (0..n)
+            .map(|i| (std::f32::consts::TAU * f * i as f32 / rate as f32).sin() * 0.5)
+            .collect()
     }
 
     #[test]
     fn detects_low_e() {
-        let f = detect(Method::Autocorrelation, &sine(41.2, 48_000, 8192), 48_000, 30.0, 500.0).unwrap();
+        let f = detect(
+            Method::Autocorrelation,
+            &sine(41.2, 48_000, 8192),
+            48_000,
+            30.0,
+            500.0,
+        )
+        .unwrap();
         assert!((f - 41.2).abs() < 0.1, "{f}");
     }
 

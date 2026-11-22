@@ -57,7 +57,11 @@ fn input(name: &str) -> Result<midir::MidiInput, String> {
 fn list_ports() -> Vec<String> {
     // A fresh client each time: a long-lived one may not see ports come and go.
     match input("zAudioScope scan") {
-        Ok(i) => i.ports().iter().filter_map(|p| i.port_name(p).ok()).collect(),
+        Ok(i) => i
+            .ports()
+            .iter()
+            .filter_map(|p| i.port_name(p).ok())
+            .collect(),
         Err(_) => Vec::new(),
     }
 }
@@ -161,7 +165,11 @@ impl MidiHub {
                     if !(0x80..0xF0).contains(&status) {
                         return;
                     }
-                    let b = [status, msg.get(1).copied().unwrap_or(0), msg.get(2).copied().unwrap_or(0)];
+                    let b = [
+                        status,
+                        msg.get(1).copied().unwrap_or(0),
+                        msg.get(2).copied().unwrap_or(0),
+                    ];
                     if let Ok(mut q) = queue.lock() {
                         q.push(Event { t: now(), b });
                     }
@@ -185,7 +193,11 @@ impl MidiHub {
         let fresh = self.scanned.lock().ok().and_then(|mut s| s.take());
         if let Some(ports) = fresh {
             self.ports = ports;
-            if self.connected.as_ref().is_some_and(|n| !self.ports.contains(n)) {
+            if self
+                .connected
+                .as_ref()
+                .is_some_and(|n| !self.ports.contains(n))
+            {
                 self.disconnect();
                 self.error = None;
             }
@@ -229,22 +241,33 @@ impl MidiHub {
             .selected_text(shown)
             .show_ui(ui, |ui| {
                 let mut pick = None;
-                if ui.selectable_label(self.port.is_none(), "— none —").clicked() {
+                if ui
+                    .selectable_label(self.port.is_none(), "— none —")
+                    .clicked()
+                {
                     pick = Some(None);
                 }
                 // The chosen port while unplugged: shown, but not pickable.
                 if let Some(name) = self.port.as_ref().filter(|_| missing) {
-                    ui.add_enabled(false, egui::Button::selectable(true, format!("{name} (not connected)")));
+                    ui.add_enabled(
+                        false,
+                        egui::Button::selectable(true, format!("{name} (not connected)")),
+                    );
                 }
                 for name in &self.ports {
-                    if ui.selectable_label(self.connected.as_ref() == Some(name), name).clicked() {
+                    if ui
+                        .selectable_label(self.connected.as_ref() == Some(name), name)
+                        .clicked()
+                    {
                         pick = Some(Some(name.clone()));
                     }
                 }
                 pick
             });
         if missing {
-            combo.response.on_hover_text("Device not connected; it reopens when it comes back");
+            combo
+                .response
+                .on_hover_text("Device not connected; it reopens when it comes back");
         }
         if let Some(pick) = combo.inner.flatten() {
             self.select(pick);

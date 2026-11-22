@@ -159,8 +159,9 @@ impl Ring {
         let end = self.written();
         let n = (n as u64).min(len.saturating_sub(slack)).min(end);
         let start = end - n;
-        let out: Vec<f32> =
-            (start..end).map(|i| f32::from_bits(self.buf[(i % len) as usize].load(Ordering::Relaxed))).collect();
+        let out: Vec<f32> = (start..end)
+            .map(|i| f32::from_bits(self.buf[(i % len) as usize].load(Ordering::Relaxed)))
+            .collect();
         // If the writer lapped the oldest samples while we copied (the UI
         // thread stalled for most of the ring's length), drop them.
         let safe = (self.written() + slack).saturating_sub(len);
@@ -298,7 +299,10 @@ impl Input {
     }
 
     pub fn devices() -> Vec<DeviceInfo> {
-        cpal::default_host().input_devices().map(describe).unwrap_or_default()
+        cpal::default_host()
+            .input_devices()
+            .map(describe)
+            .unwrap_or_default()
     }
 
     /// The feed the monitor output plays from.
@@ -310,7 +314,17 @@ impl Input {
     /// default). While paused, only looks the device up.
     pub fn switch(&mut self, device_id: Option<&str>) {
         self.stream = None;
+        // A fresh open supersedes any error latched by the old stream.
+        if let Ok(mut e) = self.shared.error.lock() {
+            *e = None;
+        }
         self.open_error = self.open_stream(device_id).err();
+    }
+
+    /// True while audio is actually arriving: not paused, and the stream
+    /// opened without error. A disconnected interface reads as not connected.
+    pub fn connected(&self) -> bool {
+        !self.paused && self.stream.is_some() && self.error().is_none()
     }
 
     /// Switch to another device picked by the user, restoring the channel
@@ -363,7 +377,10 @@ impl Input {
     /// `filled == capacity`: a full capture's worth is available.
     pub fn captured(&self) -> (usize, usize) {
         let ring = &self.shared.ring;
-        (ring.buf.len(), (ring.written() as usize).min(ring.buf.len()))
+        (
+            ring.buf.len(),
+            (ring.written() as usize).min(ring.buf.len()),
+        )
     }
 
     /// Frames per callback as delivered, 0 before the first one.
@@ -406,7 +423,12 @@ impl Input {
 
     /// Every channel's peak since the last call, after gain.
     pub fn take_all_peaks(&self) -> Vec<f32> {
-        self.shared.ring.all_peaks.iter().map(|p| f32::from_bits(p.swap(0, Ordering::Relaxed))).collect()
+        self.shared
+            .ring
+            .all_peaks
+            .iter()
+            .map(|p| f32::from_bits(p.swap(0, Ordering::Relaxed)))
+            .collect()
     }
 
     pub fn channel(&self) -> ChannelSel {
@@ -440,13 +462,20 @@ impl Input {
 
     fn open_stream(&mut self, device_id: Option<&str>) -> Result<(), String> {
         let host = cpal::default_host();
-        let device = by_id(&host, device_id).or_else(|| host.default_input_device()).ok_or("no input device")?;
+        let device = by_id(&host, device_id)
+            .or_else(|| host.default_input_device())
+            .ok_or("no input device")?;
         self.device_id = device.id().ok().map(|id| id.to_string());
         self.device_name = device_name(&device, "input");
 
         let default = device.default_input_config().map_err(|e| e.to_string())?;
-        let ranges: Vec<_> = device.supported_input_configs().map(|r| r.collect()).unwrap_or_default();
-        let supports = |c: &cpal::SupportedStreamConfigRange, r: u32| c.min_sample_rate() <= r && r <= c.max_sample_rate();
+        let ranges: Vec<_> = device
+            .supported_input_configs()
+            .map(|r| r.collect())
+            .unwrap_or_default();
+        let supports = |c: &cpal::SupportedStreamConfigRange, r: u32| {
+            c.min_sample_rate() <= r && r <= c.max_sample_rate()
+        };
         self.default_rate = default.sample_rate();
         self.rates = STANDARD_RATES
             .into_iter()
@@ -456,14 +485,21 @@ impl Input {
         self.rates.sort_unstable();
         self.rates.dedup();
 
-        let rate = self.want_rate.filter(|r| self.rates.contains(r)).unwrap_or(self.default_rate);
+        let rate = self
+            .want_rate
+            .filter(|r| self.rates.contains(r))
+            .unwrap_or(self.default_rate);
         // Every channel the device has at this rate, preferring the default
         // sample format, then f32.
         let config = ranges
             .into_iter()
             .filter(|c| supports(c, rate))
             .max_by_key(|c| {
-                (c.channels(), c.sample_format() == default.sample_format(), c.sample_format() == cpal::SampleFormat::F32)
+                (
+                    c.channels(),
+                    c.sample_format() == default.sample_format(),
+                    c.sample_format() == cpal::SampleFormat::F32,
+                )
             })
             .filter(|c| c.channels() >= default.channels())
             .and_then(|c| c.try_with_sample_rate(rate))
@@ -471,9 +507,10 @@ impl Input {
         self.rate = config.sample_rate();
         self.channels = config.channels();
         self.buffer_sizes = match *config.buffer_size() {
-            cpal::SupportedBufferSize::Range { min, max } => {
-                STANDARD_BUFFERS.into_iter().filter(|&b| min <= b && b <= max).collect()
-            }
+            cpal::SupportedBufferSize::Range { min, max } => STANDARD_BUFFERS
+                .into_iter()
+                .filter(|&b| min <= b && b <= max)
+                .collect(),
             cpal::SupportedBufferSize::Unknown => Vec::new(),
         };
         let len = (self.rate as usize * self.history_secs as usize).next_power_of_two();
@@ -518,13 +555,21 @@ impl Input {
             f => 2 * f as u64,
         };
         let (samples, start) = self.shared.ring.latest(n, slack);
-        Frame { samples, rate: self.rate, start }
+        Frame {
+            samples,
+            rate: self.rate,
+            start,
+        }
     }
 
     /// Per-channel (L, R) peak since the last call, after gain. A mono
     /// selection reports the same value for both.
     pub fn take_peaks(&self) -> [f32; 2] {
-        self.shared.ring.peaks.each_ref().map(|p| f32::from_bits(p.swap(0, Ordering::Relaxed)))
+        self.shared
+            .ring
+            .peaks
+            .each_ref()
+            .map(|p| f32::from_bits(p.swap(0, Ordering::Relaxed)))
     }
 
     /// The last `n` L/R frames, after gain.
@@ -559,7 +604,9 @@ impl Input {
     }
 
     pub fn error(&self) -> Option<String> {
-        self.open_error.clone().or_else(|| self.shared.error.lock().ok()?.clone())
+        self.open_error
+            .clone()
+            .or_else(|| self.shared.error.lock().ok()?.clone())
     }
 }
 
@@ -588,13 +635,18 @@ struct Taps {
 pub(crate) fn describe(devs: impl Iterator<Item = cpal::Device>) -> Vec<DeviceInfo> {
     devs.filter_map(|d| {
         let id = d.id().ok()?.to_string();
-        Some(DeviceInfo { name: device_name(&d, &id), id })
+        Some(DeviceInfo {
+            name: device_name(&d, &id),
+            id,
+        })
     })
     .collect()
 }
 
 pub(crate) fn device_name(d: &cpal::Device, fallback: &str) -> String {
-    d.description().map(|x| x.name().to_owned()).unwrap_or_else(|_| fallback.to_owned())
+    d.description()
+        .map(|x| x.name().to_owned())
+        .unwrap_or_else(|_| fallback.to_owned())
 }
 
 /// A saved device id, if that device is present.
@@ -602,12 +654,22 @@ pub(crate) fn by_id(host: &cpal::Host, id: Option<&str>) -> Option<cpal::Device>
     host.device_by_id(&id?.parse::<cpal::DeviceId>().ok()?)
 }
 
-fn build<T>(device: &cpal::Device, config: cpal::StreamConfig, taps: Taps) -> Result<cpal::Stream, String>
+fn build<T>(
+    device: &cpal::Device,
+    config: cpal::StreamConfig,
+    taps: Taps,
+) -> Result<cpal::Stream, String>
 where
     T: SizedSample,
     f32: FromSample<T>,
 {
-    let Taps { sh, gain, channel, meter_all, monitor } = taps;
+    let Taps {
+        sh,
+        gain,
+        channel,
+        meter_all,
+        monitor,
+    } = taps;
     let in_rate = config.sample_rate;
     let ch = config.channels.max(1) as usize;
     let err_sh = sh.clone();

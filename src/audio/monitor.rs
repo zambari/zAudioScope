@@ -35,7 +35,11 @@ pub struct MonitorSettings {
 
 impl Default for MonitorSettings {
     fn default() -> Self {
-        Self { device_id: None, gain: 0.5, guard: true }
+        Self {
+            device_id: None,
+            gain: 0.5,
+            guard: true,
+        }
     }
 }
 
@@ -123,7 +127,10 @@ impl Monitor {
     }
 
     pub fn devices() -> Vec<DeviceInfo> {
-        cpal::default_host().output_devices().map(describe).unwrap_or_default()
+        cpal::default_host()
+            .output_devices()
+            .map(describe)
+            .unwrap_or_default()
     }
 
     pub fn enabled(&self) -> bool {
@@ -153,7 +160,10 @@ impl Monitor {
     }
 
     pub fn set_gain(&self, g: f32) {
-        self.sh.gain.store(g.clamp(0.0, crate::ui::meter::GAIN_MAX).to_bits(), Ordering::Relaxed);
+        self.sh.gain.store(
+            g.clamp(0.0, crate::ui::meter::GAIN_MAX).to_bits(),
+            Ordering::Relaxed,
+        );
     }
 
     pub fn guard(&self) -> bool {
@@ -183,11 +193,16 @@ impl Monitor {
 
     /// Output (L, R) peak since the last call, as sent to the device.
     pub fn take_peaks(&self) -> [f32; 2] {
-        self.sh.peaks.each_ref().map(|p| f32::from_bits(p.swap(0, Ordering::Relaxed)))
+        self.sh
+            .peaks
+            .each_ref()
+            .map(|p| f32::from_bits(p.swap(0, Ordering::Relaxed)))
     }
 
     pub fn error(&self) -> Option<String> {
-        self.open_error.clone().or_else(|| self.sh.error.lock().ok()?.clone())
+        self.open_error
+            .clone()
+            .or_else(|| self.sh.error.lock().ok()?.clone())
     }
 
     fn open(&mut self) -> Result<(), String> {
@@ -283,7 +298,13 @@ impl Player {
         }
     }
 
-    fn render<T: SizedSample + FromSample<f32>>(&mut self, data: &mut [T], ch: usize, sh: &Shared, tap: &MonitorTap) {
+    fn render<T: SizedSample + FromSample<f32>>(
+        &mut self,
+        data: &mut [T],
+        ch: usize,
+        sh: &Shared,
+        tap: &MonitorTap,
+    ) {
         let silence = T::from_sample(0.0f32);
         if sh.rearm.swap(false, Ordering::Relaxed) {
             sh.trip.store(0, Ordering::Relaxed);
@@ -342,13 +363,18 @@ impl Player {
             let (l, r) = (l0 + (l1 - l0) * t, r0 + (r1 - r0) * t);
             pos += step;
 
-            if guard_on && !tripped {
-                if let Some(trip) = self.guard.feed(l, r, gain, sensitive) {
-                    sh.trip.store(trip.bits(), Ordering::Relaxed);
-                    tripped = true;
-                }
+            if guard_on
+                && !tripped
+                && let Some(trip) = self.guard.feed(l, r, gain, sensitive)
+            {
+                sh.trip.store(trip.bits(), Ordering::Relaxed);
+                tripped = true;
             }
-            self.mute = if tripped { (self.mute - mute_step).max(0.0) } else { 1.0 };
+            self.mute = if tripped {
+                (self.mute - mute_step).max(0.0)
+            } else {
+                1.0
+            };
             self.fade = (self.fade + fade_step).min(1.0);
             let g = gain * self.mute * self.fade * self.fade;
             let (l, r) = (soft_clip(l * g), soft_clip(r * g));
@@ -375,7 +401,11 @@ impl Player {
 fn soft_clip(x: f32) -> f32 {
     const KNEE: f32 = 0.89;
     let a = x.abs();
-    if a <= KNEE { x } else { x.signum() * (KNEE + (1.0 - KNEE) * ((a - KNEE) / (1.0 - KNEE)).tanh()) }
+    if a <= KNEE {
+        x
+    } else {
+        x.signum() * (KNEE + (1.0 - KNEE) * ((a - KNEE) / (1.0 - KNEE)).tanh())
+    }
 }
 
 const GUARD_BLOCK_S: f32 = 0.01;
@@ -457,11 +487,18 @@ impl Guard {
             return None;
         }
         self.live += 1;
-        let (max_crest, min_seg, rise_db) = if sensitive { (3.0, 1.0, 8.0) } else { (2.2, 1.5, 12.0) };
+        let (max_crest, min_seg, rise_db) = if sensitive {
+            (3.0, 1.0, 8.0)
+        } else {
+            (2.2, 1.5, 12.0)
+        };
         let tonal = self.crest < max_crest;
         const SPAN: usize = SEGS * SEG;
-        let rises: [f32; SEGS] = std::array::from_fn(|k| self.ago(k * SEG) - self.ago((k + 1) * SEG));
-        let (lo, hi) = rises.iter().fold((f32::MAX, f32::MIN), |(lo, hi), &r| (lo.min(r), hi.max(r)));
+        let rises: [f32; SEGS] =
+            std::array::from_fn(|k| self.ago(k * SEG) - self.ago((k + 1) * SEG));
+        let (lo, hi) = rises
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(lo, hi), &r| (lo.min(r), hi.max(r)));
         let steady = (0..SPAN).all(|k| self.ago(k) >= self.ago(k + 1) - 0.5);
         // Every stretch rising by about as much: a straight line in dB, not
         // an attack settling.
@@ -477,8 +514,16 @@ impl Guard {
         }
         // A tone held at clipping for 300 ms; next to its own speakers, a
         // loud tone held for a second.
-        let held = if sensitive { peak > 0.3 && self.crest < 1.8 } else { false };
-        self.hot = if (peak > 0.95 && self.crest < 2.0) || held { self.hot + 1 } else { 0 };
+        let held = if sensitive {
+            peak > 0.3 && self.crest < 1.8
+        } else {
+            false
+        };
+        self.hot = if (peak > 0.95 && self.crest < 2.0) || held {
+            self.hot + 1
+        } else {
+            0
+        };
         let limit = if peak > 0.95 { 30 } else { 100 };
         (self.hot >= limit).then_some(Trip::Howl)
     }
@@ -517,20 +562,31 @@ mod tests {
         assert_eq!(run(&mut g, 4.0, false, kick), None);
         // A steady tuning note, starting from silence.
         let mut g = Guard::new(48_000.0);
-        assert_eq!(run(&mut g, 4.0, false, |t| 0.5 * (t * 110.0 * std::f32::consts::TAU).sin()), None);
+        assert_eq!(
+            run(&mut g, 4.0, false, |t| 0.5
+                * (t * 110.0 * std::f32::consts::TAU).sin()),
+            None
+        );
         // A quieter one even next to the speakers.
         let mut g = Guard::new(48_000.0);
-        assert_eq!(run(&mut g, 4.0, true, |t| 0.2 * (t * 110.0 * std::f32::consts::TAU).sin()), None);
+        assert_eq!(
+            run(&mut g, 4.0, true, |t| 0.2
+                * (t * 110.0 * std::f32::consts::TAU).sin()),
+            None
+        );
         // A sine pad with a slow 400 ms linear attack, every second.
         let mut g = Guard::new(48_000.0);
-        let pad = |t: f32| 0.8 * ((t % 1.0) / 0.4).min(1.0) * (t * 220.0 * std::f32::consts::TAU).sin();
+        let pad =
+            |t: f32| 0.8 * ((t % 1.0) / 0.4).min(1.0) * (t * 220.0 * std::f32::consts::TAU).sin();
         assert_eq!(run(&mut g, 4.0, false, pad), None);
     }
 
     #[test]
     fn clipped_tone_trips() {
         let mut g = Guard::new(48_000.0);
-        let hit = run(&mut g, 1.0, false, |t| (3.0 * (t * 800.0 * std::f32::consts::TAU).sin()).clamp(-1.0, 1.0));
+        let hit = run(&mut g, 1.0, false, |t| {
+            (3.0 * (t * 800.0 * std::f32::consts::TAU).sin()).clamp(-1.0, 1.0)
+        });
         assert_eq!(hit, Some(Trip::Howl));
     }
 }

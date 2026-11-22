@@ -5,7 +5,7 @@
 //! above my ceiling" is then a lookup.
 //!
 //! Levels use the spectrum's scale: a full-scale sine reads 0 dB (block RMS
-//! + 3 dB), so a ceiling at 0 dB is where a sine's spectral peak tops out.
+//! plus 3 dB), so a ceiling at 0 dB is where a sine's spectral peak tops out.
 //! Close enough for tonal material; broadband material spreads over many
 //! FFT bins and reads lower there than here.
 
@@ -32,7 +32,9 @@ pub struct LevelDist {
 
 impl Default for LevelDist {
     fn default() -> Self {
-        Self { cdf: [0.0; BINS + 1] }
+        Self {
+            cdf: [0.0; BINS + 1],
+        }
     }
 }
 
@@ -47,7 +49,11 @@ impl LevelDist {
 
     /// Fraction of recent time (0..1) the level sat above `db`.
     pub fn above(&self, db: f32) -> f32 {
-        if self.cdf[BINS] > 0.0 { 1.0 - self.below(db) } else { 0.0 }
+        if self.cdf[BINS] > 0.0 {
+            1.0 - self.below(db)
+        } else {
+            0.0
+        }
     }
 }
 
@@ -63,7 +69,12 @@ pub struct LevelHistogram {
 
 impl Default for LevelHistogram {
     fn default() -> Self {
-        Self { bins: [0.0; BINS], pos: 0, acc: (0.0, 0), dist: Rc::default() }
+        Self {
+            bins: [0.0; BINS],
+            pos: 0,
+            acc: (0.0, 0),
+            dist: Rc::default(),
+        }
     }
 }
 

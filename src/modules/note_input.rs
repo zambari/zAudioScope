@@ -43,9 +43,14 @@ impl Decimator {
                     return 1.0;
                 }
                 let t = i as f32 - mid;
-                let sinc = if t == 0.0 { 2.0 * fc } else { (std::f32::consts::TAU * fc * t).sin() / (std::f32::consts::PI * t) };
+                let sinc = if t == 0.0 {
+                    2.0 * fc
+                } else {
+                    (std::f32::consts::TAU * fc * t).sin() / (std::f32::consts::PI * t)
+                };
                 let u = i as f32 / (len - 1) as f32;
-                let w = 0.42 - 0.5 * (std::f32::consts::TAU * u).cos() + 0.08 * (2.0 * std::f32::consts::TAU * u).cos();
+                let w = 0.42 - 0.5 * (std::f32::consts::TAU * u).cos()
+                    + 0.08 * (2.0 * std::f32::consts::TAU * u).cos();
                 sinc * w
             })
             .collect();
@@ -73,7 +78,11 @@ impl Decimator {
         (0..count)
             .map(|j| {
                 let s = first + j * self.factor;
-                x[s..s + len].iter().zip(&self.taps).map(|(a, b)| a * b).sum()
+                x[s..s + len]
+                    .iter()
+                    .zip(&self.taps)
+                    .map(|(a, b)| a * b)
+                    .sum()
             })
             .collect()
     }
@@ -142,19 +151,29 @@ impl NoteInput {
 
         let f_hi = pitch::midi_to_freq(range.span().1 + 0.5, want.a4);
         let factor = Decimator::factor_for(rate, f_hi, want.oversample);
-        if !self.decim.as_ref().is_some_and(|d| d.rate == rate && d.factor == factor) {
+        if !self
+            .decim
+            .as_ref()
+            .is_some_and(|d| d.rate == rate && d.factor == factor)
+        {
             self.decim = Some(Decimator::new(rate, factor));
         }
         costs.tick();
         let d = self.decim.as_ref().unwrap();
         let window = (want.window_ms / 1000.0 * rate as f32) as usize;
         let x = shared.analysis_slice(want.lookback(rate));
-        let y = costs.time(0, || d.run(&x[x.len().saturating_sub(window + d.taps.len())..]));
+        let y = costs.time(0, || {
+            d.run(&x[x.len().saturating_sub(window + d.taps.len())..])
+        });
         let r = d.out_rate();
         let keep = (want.window_ms / 1000.0 * r as f32) as usize;
         let y = y[y.len().saturating_sub(keep)..].to_vec();
         let rms = (y.iter().map(|s| s * s).sum::<f32>() / y.len().max(1) as f32).sqrt();
-        Some(Window { y, rate: r, level_db: 20.0 * rms.max(1e-9).log10() })
+        Some(Window {
+            y,
+            rate: r,
+            level_db: 20.0 * rms.max(1e-9).log10(),
+        })
     }
 }
 
@@ -209,7 +228,9 @@ mod tests {
         let d = Decimator::new(rate, Decimator::factor_for(rate, 300.0, 10.0));
         assert!(d.factor > 1);
         let y = d.run(&x);
-        let f = pitch::candidates(&y, d.out_rate(), 30.0, 300.0).pick().unwrap();
+        let f = pitch::candidates(&y, d.out_rate(), 30.0, 300.0)
+            .pick()
+            .unwrap();
         assert!((f - 41.2).abs() < 0.05, "{f}");
     }
 }

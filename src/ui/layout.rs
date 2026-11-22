@@ -5,9 +5,9 @@ use std::collections::BTreeMap;
 use egui::{Align, Align2, FontId, Id, Layout, Rect, Sense, Stroke, Ui, UiBuilder, pos2, vec2};
 use serde::{Deserialize, Serialize};
 
-use super::{noterange, plot, theme, widgets};
 use super::outside as noterange_outside;
-use crate::modules::{Shared, Slot, tuner};
+use super::{noterange, plot, theme, widgets};
+use crate::modules::{Module, Shared, Slot, tuner};
 
 const DIVIDER: f32 = 8.0;
 const HEADER: f32 = 22.0;
@@ -16,6 +16,9 @@ const INSPECTOR_MIN: f32 = 270.0;
 const DISPLAY_MIN: f32 = 72.0;
 /// Height reserved for the tab row above the display column.
 const TABS: f32 = 24.0;
+/// Share of the Composite page given to its own-pane analyser (the scope)
+/// when it is on, until the divider is dragged.
+const SCOPE_SHARE: f32 = 0.5;
 
 /// The display column's page, as saved. Solo keeps the title so the choice
 /// survives reordering and an analyzer being switched off for a while.
@@ -44,12 +47,28 @@ struct MixLayer {
 }
 
 impl MixLayer {
-    /// First-time mixer state for an analyzer. The scope starts off at half
-    /// opacity so it doesn't swamp the other layers until asked for.
-    fn default_for(title: &str) -> Self {
-        let (on, opacity) = if title == "Scope" { (false, 0.5) } else { (true, 1.0) };
-        Self { title: title.to_owned(), on, opacity }
+    /// First-time mixer state for an analyzer. Own-pane analysers (the scope)
+    /// start off, so the composite stays as it was until asked for.
+    fn default_for(title: &str, own_pane: bool) -> Self {
+        Self {
+            title: title.to_owned(),
+            on: !own_pane,
+            opacity: 1.0,
+        }
     }
+}
+
+/// Whether an analyzer takes part in Composite at all: as a stacked layer or
+/// in its own pane.
+fn in_composite(module: &dyn Module) -> bool {
+    module.layer_depth().is_some() || module.composite_pane()
+}
+
+/// Whether `title` is an analyzer drawn in its own Composite pane.
+fn own_pane(slots: &[Slot], title: &str) -> bool {
+    slots
+        .iter()
+        .any(|s| s.module.title() == title && s.module.composite_pane())
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -59,8 +78,10 @@ pub struct Workspace {
     /// Keyed by title so hiding or adding modules preserves their sizes.
     weights: BTreeMap<String, f32>,
     view: View,
-    /// Composite layers, bottom first.
+    /// Composite layers, bottom first, then own-pane analysers below them.
     mix: Vec<MixLayer>,
+    /// Fraction of the Composite page given to the own-pane analyser.
+    scope_share: f32,
     /// Stack and inspector order by title, top first; reordered by dragging
     /// a display header. Analysis still runs in slot order (scope first).
     order: Vec<String>,
@@ -88,6 +109,7 @@ impl Default for Workspace {
             weights: BTreeMap::new(),
             view: View::Stack,
             mix: Vec::new(),
+            scope_share: SCOPE_SHARE,
             order: Vec::new(),
             touched: None,
             reveal: None,
@@ -99,12 +121,22 @@ impl Default for Workspace {
 }
 
 impl Workspace {
-    pub fn show(&mut self, ui: &mut Ui, slots: &mut [Slot], shared: &Shared, marks: &[f32], profiler: &mut super::profiler::Profiler) {
+    pub fn show(
+        &mut self,
+        ui: &mut Ui,
+        slots: &mut [Slot],
+        shared: &Shared,
+        marks: &[f32],
+        profiler: &mut super::profiler::Profiler,
+    ) {
         let full = ui.available_rect_before_wrap();
         ui.allocate_rect(full, Sense::hover());
         let area = Rect::from_min_max(
             full.min,
-            pos2(full.right(), (full.bottom() - 8.0 - noterange::BAR_H).max(full.top())),
+            pos2(
+                full.right(),
+                (full.bottom() - 8.0 - noterange::BAR_H).max(full.top()),
+            ),
         );
         let max_width = (area.width() - 240.0 - DIVIDER).max(0.0);
         let min_width = INSPECTOR_MIN.min(max_width);
@@ -130,11 +162,20 @@ impl Workspace {
         );
         let column = Rect::from_min_max(pos2(inspector.right() + DIVIDER, area.top()), area.max);
         let ordered = self.sync_order(slots);
-        let visible: Vec<usize> = ordered.iter().copied().filter(|&i| slots[i].visible).collect();
+        let visible: Vec<usize> = ordered
+            .iter()
+            .copied()
+            .filter(|&i| slots[i].visible)
+            .collect();
         self.sync_mix(slots);
-        let layered = visible.iter().any(|&i| slots[i].module.layer_depth().is_some());
+        let layered = visible
+            .iter()
+            .any(|&i| in_composite(slots[i].module.as_ref()));
         let merged = merges(slots, &visible);
-        let overlays: Vec<(usize, &str)> = merged.iter().map(|&(h, g)| (h, slots[g].module.title())).collect();
+        let overlays: Vec<(usize, &str)> = merged
+            .iter()
+            .map(|&(h, g)| (h, slots[g].module.title()))
+            .collect();
         // A page whose analyzers are all off falls back to the stack.
         let mut current = match &self.view {
             View::Composite if layered => Tab::Composite,
@@ -167,7 +208,9 @@ impl Workspace {
                 Tab::Solo(title) => View::Solo(title.to_owned()),
             };
             if let Tab::Solo(title) = current
-                && let Some(slot) = slots.iter_mut().find(|s| s.module.title() == title && !s.visible)
+                && let Some(slot) = slots
+                    .iter_mut()
+                    .find(|s| s.module.title() == title && !s.visible)
             {
                 // Shown from the next frame, once the layout includes it.
                 slot.visible = true;
@@ -204,7 +247,7 @@ impl Workspace {
                     // Solo and Composite focus the inspector on what they show.
                     let shown = match current {
                         Tab::Stack => !slot.module.solo_only(),
-                        Tab::Composite => slot.module.layer_depth().is_some(),
+                        Tab::Composite => in_composite(slot.module.as_ref()),
                         // A solo overlay also shows the graph it draws over.
                         Tab::Solo(solo) => solo == title || overlays.contains(&(i, solo)),
                     };
@@ -234,11 +277,14 @@ impl Workspace {
                                 });
                             });
                             if !slot.visible {
-                                ui.painter().set(background, egui::Shape::rect_filled(
-                                    content.response.rect.expand(3.0),
-                                    0.0,
-                                    egui::Color32::from_black_alpha(77),
-                                ));
+                                ui.painter().set(
+                                    background,
+                                    egui::Shape::rect_filled(
+                                        content.response.rect.expand(3.0),
+                                        0.0,
+                                        egui::Color32::from_black_alpha(77),
+                                    ),
+                                );
                             }
                             ui.add_space(6.0);
                         }
@@ -272,10 +318,15 @@ impl Workspace {
                 self.displays(ui, displays, slots, &rows, &merged, true, shared, profiler)
             }
             Tab::Solo(title) => {
-                let solo: Vec<usize> = visible.into_iter().filter(|&i| slots[i].module.title() == title).collect();
+                let solo: Vec<usize> = visible
+                    .into_iter()
+                    .filter(|&i| slots[i].module.title() == title)
+                    .collect();
                 // An overlay's solo page draws it over its host; a host's is plain.
                 match merged.iter().find(|m| solo.contains(&m.1)) {
-                    Some(&m) => self.displays(ui, displays, slots, &[m.0], &[m], false, shared, profiler),
+                    Some(&m) => {
+                        self.displays(ui, displays, slots, &[m.0], &[m], false, shared, profiler)
+                    }
                     None => self.displays(ui, displays, slots, &solo, &[], false, shared, profiler),
                 }
             }
@@ -289,7 +340,12 @@ impl Workspace {
             let y = start.y.clamp(viewport.top(), viewport.bottom());
             // A header scrolled out of view keeps only the corner, pointing at it.
             let points = if y == start.y {
-                vec![pos2(start.x.min(turn_x), y), pos2(turn_x, y), pos2(turn_x, end.y), end]
+                vec![
+                    pos2(start.x.min(turn_x), y),
+                    pos2(turn_x, y),
+                    pos2(turn_x, end.y),
+                    end,
+                ]
             } else {
                 vec![pos2(turn_x, y), pos2(turn_x, end.y), end]
             };
@@ -313,15 +369,31 @@ impl Workspace {
             let rate = shared.frame.rate;
             let start = profiler.start();
             let (n, coarse, reused) = shared.any_spectrum(noterange_outside::COARSE_FFT);
-            profiler.record("Range", if reused { "coarse FFT shared" } else { "coarse FFT own" }, start);
+            profiler.record(
+                "Range",
+                if reused {
+                    "coarse FFT shared"
+                } else {
+                    "coarse FFT own"
+                },
+                start,
+            );
             let start = profiler.start();
-            let (d, fn_) = (noterange_outside::FINE_DECIMATE, noterange_outside::FINE_FFT);
+            let (d, fn_) = (
+                noterange_outside::FINE_DECIMATE,
+                noterange_outside::FINE_FFT,
+            );
             let fine = shared.decimated_spectrum(d, fn_);
             profiler.record("Range", "fine FFT /16", start);
             let start = profiler.start();
             let fine_rate = rate as f32 / d as f32;
             self.outside.update(
-                &noterange_outside::Source::new(&fine, fine_rate, fn_, fine_rate * noterange_outside::FINE_TOP),
+                &noterange_outside::Source::new(
+                    &fine,
+                    fine_rate,
+                    fn_,
+                    fine_rate * noterange_outside::FINE_TOP,
+                ),
                 &noterange_outside::Source::new(&coarse, rate as f32, n, rate as f32 / 2.0),
                 rate,
                 range,
@@ -332,7 +404,11 @@ impl Workspace {
         }
         let start = profiler.start();
         // Live pitch markers only where a pitch source is the point of the page.
-        let marks = if matches!(current, Tab::Stack | Tab::Solo(tuner::TITLE)) { marks } else { &[] };
+        let marks = if matches!(current, Tab::Stack | Tab::Solo(tuner::TITLE)) {
+            marks
+        } else {
+            &[]
+        };
         let outside = self.range_fft.then_some(&self.outside);
         if self.glow.update(&shared.midi) {
             ui.ctx().request_repaint();
@@ -356,9 +432,15 @@ impl Workspace {
     /// everything (the caller still limits this to visible slots).
     pub fn requested(&self, slots: &[Slot]) -> Vec<bool> {
         let all = vec![true; slots.len()];
-        let View::Solo(title) = &self.view else { return all };
+        let View::Solo(title) = &self.view else {
+            return all;
+        };
         let visible: Vec<usize> = (0..slots.len()).filter(|&i| slots[i].visible).collect();
-        let Some(solo) = visible.iter().copied().find(|&i| slots[i].module.title() == title.as_str()) else {
+        let Some(solo) = visible
+            .iter()
+            .copied()
+            .find(|&i| slots[i].module.title() == title.as_str())
+        else {
             return all;
         };
         let mut wanted = vec![false; slots.len()];
@@ -374,7 +456,8 @@ impl Workspace {
     fn sync_order(&mut self, slots: &[Slot]) -> Vec<usize> {
         let index = |title: &str| slots.iter().position(|s| s.module.title() == title);
         let mut seen = std::collections::BTreeSet::new();
-        self.order.retain(|t| index(t).is_some() && seen.insert(t.clone()));
+        self.order
+            .retain(|t| index(t).is_some() && seen.insert(t.clone()));
         for slot in slots {
             if !self.order.iter().any(|t| t == slot.module.title()) {
                 self.order.push(slot.module.title().to_owned());
@@ -383,41 +466,142 @@ impl Workspace {
         self.order.iter().filter_map(|t| index(t)).collect()
     }
 
-    /// Keep one mix entry per layerable analyzer, stacked by depth: the
-    /// opaque waterfall at the bottom, then scope trace, spectrum, tuner, and MIDI notes on top.
+    /// Keep one mix entry per Composite analyzer, stacked by depth: the
+    /// opaque waterfall at the bottom, then spectrum, tuner, and MIDI notes on
+    /// top. Own-pane analysers (the scope) sort last, below a separator.
     fn sync_mix(&mut self, slots: &[Slot]) {
-        let depth = |title: &str| {
-            slots.iter().find(|s| s.module.title() == title).and_then(|s| s.module.layer_depth())
+        let info = |title: &str| {
+            slots.iter().find(|s| s.module.title() == title).map(|s| {
+                (
+                    s.module.layer_depth().unwrap_or(0),
+                    s.module.composite_pane(),
+                )
+            })
         };
-        self.mix.retain(|l| depth(&l.title).is_some());
+        self.mix.retain(|l| info(&l.title).is_some());
         for slot in slots {
             let title = slot.module.title();
-            if slot.module.layer_depth().is_some() && !self.mix.iter().any(|l| l.title == title) {
-                self.mix.push(MixLayer::default_for(title));
+            if in_composite(slot.module.as_ref()) && !self.mix.iter().any(|l| l.title == title) {
+                self.mix
+                    .push(MixLayer::default_for(title, slot.module.composite_pane()));
             }
         }
-        self.mix.sort_by_key(|l| depth(&l.title));
+        // Own-pane entries first in ascending order, so they come last in the
+        // mixer (which lists top first) and at the bottom of the page.
+        self.mix.sort_by_key(|l| {
+            let (depth, pane) = info(&l.title).unwrap_or((0, false));
+            (!pane, depth)
+        });
         for l in &mut self.mix {
-            l.opacity = if l.opacity.is_finite() { l.opacity.clamp(0.0, 1.0) } else { 1.0 };
+            l.opacity = if l.opacity.is_finite() {
+                l.opacity.clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
         }
     }
 
     /// Every layerable analyzer that is on, drawn bottom to top over a shared
-    /// note grid in one panel. The Layers button opens the mixer.
-    fn composite(&mut self, ui: &mut Ui, area: Rect, slots: &mut [Slot], shared: &Shared, profiler: &mut super::profiler::Profiler) -> BTreeMap<String, Rect> {
+    /// note grid in one panel. An own-pane analyser (the scope) gets its own
+    /// pane under the layers, split off by a draggable divider. The Layers
+    /// button opens the mixer.
+    fn composite(
+        &mut self,
+        ui: &mut Ui,
+        area: Rect,
+        slots: &mut [Slot],
+        shared: &Shared,
+        profiler: &mut super::profiler::Profiler,
+    ) -> BTreeMap<String, Rect> {
         let mut panels = BTreeMap::new();
-        ui.painter().rect_filled(area, 2.0, ui.visuals().extreme_bg_color);
-        let graph = Rect::from_min_max(pos2(area.left() + 1.0, area.top() + HEADER), area.max - vec2(1.0, 1.0));
+        // The own-pane analyser shown this frame, if any.
+        let pane = slots.iter().position(|s| {
+            s.visible
+                && s.module.composite_pane()
+                && self.mix.iter().any(|l| l.on && l.title == s.module.title())
+        });
+        let Some(pane) = pane else {
+            self.layers(ui, area, slots, shared, profiler, &mut panels);
+            return panels;
+        };
+        if !self.scope_share.is_finite() {
+            self.scope_share = SCOPE_SHARE;
+        }
+        // Same split as the stack: a divider between the layers and the pane.
+        let avail = (area.height() - DIVIDER).max(0.0);
+        let minimum = DISPLAY_MIN.min(avail * 0.5);
+        let limit = |h: f32| h.clamp(minimum, (avail - minimum).max(minimum));
+        let lower = limit(avail * self.scope_share.clamp(0.0, 1.0));
+        let split = area.bottom() - lower - DIVIDER;
+        let divider_rect =
+            Rect::from_min_size(pos2(area.left(), split), vec2(area.width(), DIVIDER));
+        let response = divider(
+            ui,
+            ui.scope_id().with("composite_divider"),
+            divider_rect,
+            false,
+        );
+        // A drag takes effect from the next frame, when the panes are laid out again.
+        if response.dragged() || response.double_clicked() {
+            let next = if response.double_clicked() {
+                avail * 0.5
+            } else {
+                lower - response.drag_delta().y
+            };
+            self.scope_share = if avail > 0.0 {
+                limit(next) / avail
+            } else {
+                SCOPE_SHARE
+            };
+        }
+        let top = Rect::from_min_max(area.min, pos2(area.right(), split));
+        let below = Rect::from_min_max(pos2(area.left(), split + DIVIDER), area.max);
+        self.layers(ui, top, slots, shared, profiler, &mut panels);
+        scope_pane(ui, below, &mut slots[pane], shared, profiler, &mut panels);
+        panels
+    }
+
+    /// The stacked layers, drawn over a shared note grid in `area`.
+    fn layers(
+        &mut self,
+        ui: &mut Ui,
+        area: Rect,
+        slots: &mut [Slot],
+        shared: &Shared,
+        profiler: &mut super::profiler::Profiler,
+        panels: &mut BTreeMap<String, Rect>,
+    ) {
+        ui.painter()
+            .rect_filled(area, 2.0, ui.visuals().extreme_bg_color);
+        let graph = Rect::from_min_max(
+            pos2(area.left() + 1.0, area.top() + HEADER),
+            area.max - vec2(1.0, 1.0),
+        );
         let sized = graph.height() >= 44.0 && graph.width() >= 24.0;
-        if sized && !shared.signal {
-            widgets::no_signal(ui, graph);
+        if sized && let Some(label) = shared.idle_label() {
+            widgets::placeholder(ui, graph, label);
         } else if sized {
-            plot::note_grid(&ui.painter().with_clip_rect(graph), graph, shared.range.get());
-            for layer in self.mix.iter().filter(|l| l.on && l.opacity > 0.0) {
-                let Some(slot) = slots.iter_mut().find(|s| s.visible && s.module.title() == layer.title) else { continue };
+            plot::note_grid(
+                &ui.painter().with_clip_rect(graph),
+                graph,
+                shared.range.get(),
+            );
+            let stacked: Vec<(String, f32)> = self
+                .mix
+                .iter()
+                .filter(|l| l.on && l.opacity > 0.0 && !own_pane(slots, &l.title))
+                .map(|l| (l.title.clone(), l.opacity))
+                .collect();
+            for (title, opacity) in stacked {
+                let Some(slot) = slots
+                    .iter_mut()
+                    .find(|s| s.visible && s.module.title() == title)
+                else {
+                    continue;
+                };
                 let start = profiler.start();
                 let mut pane = child(ui, ("composite", slot.module.title()), graph);
-                pane.set_opacity(layer.opacity);
+                pane.set_opacity(opacity);
                 slot.module.layer(&mut pane, graph, shared);
                 panels.insert(slot.module.title().to_owned(), area);
                 profiler.record("Display", slot.module.title(), start);
@@ -445,27 +629,40 @@ impl Workspace {
         } else {
             egui::Button::new(label.color(super::theme::ON_ACCENT)).fill(super::theme::ACCENT)
         };
-        let button = header.add(button.small()).on_hover_text("Layer visibility and opacity");
+        let button = header
+            .add(button.small())
+            .on_hover_text("Layer visibility and opacity");
         egui::Popup::menu(&button)
             .id(popup_id)
             .close_behavior(egui::PopupCloseBehavior::IgnoreClicks)
             .show(|ui| self.mixer(ui, slots));
-        panels
     }
 
-    /// One row per layer, topmost first: on/off and opacity.
+    /// One row per layer, topmost first: on/off and opacity. Own-pane
+    /// analysers follow a separator, since they are not stacked over the layers.
     fn mixer(&mut self, ui: &mut Ui, slots: &[Slot]) {
+        let mut separated = false;
         for layer in self.mix.iter_mut().rev() {
-            let on = slots.iter().any(|s| s.visible && s.module.title() == layer.title);
+            let pane = own_pane(slots, &layer.title);
+            if pane && !separated {
+                ui.separator();
+                separated = true;
+            }
+            let on = slots
+                .iter()
+                .any(|s| s.visible && s.module.title() == layer.title);
             ui.horizontal(|ui| {
                 ui.add_enabled_ui(on, |ui| {
                     ui.add(widgets::flicktoggle(&mut layer.on));
                     ui.add_sized(vec2(84.0, 18.0), egui::Label::new(&layer.title).truncate());
-                    ui.add_enabled(
-                        layer.on,
-                        egui::Slider::new(&mut layer.opacity, 0.0..=1.0)
-                            .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
-                    );
+                    // A pane has its own space, so only stacked layers fade.
+                    if !pane {
+                        ui.add_enabled(
+                            layer.on,
+                            egui::Slider::new(&mut layer.opacity, 0.0..=1.0)
+                                .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
+                        );
+                    }
                 })
                 .response
                 .on_disabled_hover_text("Turn this analyzer on to layer it");
@@ -478,7 +675,17 @@ impl Workspace {
     /// header's arrow folds or unfolds it and dragging a header reorders.
     #[allow(clippy::too_many_arguments)]
     /// `merged` (host, overlay) pairs: the overlay draws over its host's row.
-    fn displays(&mut self, ui: &mut Ui, area: Rect, slots: &mut [Slot], rows: &[usize], merged: &[(usize, usize)], stack: bool, shared: &Shared, profiler: &mut super::profiler::Profiler) -> BTreeMap<String, Rect> {
+    fn displays(
+        &mut self,
+        ui: &mut Ui,
+        area: Rect,
+        slots: &mut [Slot],
+        rows: &[usize],
+        merged: &[(usize, usize)],
+        stack: bool,
+        shared: &Shared,
+        profiler: &mut super::profiler::Profiler,
+    ) -> BTreeMap<String, Rect> {
         let mut panels = BTreeMap::new();
         if rows.is_empty() {
             ui.painter().text(
@@ -491,7 +698,9 @@ impl Workspace {
             return panels;
         }
         // Row positions (into `rows`) of the panels that get a graph.
-        let expanded: Vec<usize> = (0..rows.len()).filter(|&r| slots[rows[r]].visible).collect();
+        let expanded: Vec<usize> = (0..rows.len())
+            .filter(|&r| slots[rows[r]].visible)
+            .collect();
         let weights: Vec<f32> = expanded
             .iter()
             .map(|&r| {
@@ -510,7 +719,10 @@ impl Workspace {
         let available =
             (area.height() - DIVIDER * (rows.len() - 1) as f32 - HEADER * folded).max(0.0);
         let mut heights = vec![HEADER; rows.len()];
-        for (&r, size) in expanded.iter().zip(proportional_sizes(&weights, available, DISPLAY_MIN)) {
+        for (&r, size) in expanded
+            .iter()
+            .zip(proportional_sizes(&weights, available, DISPLAY_MIN))
+        {
             heights[r] = size;
         }
         let minimum = DISPLAY_MIN.min(available / expanded.len().max(1) as f32);
@@ -575,24 +787,35 @@ impl Workspace {
             }
             let mut pane = child(ui, title, rect);
             let fill = ui.visuals().extreme_bg_color;
-            pane.painter()
-                .rect_filled(rect, 2.0, if slot.visible { fill } else { fill.gamma_multiply(0.5) });
+            pane.painter().rect_filled(
+                rect,
+                2.0,
+                if slot.visible {
+                    fill
+                } else {
+                    fill.gamma_multiply(0.5)
+                },
+            );
             // At the minimum window height, use an overlaid title so the
             // axes still have room even with every analyzer visible.
-            let header = if !slot.visible || height >= DISPLAY_MIN { HEADER } else { 0.0 };
+            let header = if !slot.visible || height >= DISPLAY_MIN {
+                HEADER
+            } else {
+                0.0
+            };
             let graph = Rect::from_min_max(
                 pos2(rect.left() + 1.0, rect.top() + header),
                 rect.max - vec2(1.0, 1.0),
             );
             // Tiny windows still fit; don't pass inverted plot bounds to modules.
             if slot.visible && graph.height() >= 44.0 && graph.width() >= 24.0 {
-                if shared.signal {
+                if let Some(label) = shared.idle_label() {
+                    widgets::placeholder(&pane, graph, label);
+                } else {
                     slot.module.graph(&mut pane, graph, shared);
                     if let Some(g) = guest {
                         slots[g].module.overlay(&mut pane, graph, shared);
                     }
-                } else {
-                    widgets::no_signal(&pane, graph);
                 }
             }
             let slot = &mut slots[i];
@@ -609,20 +832,47 @@ impl Workspace {
             let strip = if header > 0.0 {
                 let strip = rect.with_max_y(rect.top() + HEADER);
                 let font = FontId::proportional(11.0);
-                let name = pane.painter().text(strip.left_center() + vec2(8.0, 0.0), Align2::LEFT_CENTER, label, font, color);
+                let name = pane.painter().text(
+                    strip.left_center() + vec2(8.0, 0.0),
+                    Align2::LEFT_CENTER,
+                    label,
+                    font,
+                    color,
+                );
                 (strip, name.expand2(vec2(6.0, 4.0)))
             } else {
-                let tag = plot::tag(pane.painter(), rect, rect.right_top() + vec2(-6.0, 2.0), Align2::RIGHT_TOP, label, color);
+                let tag = plot::tag(
+                    pane.painter(),
+                    rect,
+                    rect.right_top() + vec2(-6.0, 2.0),
+                    Align2::RIGHT_TOP,
+                    label,
+                    color,
+                );
                 (tag, tag)
             };
             if stack {
                 let (strip, name) = strip;
                 let response = pane
-                    .interact(strip, pane.scope_id().with("panel_header"), Sense::click_and_drag())
-                    .on_hover_text("Click the arrow to fold (switches the analyzer off) · drag to reorder");
+                    .interact(
+                        strip,
+                        pane.scope_id().with("panel_header"),
+                        Sense::click_and_drag(),
+                    )
+                    .on_hover_text(
+                        "Click the arrow to fold (switches the analyzer off) · drag to reorder",
+                    );
                 let on_name = |pos: Option<egui::Pos2>| pos.is_some_and(|p| name.contains(p));
                 if response.hovered() && on_name(response.hover_pos()) {
-                    pane.painter().rect_filled(name, 2.0, ui.visuals().widgets.hovered.weak_bg_fill.gamma_multiply(0.6));
+                    pane.painter().rect_filled(
+                        name,
+                        2.0,
+                        ui.visuals()
+                            .widgets
+                            .hovered
+                            .weak_bg_fill
+                            .gamma_multiply(0.6),
+                    );
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                 } else if response.hovered() {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
@@ -653,16 +903,33 @@ impl Workspace {
             let others: Vec<usize> = (0..rows.len()).filter(|&r| r != from).collect();
             let line_y = match others.get(to) {
                 Some(&r) => rects[r].top() - DIVIDER * 0.5,
-                None => others.last().map_or(rects[from].bottom(), |&r| rects[r].bottom()) + DIVIDER * 0.5,
+                None => {
+                    others
+                        .last()
+                        .map_or(rects[from].bottom(), |&r| rects[r].bottom())
+                        + DIVIDER * 0.5
+                }
             };
             let painter = ui.painter();
-            painter.rect_stroke(rects[from], 2.0, Stroke::new(1.0, theme::ACCENT_BRIGHT.gamma_multiply(0.6)), egui::StrokeKind::Inside);
-            painter.hline(area.x_range(), line_y, Stroke::new(2.0, theme::ACCENT_BRIGHT));
+            painter.rect_stroke(
+                rects[from],
+                2.0,
+                Stroke::new(1.0, theme::ACCENT_BRIGHT.gamma_multiply(0.6)),
+                egui::StrokeKind::Inside,
+            );
+            painter.hline(
+                area.x_range(),
+                line_y,
+                Stroke::new(2.0, theme::ACCENT_BRIGHT),
+            );
             if released {
                 let moved = slots[rows[from]].module.title().to_owned();
                 // Positions in `self.order` of the rows shown, so a solo page
                 // or a missing slot never scrambles the rest.
-                let mut titles: Vec<String> = rows.iter().map(|&i| slots[i].module.title().to_owned()).collect();
+                let mut titles: Vec<String> = rows
+                    .iter()
+                    .map(|&i| slots[i].module.title().to_owned())
+                    .collect();
                 titles.remove(from);
                 titles.insert(to, moved);
                 let mut shown = titles.into_iter();
@@ -684,10 +951,50 @@ fn merges(slots: &[Slot], visible: &[usize]) -> Vec<(usize, usize)> {
         .iter()
         .filter_map(|&g| {
             let host = slots[g].module.stack_over()?;
-            let h = visible.iter().copied().find(|&h| h != g && slots[h].module.title() == host)?;
+            let h = visible
+                .iter()
+                .copied()
+                .find(|&h| h != g && slots[h].module.title() == host)?;
             Some((h, g))
         })
         .collect()
+}
+
+/// An own-pane analyser's full graph in its own panel under the Composite
+/// layers, with its name in the header strip like a stack display.
+fn scope_pane(
+    ui: &mut Ui,
+    rect: Rect,
+    slot: &mut Slot,
+    shared: &Shared,
+    profiler: &mut super::profiler::Profiler,
+    panels: &mut BTreeMap<String, Rect>,
+) {
+    let title = slot.module.title();
+    panels.insert(title.to_owned(), rect);
+    ui.painter()
+        .rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
+    let graph = Rect::from_min_max(
+        pos2(rect.left() + 1.0, rect.top() + HEADER),
+        rect.max - vec2(1.0, 1.0),
+    );
+    let mut pane = child(ui, ("composite_pane", title), rect);
+    if graph.height() >= 44.0 && graph.width() >= 24.0 {
+        if let Some(label) = shared.idle_label() {
+            widgets::placeholder(&pane, graph, label);
+        } else {
+            let start = profiler.start();
+            slot.module.graph(&mut pane, graph, shared);
+            profiler.record("Display", title, start);
+        }
+    }
+    pane.painter().text(
+        rect.left_top() + vec2(8.0, HEADER * 0.5),
+        Align2::LEFT_CENTER,
+        title,
+        FontId::proportional(11.0),
+        ui.visuals().weak_text_color(),
+    );
 }
 
 fn child(ui: &mut Ui, salt: impl egui::AsIdSalt, rect: Rect) -> Ui {
@@ -848,8 +1155,9 @@ mod tests {
                     ..Default::default()
                 },
                 |ui| {
-                    egui::CentralPanel::default()
-                        .show(ui, |ui| workspace.show(ui, slots, &shared, &[], &mut Default::default()));
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        workspace.show(ui, slots, &shared, &[], &mut Default::default())
+                    });
                 },
             );
             output.textures_delta.clear();
@@ -907,10 +1215,18 @@ mod tests {
         // Drag the first header (away from its name) below the last panel.
         let grab = pos2(restored[0].right() - 40.0, restored[0].top() - HEADER * 0.5);
         let drop = pos2(grab.x, restored[2].bottom() - 5.0);
-        frame(&mut workspace, &mut slots, vec![egui::Event::PointerMoved(grab), pointer(grab, true)]);
+        frame(
+            &mut workspace,
+            &mut slots,
+            vec![egui::Event::PointerMoved(grab), pointer(grab, true)],
+        );
         for step in 1..=4 {
             let at = grab + (drop - grab) * (step as f32 / 4.0);
-            frame(&mut workspace, &mut slots, vec![egui::Event::PointerMoved(at)]);
+            frame(
+                &mut workspace,
+                &mut slots,
+                vec![egui::Event::PointerMoved(at)],
+            );
         }
         frame(&mut workspace, &mut slots, vec![pointer(drop, false)]);
         assert_eq!(workspace.order, ["Two", "Three", "One"]);
@@ -918,14 +1234,22 @@ mod tests {
         // Clicking the top header's name folds it: off, inspector closed.
         let top = frame(&mut workspace, &mut slots, vec![]);
         let name = pos2(top[0].left() + 24.0, top[0].top() - HEADER * 0.5);
-        frame(&mut workspace, &mut slots, vec![egui::Event::PointerMoved(name), pointer(name, true)]);
+        frame(
+            &mut workspace,
+            &mut slots,
+            vec![egui::Event::PointerMoved(name), pointer(name, true)],
+        );
         frame(&mut workspace, &mut slots, vec![pointer(name, false)]);
         assert!(!slots[1].visible && !slots[1].open);
         let folded = frame(&mut workspace, &mut slots, vec![]);
         assert_eq!(folded.len(), 2);
         // The folded strip stays on top, so the remaining panels start below it.
         assert!(folded[0].top() > top[0].top() + DIVIDER);
-        frame(&mut workspace, &mut slots, vec![egui::Event::PointerMoved(name), pointer(name, true)]);
+        frame(
+            &mut workspace,
+            &mut slots,
+            vec![egui::Event::PointerMoved(name), pointer(name, true)],
+        );
         frame(&mut workspace, &mut slots, vec![pointer(name, false)]);
         assert!(slots[1].visible && slots[1].open);
 
@@ -963,23 +1287,39 @@ mod tests {
     fn composite_draws_layers_bottom_up_by_depth() {
         let ctx = egui::Context::default();
         let drawn = Rc::new(RefCell::new(Vec::new()));
-        let mut slots: Vec<Slot> = [("Notes", Some(2)), ("Time", None), ("Image", Some(0)), ("Pitch", Some(1))]
-            .into_iter()
-            .map(|(title, depth)| Slot {
-                visible: true,
-                open: true,
-                module: Box::new(Layered { title, depth, drawn: drawn.clone() }),
-            })
-            .collect();
+        let mut slots: Vec<Slot> = [
+            ("Notes", Some(2)),
+            ("Time", None),
+            ("Image", Some(0)),
+            ("Pitch", Some(1)),
+        ]
+        .into_iter()
+        .map(|(title, depth)| Slot {
+            visible: true,
+            open: true,
+            module: Box::new(Layered {
+                title,
+                depth,
+                drawn: drawn.clone(),
+            }),
+        })
+        .collect();
         let shared = Shared::new(
-            Frame { samples: Vec::new(), rate: 48000, start: 0 },
+            Frame {
+                samples: Vec::new(),
+                rate: 48000,
+                start: 0,
+            },
             false,
             NoteRange::default(),
             crate::ui::dynamic_range::DbRange::default(),
             Default::default(),
             FftPlans::default(),
         );
-        let mut workspace = Workspace { view: View::Composite, ..Default::default() };
+        let mut workspace = Workspace {
+            view: View::Composite,
+            ..Default::default()
+        };
         let frame = |workspace: &mut Workspace, slots: &mut [Slot]| {
             drawn.borrow_mut().clear();
             let mut output = ctx.run_ui(
@@ -988,20 +1328,119 @@ mod tests {
                     ..Default::default()
                 },
                 |ui| {
-                    egui::CentralPanel::default()
-                        .show(ui, |ui| workspace.show(ui, slots, &shared, &[], &mut Default::default()));
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        workspace.show(ui, slots, &shared, &[], &mut Default::default())
+                    });
                 },
             );
             output.textures_delta.clear();
             drawn.borrow().clone()
         };
-        assert_eq!(frame(&mut workspace, &mut slots), ["Image", "Pitch", "Notes"]);
+        assert_eq!(
+            frame(&mut workspace, &mut slots),
+            ["Image", "Pitch", "Notes"]
+        );
         // A scrambled (e.g. older persisted) order snaps back to depth order.
         workspace.mix.swap(0, 2);
         workspace.mix[1].on = false;
         assert_eq!(frame(&mut workspace, &mut slots), ["Image", "Notes"]);
         slots[0].visible = false;
         assert_eq!(frame(&mut workspace, &mut slots), ["Image"]);
+    }
+
+    /// Stands in for the scope: an own-pane analyser with a full graph.
+    struct Pane {
+        drawn: Rc<RefCell<Vec<&'static str>>>,
+    }
+
+    impl Module for Pane {
+        fn title(&self) -> &'static str {
+            "Scope"
+        }
+        fn save_params(&self, _: &mut dyn eframe::Storage, _: &str) {}
+        fn load_params(&mut self, _: &dyn eframe::Storage, _: &str) {}
+        fn params(&mut self, _: &mut Ui, _: &Shared) {}
+        fn graph(&mut self, _: &mut Ui, _: Rect, _: &Shared) {
+            self.drawn.borrow_mut().push("Scope");
+        }
+        fn composite_pane(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn composite_scope_gets_its_own_pane_below_the_layers() {
+        let ctx = egui::Context::default();
+        let drawn = Rc::new(RefCell::new(Vec::new()));
+        let mut slots: Vec<Slot> = vec![
+            Slot {
+                visible: true,
+                open: true,
+                module: Box::new(Layered {
+                    title: "Image",
+                    depth: Some(0),
+                    drawn: drawn.clone(),
+                }),
+            },
+            Slot {
+                visible: true,
+                open: true,
+                module: Box::new(Pane {
+                    drawn: drawn.clone(),
+                }),
+            },
+        ];
+        let shared = Shared::new(
+            Frame {
+                samples: Vec::new(),
+                rate: 48000,
+                start: 0,
+            },
+            false,
+            NoteRange::default(),
+            crate::ui::dynamic_range::DbRange::default(),
+            Default::default(),
+            FftPlans::default(),
+        );
+        let mut workspace = Workspace {
+            view: View::Composite,
+            ..Default::default()
+        };
+        let frame = |workspace: &mut Workspace, slots: &mut [Slot]| {
+            drawn.borrow_mut().clear();
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(1000.0, 700.0))),
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        workspace.show(ui, slots, &shared, &[], &mut Default::default())
+                    });
+                },
+            );
+            output.textures_delta.clear();
+            drawn.borrow().clone()
+        };
+        // Off by default: the scope is listed in the mixer, drawn nowhere.
+        assert_eq!(frame(&mut workspace, &mut slots), ["Image"]);
+        workspace
+            .mix
+            .iter_mut()
+            .find(|l| l.title == "Scope")
+            .unwrap()
+            .on = true;
+        // Its full graph goes in its own pane, after the stacked layers.
+        assert_eq!(frame(&mut workspace, &mut slots), ["Image", "Scope"]);
+        // Own-pane analysers sort first in the mix, so the mixer shows them last.
+        assert_eq!(
+            workspace
+                .mix
+                .iter()
+                .map(|l| l.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Scope", "Image"]
+        );
     }
 
     #[test]
@@ -1031,7 +1470,12 @@ mod tests {
         use crate::modules::{self, note_spectrum, tuner};
         let slots = modules::all();
         let titles = |want: &[bool]| -> Vec<&str> {
-            slots.iter().zip(want).filter(|(_, w)| **w).map(|(s, _)| s.module.title()).collect()
+            slots
+                .iter()
+                .zip(want)
+                .filter(|(_, w)| **w)
+                .map(|(s, _)| s.module.title())
+                .collect()
         };
         let waterfall = "Waterfall";
         let mut workspace = Workspace::default();
@@ -1045,11 +1489,17 @@ mod tests {
 
         // The tuner draws over the note spectrum, so both are requested.
         workspace.view = View::Solo(tuner::TITLE.to_owned());
-        assert_eq!(titles(&workspace.requested(&slots)), [tuner::TITLE, note_spectrum::TITLE]);
+        assert_eq!(
+            titles(&workspace.requested(&slots)),
+            [tuner::TITLE, note_spectrum::TITLE]
+        );
 
         // Solo on a switched-off analyser falls back to the stack.
         let mut off = modules::all();
-        off[2].visible = false;
+        off.iter_mut()
+            .find(|s| s.module.title() == waterfall)
+            .unwrap()
+            .visible = false;
         workspace.view = View::Solo(waterfall.to_owned());
         assert!(workspace.requested(&off).iter().all(|&w| w));
     }

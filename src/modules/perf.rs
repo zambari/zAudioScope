@@ -64,22 +64,30 @@ impl Costs {
 
     /// Share of one core spent analysing, %.
     fn load(&self) -> f32 {
-        if self.interval > 0.0 { self.total_us() * 1e-4 / self.interval } else { 0.0 }
+        if self.interval > 0.0 {
+            self.total_us() * 1e-4 / self.interval
+        } else {
+            0.0
+        }
     }
 
     /// The "performance" foldout: load summary, per-stage µs (`names` in
     /// stage order), then `knobs`.
     pub fn foldout(&self, ui: &mut Ui, salt: &str, names: &[&str], knobs: impl FnOnce(&mut Ui)) {
         let summary = format!("~{:.1}% core · {:.0} µs", self.load(), self.total_us());
-        Foldout::new(salt, "performance").summary(summary).show(ui, |ui| {
-            let mut text: String = names
-                .iter()
-                .enumerate()
-                .map(|(i, n)| format!("{n:<9}{:5.0} µs\n", self.stages.get(i).map_or(0.0, |c| c.0)))
-                .collect();
-            text += &format!("every {:.0} ms", self.interval * 1000.0);
-            ui.label(egui::RichText::new(text).monospace().size(10.0).weak());
-            knobs(ui);
-        });
+        Foldout::new(salt, "performance")
+            .summary(summary)
+            .show(ui, |ui| {
+                let mut text: String = names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, n)| {
+                        format!("{n:<9}{:5.0} µs\n", self.stages.get(i).map_or(0.0, |c| c.0))
+                    })
+                    .collect();
+                text += &format!("every {:.0} ms", self.interval * 1000.0);
+                ui.label(egui::RichText::new(text).monospace().size(10.0).weak());
+                knobs(ui);
+            });
     }
 }

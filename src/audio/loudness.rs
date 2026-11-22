@@ -11,7 +11,8 @@ impl Biquad {
     fn run(&self, x: &mut [f64]) {
         let (mut x1, mut x2, mut y1, mut y2) = (0.0, 0.0, 0.0, 0.0);
         for s in x.iter_mut() {
-            let y = self.b[0] * *s + self.b[1] * x1 + self.b[2] * x2 - self.a[0] * y1 - self.a[1] * y2;
+            let y =
+                self.b[0] * *s + self.b[1] * x1 + self.b[2] * x2 - self.a[0] * y1 - self.a[1] * y2;
             (x2, x1, y2, y1) = (x1, *s, y1, y);
             *s = y;
         }
@@ -29,7 +30,11 @@ fn k_weighting(rate: u32) -> [Biquad; 2] {
         let vb = vh.powf(0.4996667741545416);
         let a0 = 1.0 + k / q + k * k;
         Biquad {
-            b: [(vh + vb * k / q + k * k) / a0, 2.0 * (k * k - vh) / a0, (vh - vb * k / q + k * k) / a0],
+            b: [
+                (vh + vb * k / q + k * k) / a0,
+                2.0 * (k * k - vh) / a0,
+                (vh - vb * k / q + k * k) / a0,
+            ],
             a: [2.0 * (k * k - 1.0) / a0, (1.0 - k / q + k * k) / a0],
         }
     };
@@ -37,7 +42,10 @@ fn k_weighting(rate: u32) -> [Biquad; 2] {
         let (f0, q) = (38.13547087602444, 0.5003270373238773);
         let k = (std::f64::consts::PI * f0 / fs).tan();
         let a0 = 1.0 + k / q + k * k;
-        Biquad { b: [1.0, -2.0, 1.0], a: [2.0 * (k * k - 1.0) / a0, (1.0 - k / q + k * k) / a0] }
+        Biquad {
+            b: [1.0, -2.0, 1.0],
+            a: [2.0 * (k * k - 1.0) / a0, (1.0 - k / q + k * k) / a0],
+        }
     };
     [shelf, highpass]
 }
@@ -46,7 +54,13 @@ fn k_weighting(rate: u32) -> [Biquad; 2] {
 /// The filters start `settle` samples earlier (when there are any) so their
 /// start-up transient doesn't count. Loudness is ungated, single channel:
 /// -0.691 + 10·log10(mean square of the K-weighted signal).
-pub fn measure(samples: &[f32], rate: u32, from: usize, to: usize, settle: usize) -> Option<(f32, f32)> {
+pub fn measure(
+    samples: &[f32],
+    rate: u32,
+    from: usize,
+    to: usize,
+    settle: usize,
+) -> Option<(f32, f32)> {
     let to = to.min(samples.len());
     if from >= to {
         return None;
@@ -59,13 +73,21 @@ pub fn measure(samples: &[f32], rate: u32, from: usize, to: usize, settle: usize
     }
     let body = &x[pre..];
     let ms = body.iter().map(|y| y * y).sum::<f64>() / body.len() as f64;
-    let lufs = if ms > 0.0 { (-0.691 + 10.0 * ms.log10()) as f32 } else { f32::NEG_INFINITY };
+    let lufs = if ms > 0.0 {
+        (-0.691 + 10.0 * ms.log10()) as f32
+    } else {
+        f32::NEG_INFINITY
+    };
     Some((peak, lufs))
 }
 
 /// Linear amplitude to dB; silence is -inf.
 pub fn db(v: f32) -> f32 {
-    if v > 0.0 { 20.0 * v.log10() } else { f32::NEG_INFINITY }
+    if v > 0.0 {
+        20.0 * v.log10()
+    } else {
+        f32::NEG_INFINITY
+    }
 }
 
 /// dB to linear amplitude.
@@ -81,9 +103,17 @@ mod tests {
     #[test]
     fn sine_997hz() {
         let rate = 48_000;
-        let x: Vec<f32> =
-            (0..rate * 2).map(|i| (2.0 * std::f32::consts::PI * 997.0 * i as f32 / rate as f32).sin()).collect();
-        let (peak, lufs) = measure(&x, rate as u32, rate as usize / 2, x.len(), rate as usize / 2).unwrap();
+        let x: Vec<f32> = (0..rate * 2)
+            .map(|i| (2.0 * std::f32::consts::PI * 997.0 * i as f32 / rate as f32).sin())
+            .collect();
+        let (peak, lufs) = measure(
+            &x,
+            rate as u32,
+            rate as usize / 2,
+            x.len(),
+            rate as usize / 2,
+        )
+        .unwrap();
         assert!((peak - 1.0).abs() < 1e-3);
         assert!((lufs + 3.01).abs() < 0.05, "{lufs}");
     }

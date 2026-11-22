@@ -33,7 +33,11 @@ pub fn paint(painter: &Painter, rect: Rect, level: f32, peak: Option<f32>) {
 /// Exponential-moving-average weight for a sample arriving `dt` seconds after the last,
 /// given a smoothing time constant `tau` (seconds). Returns 1.0 for non-positive `dt`.
 pub fn ema_alpha(dt: f32, tau: f32) -> f32 {
-    if dt > 0.0 { 1.0 - (-dt / tau).exp() } else { 1.0 }
+    if dt > 0.0 {
+        1.0 - (-dt / tau).exp()
+    } else {
+        1.0
+    }
 }
 
 /// Moving-averaged bar value with a falling peak marker that tracks the raw input,

@@ -27,7 +27,7 @@ impl BuildWatch {
         let exe = std::env::current_exe()
             .ok()
             .filter(|p| p.components().any(|c| c.as_os_str() == "target"));
-        let started = exe.as_ref().and_then(|p| modified(p));
+        let started = exe.as_ref().and_then(modified);
         Self {
             exe,
             started,

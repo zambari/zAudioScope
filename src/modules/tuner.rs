@@ -119,7 +119,12 @@ impl Params {
     }
 
     fn want(&self) -> Want {
-        Want { window_ms: self.window_ms, rate_hz: self.rate_hz, oversample: self.oversample, a4: self.a4 }
+        Want {
+            window_ms: self.window_ms,
+            rate_hz: self.rate_hz,
+            oversample: self.oversample,
+            a4: self.a4,
+        }
     }
 }
 
@@ -169,8 +174,17 @@ pub struct Tuner {
 
 impl Tuner {
     fn enabled_notes(&self) -> Vec<i32> {
-        let on: Vec<i32> = self.input.analysed.notes().filter(|&m| self.is_enabled(m)).collect();
-        if on.is_empty() { (0..128).collect() } else { on }
+        let on: Vec<i32> = self
+            .input
+            .analysed
+            .notes()
+            .filter(|&m| self.is_enabled(m))
+            .collect();
+        if on.is_empty() {
+            (0..128).collect()
+        } else {
+            on
+        }
     }
 
     fn is_enabled(&self, midi: i32) -> bool {
@@ -203,12 +217,17 @@ impl Module for Tuner {
     }
 
     fn update(&mut self, shared: &mut Shared) {
-        let Some(w) = self.input.next(shared, &self.p.want(), &mut self.costs) else { return };
+        let Some(w) = self.input.next(shared, &self.p.want(), &mut self.costs) else {
+            return;
+        };
         let (y, r) = (&w.y, w.rate);
         self.level_db = w.level_db;
         let (lo, hi) = self.input.analysed.span();
         let a4 = self.p.a4;
-        let (f_lo, f_hi) = (pitch::midi_to_freq(lo - 0.5, a4), pitch::midi_to_freq(hi + 0.5, a4));
+        let (f_lo, f_hi) = (
+            pitch::midi_to_freq(lo - 0.5, a4),
+            pitch::midi_to_freq(hi + 0.5, a4),
+        );
         let c = if self.level_db < self.p.gate_db {
             self.costs.skip(1);
             pitch::Candidates::default()
@@ -219,7 +238,13 @@ impl Module for Tuner {
             .list
             .iter()
             .enumerate()
-            .map(|(i, k)| (pitch::freq_to_midi(k.freq, a4), k.clarity, c.pick == Some(i)))
+            .map(|(i, k)| {
+                (
+                    pitch::freq_to_midi(k.freq, a4),
+                    k.clarity,
+                    c.pick == Some(i),
+                )
+            })
             .filter(|&(m, cl, _)| cl >= MIN_CLARITY && m >= lo - 0.5 && m <= hi + 0.5)
             .collect();
         // NSDF also peaks at 2T, 3T… of the true period: lines with no
@@ -240,11 +265,15 @@ impl Module for Tuner {
         raw.truncate(MAX_CANDIDATES);
         self.raw = raw;
 
-        let picked = c.pick.map(|i| (pitch::freq_to_midi(c.list[i].freq, a4), c.list[i].clarity));
+        let picked = c
+            .pick
+            .map(|i| (pitch::freq_to_midi(c.list[i].freq, a4), c.list[i].clarity));
         self.pick_clarity = picked.map_or(0.0, |p| p.1);
         self.midi = match (self.midi, picked.map(|p| p.0)) {
             // Jumped by more than a semitone: a new note, don't glide to it.
-            (Some(prev), Some(m)) if (m - prev).abs() < 1.0 => Some(prev * self.p.smoothing + m * (1.0 - self.p.smoothing)),
+            (Some(prev), Some(m)) if (m - prev).abs() < 1.0 => {
+                Some(prev * self.p.smoothing + m * (1.0 - self.p.smoothing))
+            }
             (_, m) => m,
         };
     }
@@ -256,15 +285,26 @@ impl Module for Tuner {
     }
 
     fn params(&mut self, ui: &mut Ui, shared: &Shared) {
-        egui::ComboBox::from_id_salt("tuner_method").selected_text(self.p.method.label()).show_ui(ui, |ui| {
-            for m in Method::ALL {
-                ui.selectable_value(&mut self.p.method, m, m.label());
-            }
-        });
+        egui::ComboBox::from_id_salt("tuner_method")
+            .selected_text(self.p.method.label())
+            .show_ui(ui, |ui| {
+                for m in Method::ALL {
+                    ui.selectable_value(&mut self.p.method, m, m.label());
+                }
+            });
         ui.add(egui::Slider::new(&mut self.p.smoothing, 0.0..=0.98).text("smoothing"));
-        ui.add(egui::Slider::new(&mut self.p.window_ms, 60.0..=1000.0).logarithmic(true).suffix(" ms").text("window"));
+        ui.add(
+            egui::Slider::new(&mut self.p.window_ms, 60.0..=1000.0)
+                .logarithmic(true)
+                .suffix(" ms")
+                .text("window"),
+        );
         ui.add(egui::Slider::new(&mut self.p.a4, 415.0..=466.0).text("A4 Hz"));
-        ui.add(egui::Slider::new(&mut self.p.units_per_semitone, 0.01..=10.0).logarithmic(true).text("units/semi"));
+        ui.add(
+            egui::Slider::new(&mut self.p.units_per_semitone, 0.01..=10.0)
+                .logarithmic(true)
+                .text("units/semi"),
+        );
         let p = &mut self.p;
         self.costs.foldout(ui, "tuner_perf", &STAGES, |ui| {
             ui.add(egui::Slider::new(&mut p.rate_hz, 2.0..=60.0).logarithmic(true).suffix(" Hz").text("update rate"))
@@ -276,27 +316,48 @@ impl Module for Tuner {
         });
         let NoteRange { lo, hi } = shared.range.get();
         let count = (lo..=hi).filter(|&m| self.is_enabled(m)).count();
-        let summary = if count == 0 { "any semitone".to_owned() } else { format!("{count} toggled notes") };
-        Foldout::new("snap", "snap to").summary(summary).show(ui, |ui| {
-            if ui.add_enabled(count > 0, egui::Button::new("none").small()).on_hover_text("Clear all note toggles").clicked() {
-                self.p.notes.fill(false);
-            }
-            // One row per octave in range, one tiny toggle per note.
-            ui.spacing_mut().item_spacing = vec2(1.0, 1.0);
-            for oct in lo.div_euclid(12)..=hi.div_euclid(12) {
-                ui.horizontal(|ui| {
-                    ui.add_sized(vec2(14.0, 15.0), egui::Label::new(egui::RichText::new(format!("{}", oct - 1)).size(9.0).weak()));
-                    for n in 0..12 {
-                        let m = oct * 12 + n;
-                        let label = egui::RichText::new(pitch::NOTE_NAMES[n as usize]).size(9.0);
-                        let b = egui::Button::selectable(self.is_enabled(m), label).min_size(vec2(17.0, 15.0));
-                        if ui.add_enabled(m >= lo && m <= hi, b).on_hover_text(pitch::note_name(m)).clicked() {
-                            self.p.notes[m as usize] = !self.p.notes[m as usize];
+        let summary = if count == 0 {
+            "any semitone".to_owned()
+        } else {
+            format!("{count} toggled notes")
+        };
+        Foldout::new("snap", "snap to")
+            .summary(summary)
+            .show(ui, |ui| {
+                if ui
+                    .add_enabled(count > 0, egui::Button::new("none").small())
+                    .on_hover_text("Clear all note toggles")
+                    .clicked()
+                {
+                    self.p.notes.fill(false);
+                }
+                // One row per octave in range, one tiny toggle per note.
+                ui.spacing_mut().item_spacing = vec2(1.0, 1.0);
+                for oct in lo.div_euclid(12)..=hi.div_euclid(12) {
+                    ui.horizontal(|ui| {
+                        ui.add_sized(
+                            vec2(14.0, 15.0),
+                            egui::Label::new(
+                                egui::RichText::new(format!("{}", oct - 1)).size(9.0).weak(),
+                            ),
+                        );
+                        for n in 0..12 {
+                            let m = oct * 12 + n;
+                            let label =
+                                egui::RichText::new(pitch::NOTE_NAMES[n as usize]).size(9.0);
+                            let b = egui::Button::selectable(self.is_enabled(m), label)
+                                .min_size(vec2(17.0, 15.0));
+                            if ui
+                                .add_enabled(m >= lo && m <= hi, b)
+                                .on_hover_text(pitch::note_name(m))
+                                .clicked()
+                            {
+                                self.p.notes[m as usize] = !self.p.notes[m as usize];
+                            }
                         }
-                    }
-                });
-            }
-        });
+                    });
+                }
+            });
     }
 
     fn graph(&mut self, ui: &mut Ui, rect: Rect, shared: &Shared) {
@@ -339,7 +400,9 @@ impl Tuner {
             // towards it only in proportion to the power it adds.
             let host = near.or_else(|| {
                 (0..self.tracks.len())
-                    .filter(|&i| dist(&self.tracks[i]) < ABSORB_SEMIS && self.tracks[i].weight >= SHOW_WEIGHT)
+                    .filter(|&i| {
+                        dist(&self.tracks[i]) < ABSORB_SEMIS && self.tracks[i].weight >= SHOW_WEIGHT
+                    })
                     .max_by(|&a, &b| self.tracks[a].weight.total_cmp(&self.tracks[b].weight))
             });
             let t = match host {
@@ -394,8 +457,17 @@ impl Tuner {
         for t in &mut self.tracks {
             t.weight *= decay;
             let shown = t.live && t.weight >= SHOW_WEIGHT;
-            let target = if shown { ((t.clarity - 0.4) / 0.6).clamp(0.0, 1.0).max(0.25) * level } else { 0.0 };
-            t.alpha += (target - t.alpha) * if target > t.alpha { ease(dt, 0.12) } else { ease(dt, 0.45) };
+            let target = if shown {
+                ((t.clarity - 0.4) / 0.6).clamp(0.0, 1.0).max(0.25) * level
+            } else {
+                0.0
+            };
+            t.alpha += (target - t.alpha)
+                * if target > t.alpha {
+                    ease(dt, 0.12)
+                } else {
+                    ease(dt, 0.45)
+                };
             t.primary += (t.target_primary - t.primary) * ease(dt, 0.15);
         }
         self.tracks.retain(|t| t.weight > 0.01 || t.alpha > 0.004);
@@ -405,7 +477,12 @@ impl Tuner {
             self.shown_midi = m;
         }
         let want = if sure { level } else { 0.0 };
-        self.readout += (want - self.readout) * if want > self.readout { ease(dt, 0.2) } else { ease(dt, 0.6) };
+        self.readout += (want - self.readout)
+            * if want > self.readout {
+                ease(dt, 0.2)
+            } else {
+                ease(dt, 0.6)
+            };
     }
 
     fn paint(&mut self, ui: &mut Ui, rect: Rect, shared: &Shared, draw: Draw) {
@@ -413,7 +490,11 @@ impl Tuner {
         let painter = ui.painter_at(rect);
         let range = shared.range.get();
         let labelled = draw != Draw::Layer;
-        let plot = if labelled { plot::note_plot(rect) } else { rect };
+        let plot = if labelled {
+            plot::note_plot(rect)
+        } else {
+            rect
+        };
         let x_of = |m: f32| range.scale(rect).px(m);
         match draw {
             Draw::Full => {
@@ -429,7 +510,11 @@ impl Tuner {
         if let Some((n, _)) = target
             && self.readout > 0.01
         {
-            painter.vline(x_of(n as f32), plot.y_range(), Stroke::new(2.0, theme::GOOD.gamma_multiply(0.25 * self.readout)));
+            painter.vline(
+                x_of(n as f32),
+                plot.y_range(),
+                Stroke::new(2.0, theme::GOOD.gamma_multiply(0.25 * self.readout)),
+            );
         }
 
         // ---- candidates ---------------------------------------------------
@@ -442,18 +527,30 @@ impl Tuner {
                 continue;
             }
             let x = x_of(t.midi);
-            let base = theme::lerp(Color32::from_rgb(196, 176, 150), theme::ACCENT_BRIGHT, t.primary);
+            let base = theme::lerp(
+                Color32::from_rgb(196, 176, 150),
+                theme::ACCENT_BRIGHT,
+                t.primary,
+            );
             let col = base.gamma_multiply(t.alpha);
             painter.vline(x, plot.y_range(), Stroke::new(1.0 + 0.8 * t.primary, col));
             if !labelled {
                 continue;
             }
-            let text = format!("{} {:.0}%", pitch::note_name(t.midi.round() as i32), t.clarity * 100.0);
+            let text = format!(
+                "{} {:.0}%",
+                pitch::note_name(t.midi.round() as i32),
+                t.clarity * 100.0
+            );
             let galley = painter.layout_no_wrap(text, FontId::monospace(10.0), col);
             let w = galley.size().x;
             let left = (x - w / 2.0).clamp(rect.left() + 1.0, rect.right() - w - 1.0);
             let row = lanes.place(left, w);
-            painter.galley(pos2(left, rect.top() + 2.0 + row as f32 * NOTE_LANE), galley, col);
+            painter.galley(
+                pos2(left, rect.top() + 2.0 + row as f32 * NOTE_LANE),
+                galley,
+                col,
+            );
         }
 
         // ---- readout ------------------------------------------------------
@@ -463,7 +560,12 @@ impl Tuner {
         {
             let a = self.readout;
             let in_tune = cents.abs() < 3.0;
-            let col = if in_tune { theme::GOOD } else { theme::ACCENT_BRIGHT }.gamma_multiply(a);
+            let col = if in_tune {
+                theme::GOOD
+            } else {
+                theme::ACCENT_BRIGHT
+            }
+            .gamma_multiply(a);
             let dim = Color32::from_gray(170).gamma_multiply(a);
             let units = cents / 100.0 * self.p.units_per_semitone;
             let advice = if in_tune {
@@ -476,15 +578,45 @@ impl Tuner {
             let hz = pitch::midi_to_freq(self.shown_midi, self.p.a4);
 
             let w = 176.0;
-            let panel = Rect::from_min_size(pos2(plot.right() - w - 8.0, plot.top() + 6.0), vec2(w, 64.0));
+            let panel = Rect::from_min_size(
+                pos2(plot.right() - w - 8.0, plot.top() + 6.0),
+                vec2(w, 64.0),
+            );
             painter.rect_filled(panel, 2.0, Color32::from_black_alpha((150.0 * a) as u8));
-            painter.text(panel.left_top() + vec2(8.0, 4.0), Align2::LEFT_TOP, pitch::note_name(n), FontId::proportional(26.0), col);
-            painter.text(panel.right_top() + vec2(-8.0, 6.0), Align2::RIGHT_TOP, &advice, FontId::proportional(14.0), col);
-            painter.text(panel.right_top() + vec2(-8.0, 24.0), Align2::RIGHT_TOP, format!("{cents:+.1}¢  {hz:.2} Hz"), FontId::monospace(10.0), dim);
+            painter.text(
+                panel.left_top() + vec2(8.0, 4.0),
+                Align2::LEFT_TOP,
+                pitch::note_name(n),
+                FontId::proportional(26.0),
+                col,
+            );
+            painter.text(
+                panel.right_top() + vec2(-8.0, 6.0),
+                Align2::RIGHT_TOP,
+                &advice,
+                FontId::proportional(14.0),
+                col,
+            );
+            painter.text(
+                panel.right_top() + vec2(-8.0, 24.0),
+                Align2::RIGHT_TOP,
+                format!("{cents:+.1}¢  {hz:.2} Hz"),
+                FontId::monospace(10.0),
+                dim,
+            );
             // ±50 cent strip.
-            let strip = Rect::from_min_size(panel.left_bottom() + vec2(8.0, -14.0), vec2(w - 16.0, 6.0));
-            painter.hline(strip.x_range(), strip.center().y, Stroke::new(1.0, Color32::from_gray(70).gamma_multiply(a)));
-            painter.vline(strip.center().x, strip.y_range(), Stroke::new(1.0, theme::GOOD.gamma_multiply(0.6 * a)));
+            let strip =
+                Rect::from_min_size(panel.left_bottom() + vec2(8.0, -14.0), vec2(w - 16.0, 6.0));
+            painter.hline(
+                strip.x_range(),
+                strip.center().y,
+                Stroke::new(1.0, Color32::from_gray(70).gamma_multiply(a)),
+            );
+            painter.vline(
+                strip.center().x,
+                strip.y_range(),
+                Stroke::new(1.0, theme::GOOD.gamma_multiply(0.6 * a)),
+            );
             let mx = strip.center().x + (cents / 50.0).clamp(-1.0, 1.0) * strip.width() / 2.0;
             painter.circle_filled(pos2(mx, strip.center().y), 3.0, col);
         }

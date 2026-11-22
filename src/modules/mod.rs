@@ -26,9 +26,9 @@ mod note_input;
 pub mod note_spectrum;
 mod perf;
 pub mod scope;
-pub mod waterfall;
 mod spectrum_rows;
 pub mod tuner;
+pub mod waterfall;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -125,12 +125,22 @@ pub struct Shared {
     /// it from the input meter; while false, displays stop drawing and show
     /// "No signal" instead. Analysis still runs.
     pub signal: bool,
+    /// Whether the input is connected and not paused. The app sets it; while
+    /// false, displays stop drawing and show "Paused" instead.
+    pub connected: bool,
     plans: RefCell<FftPlans>,
     cache: RefCell<FrameCache>,
 }
 
 impl Shared {
-    pub fn new(frame: Frame, reset: bool, range: NoteRange, db: DbRange, levels: Rc<LevelDist>, plans: FftPlans) -> Self {
+    pub fn new(
+        frame: Frame,
+        reset: bool,
+        range: NoteRange,
+        db: DbRange,
+        levels: Rc<LevelDist>,
+        plans: FftPlans,
+    ) -> Self {
         Self {
             frame,
             gate: Gate::default(),
@@ -140,8 +150,21 @@ impl Shared {
             levels,
             midi: MidiFrame::default(),
             signal: true,
+            connected: true,
             plans: RefCell::new(plans),
             cache: Default::default(),
+        }
+    }
+
+    /// What a display shows in place of its graph, or `None` when it should
+    /// draw: "Paused" when no audio can arrive, "No signal" when it is quiet.
+    pub fn idle_label(&self) -> Option<&'static str> {
+        if !self.connected {
+            Some("Paused")
+        } else if !self.signal {
+            Some("No signal")
+        } else {
+            None
         }
     }
 
@@ -191,7 +214,12 @@ impl Shared {
     fn fft_power(&self, x: &[f32]) -> Rc<[f32]> {
         let mut plans = self.plans.borrow_mut();
         plans.pending.computed += 1;
-        plans.plans.entry(x.len()).or_insert_with(|| Fft::new(x.len())).power(x).into()
+        plans
+            .plans
+            .entry(x.len())
+            .or_insert_with(|| Fft::new(x.len()))
+            .power(x)
+            .into()
     }
 
     /// Power spectrum (`n/2 + 1` bins) of the latest audio at `1/factor` of
@@ -203,7 +231,11 @@ impl Shared {
         let f = &self.frame;
         let need = (n + 8) * factor as usize;
         let tail = &f.samples[f.samples.len().saturating_sub(need)..];
-        let mut d = Frame { samples: tail.to_vec(), rate: f.rate, start: f.end() - tail.len() as u64 };
+        let mut d = Frame {
+            samples: tail.to_vec(),
+            rate: f.rate,
+            start: f.end() - tail.len() as u64,
+        };
         let mut k = factor;
         while k > 1 {
             d = halve(&d);
@@ -217,7 +249,13 @@ impl Shared {
     /// `(fft size, power, true)`; failing that, a fresh `fallback`-point one
     /// of the latest audio, `(fallback, power, false)`.
     pub fn any_spectrum(&self, fallback: usize) -> (usize, Rc<[f32]>, bool) {
-        let cached = self.cache.borrow().spectra.iter().max_by_key(|(k, _)| (k.0, k.2)).map(|(k, v)| (k.0, v.clone()));
+        let cached = self
+            .cache
+            .borrow()
+            .spectra
+            .iter()
+            .max_by_key(|(k, _)| (k.0, k.2))
+            .map(|(k, v)| (k.0, v.clone()));
         match cached {
             Some((n, p)) => {
                 self.plans.borrow_mut().pending.reused += 1;
@@ -225,7 +263,11 @@ impl Shared {
             }
             None => {
                 let end = self.frame.end();
-                (fallback, self.spectrum(fallback, (end.saturating_sub(fallback as u64), end)), false)
+                (
+                    fallback,
+                    self.spectrum(fallback, (end.saturating_sub(fallback as u64), end)),
+                    false,
+                )
             }
         }
     }
@@ -337,6 +379,12 @@ pub trait Module {
     /// Data only (no background, axes or value labels), for the Composite
     /// view, which draws a shared note grid underneath. Animates like `graph`.
     fn layer(&mut self, _ui: &mut Ui, _rect: Rect, _shared: &Shared) {}
+    /// Composite view: `true` draws this analyser in its own pane under the
+    /// layers (split off by a divider) with its full [`Self::graph`], instead
+    /// of stacking it over them.
+    fn composite_pane(&self) -> bool {
+        false
+    }
     /// Title of a module whose full graph this one draws on top of (with
     /// [`Self::overlay`]) in the stack and in this module's solo page,
     /// while that module is on, instead of in a panel of its own.
@@ -376,11 +424,11 @@ pub fn all() -> Vec<Slot> {
         module: m,
     };
     vec![
-        slot(Box::new(scope::Scope::default())),
-        slot(Box::new(tuner::Tuner::default())),
-        slot(Box::new(waterfall::Waterfall::default())),
-        slot(Box::new(note_spectrum::NoteSpectrum::default())),
-        slot(Box::new(impulse::Impulse::default())),
-        slot(Box::new(midi::MidiMonitor::default())),
+        slot(Box::<scope::Scope>::default()),
+        slot(Box::<tuner::Tuner>::default()),
+        slot(Box::<note_spectrum::NoteSpectrum>::default()),
+        slot(Box::<waterfall::Waterfall>::default()),
+        slot(Box::<impulse::Impulse>::default()),
+        slot(Box::<midi::MidiMonitor>::default()),
     ]
 }

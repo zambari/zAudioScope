@@ -4,8 +4,10 @@
 use serde::{Deserialize, Serialize};
 
 use crate::audio::mic_permission::{self, MicAuth};
+use crate::audio::{
+    ChannelSel, DeviceInfo, HISTORY_CHOICES, Input, InputSettings, Monitor, MonitorSettings,
+};
 use crate::midi::MidiHub;
-use crate::audio::{ChannelSel, DeviceInfo, HISTORY_CHOICES, Input, InputSettings, Monitor, MonitorSettings};
 use crate::modules::{self, FftPlans, Shared, Slot};
 use crate::relaunch::BuildWatch;
 use crate::ui::dynamic_range::DbRange;
@@ -15,7 +17,7 @@ use crate::ui::{self, theme};
 const STATE_KEY: &str = "zaudioscope_state";
 
 /// What survives a restart.
-#[derive(Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 #[serde(default)]
 struct Saved {
     device_id: Option<String>,
@@ -34,22 +36,6 @@ struct Saved {
     midi_port: Option<String>,
     /// Monitor output: device, level, feedback guard. Never on at startup.
     monitor: MonitorSettings,
-}
-
-impl Default for Saved {
-    fn default() -> Self {
-        Self {
-            device_id: None,
-            input: InputSettings::default(),
-            modules: Vec::new(),
-            range: NoteRange::default(),
-            db: DbRange::default(),
-            layout: Default::default(),
-            debug: false,
-            midi_port: None,
-            monitor: MonitorSettings::default(),
-        }
-    }
 }
 
 pub struct App {
@@ -99,11 +85,7 @@ impl App {
         let mut slots = modules::all();
         let slots_len = slots.len();
         for slot in &mut slots {
-            if let Some((_, v, o)) = saved
-                .modules
-                .iter()
-                .find(|m| m.0 == slot.module.title())
-            {
+            if let Some((_, v, o)) = saved.modules.iter().find(|m| m.0 == slot.module.title()) {
                 (slot.visible, slot.open) = (*v, *o);
             }
             if let Some(s) = storage {
@@ -120,7 +102,12 @@ impl App {
             out_devices: Monitor::devices(),
             input,
             devices: Input::devices(),
-            midi: MidiHub::new(saved.midi_port.clone().or_else(|| legacy_midi_port(storage?))),
+            midi: MidiHub::new(
+                saved
+                    .midi_port
+                    .clone()
+                    .or_else(|| legacy_midi_port(storage?)),
+            ),
             slots,
             // Never persisted: a drag to zero must not survive a restart.
             gain: 1.0,
@@ -235,7 +222,11 @@ impl App {
                 self.input.device_id.as_deref(),
                 &self.devices,
             );
-            if ui.button("⟳").on_hover_text("Rescan input and output devices").clicked() {
+            if ui
+                .button("⟳")
+                .on_hover_text("Rescan input and output devices")
+                .clicked()
+            {
                 self.devices = Input::devices();
                 self.out_devices = Monitor::devices();
             }
@@ -246,7 +237,13 @@ impl App {
             ui.separator();
             self.meter.show(ui, &self.input, &mut self.gain);
             ui.separator();
-            ui::monitor_bar::show(ui, &mut self.monitor, &mut self.out_meter, &self.out_devices, &self.input.device_name);
+            ui::monitor_bar::show(
+                ui,
+                &mut self.monitor,
+                &mut self.out_meter,
+                &self.out_devices,
+                &self.input.device_name,
+            );
             self.meter.phase_strip(ui, &self.input);
         });
         ui.separator();
@@ -520,6 +517,7 @@ impl eframe::App for App {
         shared.midi = self.midi.frame();
         // The input meter's held peak, as shown, from last frame's readout.
         shared.signal = self.meter.has_signal();
+        shared.connected = self.input.connected();
         // Analysis runs in slot order, so the scope sets the gate first.
         for (i, slot) in self.slots.iter_mut().enumerate() {
             if !live[i] {
@@ -545,7 +543,8 @@ impl eframe::App for App {
             if paused {
                 ui.multiply_opacity(0.5);
             }
-            self.layout.show(ui, &mut self.slots, &shared, &marks, &mut self.profiler);
+            self.layout
+                .show(ui, &mut self.slots, &shared, &marks, &mut self.profiler);
         });
         self.range = shared.range.get().sanitized();
         self.db = shared.db.get().sanitized();
@@ -603,10 +602,10 @@ impl eframe::App for App {
             .exe()
             .cloned()
             .or_else(|| std::env::current_exe().ok());
-        if let Some(exe) = exe {
-            if let Err(e) = std::process::Command::new(exe).spawn() {
-                eprintln!("relaunch failed: {e}");
-            }
+        if let Some(exe) = exe
+            && let Err(e) = std::process::Command::new(exe).spawn()
+        {
+            eprintln!("relaunch failed: {e}");
         }
     }
 }
@@ -622,7 +621,7 @@ fn legacy_midi_port(storage: &dyn eframe::Storage) -> Option<String> {
 
 /// "48k", "44.1k".
 fn short_rate(r: u32) -> String {
-    if r % 1000 == 0 {
+    if r.is_multiple_of(1000) {
         format!("{}k", r / 1000)
     } else {
         format!("{:.1}k", r as f32 / 1000.0)

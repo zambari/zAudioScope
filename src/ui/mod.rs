@@ -6,11 +6,11 @@ pub mod layout;
 pub mod meter;
 pub mod monitor_bar;
 pub mod noterange;
-pub mod outside;
 pub mod notestyle;
+pub mod outside;
 pub mod plot;
+pub mod profiler;
 pub mod theme;
 pub mod widgets;
-pub mod profiler;
 
 pub mod level_bar;

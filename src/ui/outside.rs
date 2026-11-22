@@ -59,11 +59,18 @@ struct Reading {
 
 impl Source<'_> {
     pub fn new(power: &[f32], rate: f32, n: usize, top: f32) -> Source<'_> {
-        Source { power, hz_per_bin: rate / n as f32, top }
+        Source {
+            power,
+            hz_per_bin: rate / n as f32,
+            top,
+        }
     }
 
     fn p(&self, k: usize) -> f32 {
-        self.power.get(k.min(self.power.len().saturating_sub(1))).copied().unwrap_or(0.0)
+        self.power
+            .get(k.min(self.power.len().saturating_sub(1)))
+            .copied()
+            .unwrap_or(0.0)
     }
 
     fn lerp(&self, x: f32) -> f32 {
@@ -74,7 +81,10 @@ impl Source<'_> {
 
     fn band(&self, (f0, f1): (f32, f32)) -> Reading {
         let (b0, b1) = (f0 / self.hz_per_bin, f1 / self.hz_per_bin);
-        let (k0, k1) = (b0.round() as usize, (b1.round() as usize).min(self.power.len()));
+        let (k0, k1) = (
+            b0.round() as usize,
+            (b1.round() as usize).min(self.power.len()),
+        );
         if k1 > k0 {
             let (mut sum, mut best) = (0.0, k0);
             for k in k0..k1 {
@@ -83,12 +93,20 @@ impl Source<'_> {
                     best = k;
                 }
             }
-            Reading { peak: self.power[best], sum, peak_hz: self.refine(best) * self.hz_per_bin }
+            Reading {
+                peak: self.power[best],
+                sum,
+                peak_hz: self.refine(best) * self.hz_per_bin,
+            }
         } else {
             // Narrower than a bin: interpolate, and take its share of the bin.
             let c = (b0 + b1) / 2.0;
             let v = self.lerp(c);
-            Reading { peak: v, sum: v * (b1 - b0), peak_hz: c * self.hz_per_bin }
+            Reading {
+                peak: v,
+                sum: v * (b1 - b0),
+                peak_hz: c * self.hz_per_bin,
+            }
         }
     }
 
@@ -100,7 +118,11 @@ impl Source<'_> {
         let l = |k: usize| self.power[k].max(1e-20).ln();
         let (a, b, c) = (l(k - 1), l(k), l(k + 1));
         let d = a - 2.0 * b + c;
-        if d < 0.0 { k as f32 + (0.5 * (a - c) / d).clamp(-0.5, 0.5) } else { k as f32 }
+        if d < 0.0 {
+            k as f32 + (0.5 * (a - c) / d).clamp(-0.5, 0.5)
+        } else {
+            k as f32
+        }
     }
 }
 
@@ -150,13 +172,22 @@ fn midi_hz(m: f32) -> f32 {
 }
 
 impl Outside {
-    pub fn update(&mut self, fine: &Source, coarse: &Source, rate: u32, range: NoteRange, fft: usize, reused: bool) {
+    pub fn update(
+        &mut self,
+        fine: &Source,
+        coarse: &Source,
+        rate: u32,
+        range: NoteRange,
+        fft: usize,
+        reused: bool,
+    ) {
         let first = ((NoteRange::BOUNDS.span().0 + 0.5) * BPS).round() as i32;
         let last = ((pitch::freq_to_midi(rate as f32 / 2.0, A4) + 0.5) * BPS).floor() as i32;
         let count = (last - first).max(0) as usize;
         let fresh = self.rate != rate || self.db.len() != count;
         (self.rate, self.first, self.fft, self.reused) = (rate, first, fft, reused);
-        (self.fine_hz, self.coarse_hz, self.handover) = (fine.hz_per_bin, coarse.hz_per_bin, fine.top);
+        (self.fine_hz, self.coarse_hz, self.handover) =
+            (fine.hz_per_bin, coarse.hz_per_bin, fine.top);
         if fresh {
             self.db = vec![FLOOR_DB; count];
         }
@@ -166,7 +197,11 @@ impl Outside {
             .map(|j| {
                 let (m0, m1) = band_midi(first + j as i32);
                 let hz = (midi_hz(m0), midi_hz(m1));
-                let r = if hz.1 <= fine.top { fine.band(hz) } else { coarse.band(hz) };
+                let r = if hz.1 <= fine.top {
+                    fine.band(hz)
+                } else {
+                    coarse.band(hz)
+                };
                 let tilt = TILT_DB_PER_OCT * ((hz.0 * hz.1).sqrt() / 1000.0).log2();
                 let db = (10.0 * r.peak.max(1e-12).log10() + tilt).max(FLOOR_DB);
                 self.db[j] += (db - self.db[j]) * a;
@@ -176,9 +211,11 @@ impl Outside {
 
         let (s0, s1) = range.span();
         let nyq_m = band_midi(last).0;
-        let idx = |m: f32| (((m + 0.5) * BPS).round() as i32 - first).clamp(0, count as i32) as usize;
+        let idx =
+            |m: f32| (((m + 0.5) * BPS).round() as i32 - first).clamp(0, count as i32) as usize;
         let (b0, b1) = (idx(s0), idx(s1));
-        self.lo.update(&readings[..b0], (NoteRange::BOUNDS.span().0, s0), fresh);
+        self.lo
+            .update(&readings[..b0], (NoteRange::BOUNDS.span().0, s0), fresh);
         self.hi.update(&readings[b1..], (s1, nyq_m), fresh);
     }
 
@@ -232,9 +269,13 @@ impl Outside {
             let (m0, m1) = band_midi(self.first + j as i32);
             let mid = (m0 + m1) / 2.0;
             if mid >= span.0 && mid < span.1 {
-                let c = ((((mid - span.0) / (span.1 - span.0)) * cols as f32) as usize).min(cols - 1);
+                let c =
+                    ((((mid - span.0) / (span.1 - span.0)) * cols as f32) as usize).min(cols - 1);
                 let db = db + EMPHASIS_DB_PER_OCT * (midi_hz(mid) / EMPHASIS_PIVOT).log2();
-                v[c] = (v[c].0.max(y.px(db).clamp(0.0, 1.0)), mid >= sel.0 && mid < sel.1);
+                v[c] = (
+                    v[c].0.max(y.px(db).clamp(0.0, 1.0)),
+                    mid >= sel.0 && mid < sel.1,
+                );
             }
         }
         let w = rect.width() / cols as f32;
@@ -271,14 +312,31 @@ impl Side {
         if sum <= 1e-12 || bands.is_empty() {
             return;
         }
-        let lnf = bands.iter().map(|r| r.sum * r.peak_hz.max(1.0).ln()).sum::<f32>() / sum;
+        let lnf = bands
+            .iter()
+            .map(|r| r.sum * r.peak_hz.max(1.0).ln())
+            .sum::<f32>()
+            / sum;
         let ln_mean = bands.iter().map(|r| r.sum.max(1e-20).ln()).sum::<f32>() / bands.len() as f32;
         let flat = (ln_mean.exp() / (sum / bands.len() as f32)).clamp(0.0, 1.0);
         self.flatness += (flat - self.flatness) * a;
-        let log_ema = |old: f32, new: f32| if old <= 0.0 || fresh { new } else { (old.ln() + (new.ln() - old.ln()) * a).exp() };
+        let log_ema = |old: f32, new: f32| {
+            if old <= 0.0 || fresh {
+                new
+            } else {
+                (old.ln() + (new.ln() - old.ln()) * a).exp()
+            }
+        };
         self.centroid = log_ema(self.centroid, lnf.exp());
         // The peak glides while it stays within a semitone, else jumps.
-        let peak = bands.iter().max_by(|x, y| x.peak.total_cmp(&y.peak)).map_or(0.0, |r| r.peak_hz);
-        self.peak = if self.peak > 0.0 && (peak / self.peak).log2().abs() < 1.0 / 12.0 { log_ema(self.peak, peak) } else { peak };
+        let peak = bands
+            .iter()
+            .max_by(|x, y| x.peak.total_cmp(&y.peak))
+            .map_or(0.0, |r| r.peak_hz);
+        self.peak = if self.peak > 0.0 && (peak / self.peak).log2().abs() < 1.0 / 12.0 {
+            log_ema(self.peak, peak)
+        } else {
+            peak
+        };
     }
 }

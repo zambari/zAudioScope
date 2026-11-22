@@ -8,6 +8,7 @@ use egui::{Align2, Color32, Mesh, Pos2, Rect, Stroke, Ui, pos2, vec2};
 
 use super::spectrum_rows::{self, BANDS, Key, Params, Rows, heat};
 use super::{Module, Shared};
+use crate::ui::dynamic_range;
 use crate::ui::noterange::NoteRange;
 use crate::ui::plot::{self, Link, Scale};
 use crate::ui::theme;
@@ -95,54 +96,63 @@ impl Module for Impulse {
     fn save_params(&self, storage: &mut dyn eframe::Storage, key: &str) {
         eframe::set_value(storage, &format!("{key}.3d"), &self.p);
         eframe::set_value(storage, &format!("{key}.range_hz"), &self.range_hz);
-        eframe::set_value(storage, &format!("{key}.fade"), &(self.fade_curve, self.hue_offset));
-        eframe::set_value(storage, &format!("{key}.window"), &(self.window_ms, self.density));
+        eframe::set_value(
+            storage,
+            &format!("{key}.fade"),
+            &(self.fade_curve, self.hue_offset),
+        );
+        eframe::set_value(
+            storage,
+            &format!("{key}.window"),
+            &(self.window_ms, self.density),
+        );
         eframe::set_value(storage, &format!("{key}.depth"), &self.depth);
         eframe::set_value(storage, &format!("{key}.time_smooth"), &self.time_smooth);
         eframe::set_value(storage, &format!("{key}.line_opacity"), &self.line_opacity);
     }
 
     fn load_params(&mut self, storage: &dyn eframe::Storage, key: &str) {
-        if let Some((curve, hue)) = eframe::get_value::<(f32, f32)>(storage, &format!("{key}.fade")) {
-            if curve.is_finite() && hue.is_finite() {
-                self.fade_curve = curve.clamp(0.0, 2.0);
-                self.hue_offset = hue.clamp(-1.0, 1.0);
-            }
+        if let Some((curve, hue)) = eframe::get_value::<(f32, f32)>(storage, &format!("{key}.fade"))
+            && curve.is_finite()
+            && hue.is_finite()
+        {
+            self.fade_curve = curve.clamp(0.0, 2.0);
+            self.hue_offset = hue.clamp(-1.0, 1.0);
         }
         if let Some(p) = Params::load(storage, &format!("{key}.3d")) {
             self.p = p;
         }
         // Older saves only had rows and ms/row: keep the same depth.
-        let (window, density) = eframe::get_value::<(f32, usize)>(storage, &format!("{key}.window"))
-            .unwrap_or(((self.p.rows.max(2) - 1) as f32 * self.p.row_ms, self.p.rows));
+        let (window, density) =
+            eframe::get_value::<(f32, usize)>(storage, &format!("{key}.window"))
+                .unwrap_or(((self.p.rows.max(2) - 1) as f32 * self.p.row_ms, self.p.rows));
         if window.is_finite() {
             self.window_ms = window.clamp(WINDOW_MS.0, WINDOW_MS.1);
         }
         self.density = density.clamp(DENSITY.0, DENSITY.1);
-        if let Some(depth) = eframe::get_value::<f32>(storage, &format!("{key}.depth")) {
-            if depth.is_finite() {
-                self.depth = depth.clamp(DEPTH.0, DEPTH.1);
-            }
+        if let Some(depth) = eframe::get_value::<f32>(storage, &format!("{key}.depth"))
+            && depth.is_finite()
+        {
+            self.depth = depth.clamp(DEPTH.0, DEPTH.1);
         }
-        if let Some(s) = eframe::get_value::<f32>(storage, &format!("{key}.time_smooth")) {
-            if s.is_finite() {
-                self.time_smooth = s.clamp(0.0, 1.0);
-            }
+        if let Some(s) = eframe::get_value::<f32>(storage, &format!("{key}.time_smooth"))
+            && s.is_finite()
+        {
+            self.time_smooth = s.clamp(0.0, 1.0);
         }
-        if let Some(o) = eframe::get_value::<f32>(storage, &format!("{key}.line_opacity")) {
-            if o.is_finite() {
-                self.line_opacity = o.clamp(0.0, 1.0);
-            }
+        if let Some(o) = eframe::get_value::<f32>(storage, &format!("{key}.line_opacity"))
+            && o.is_finite()
+        {
+            self.line_opacity = o.clamp(0.0, 1.0);
         }
         self.apply_window();
         if let Some((lo, hi)) = eframe::get_value::<(f32, f32)>(storage, &format!("{key}.range_hz"))
+            && lo.is_finite()
+            && hi.is_finite()
         {
-            if lo.is_finite() && hi.is_finite() {
-                let hi = hi.clamp(41.0, NoteRange::BOUNDS.hz().1);
-                self.range_hz = (lo.clamp(40.0, hi - 1.0), hi);
-            }
+            let hi = hi.clamp(41.0, NoteRange::BOUNDS.hz().1);
+            self.range_hz = (lo.clamp(40.0, hi - 1.0), hi);
         }
-
     }
 
     fn graph_height(&self) -> f32 {
@@ -161,28 +171,39 @@ impl Module for Impulse {
 
     fn params(&mut self, ui: &mut Ui, shared: &Shared) {
         self.p.db.ui(ui, shared);
-        self.link.slider(
-            ui,
-            Key::Speed,
-            egui::Slider::new(&mut self.window_ms, WINDOW_MS.0..=WINDOW_MS.1)
-                .logarithmic(true)
-                .integer()
-                .text("window ms"),
-        )
-        .on_hover_text("Time span from the front layer to the back one.");
+        self.link
+            .slider(
+                ui,
+                Key::Speed,
+                egui::Slider::new(&mut self.window_ms, WINDOW_MS.0..=WINDOW_MS.1)
+                    .logarithmic(true)
+                    .integer()
+                    .text("window ms"),
+            )
+            .on_hover_text("Time span from the front layer to the back one.");
         ui.add(egui::Slider::new(&mut self.density, DENSITY.0..=DENSITY.1).text("density"))
             .on_hover_text("Layers per unit of depth; the layer count is density × depth.");
         ui.add(egui::Slider::new(&mut self.fade_curve, 0.0..=2.0).text("fade curve"))
-            .on_hover_text("0: no fade (solid stack) · 1: linear fade to black at the back · \
-                 below 1 keeps the middle bright and drops off late · above 1 fades early.");
+            .on_hover_text(
+                "0: no fade (solid stack) · 1: linear fade to black at the back · \
+                 below 1 keeps the middle bright and drops off late · above 1 fades early.",
+            );
         ui.add(egui::Slider::new(&mut self.time_smooth, 0.0..=1.0).text("time smooth"))
-            .on_hover_text("Averages each frequency band with its neighbouring layers in time \
+            .on_hover_text(
+                "Averages each frequency band with its neighbouring layers in time \
                  (never across bands). Higher values turn the stack into a heavy, slowly \
-                 waving blanket.");
+                 waving blanket.",
+            );
         self.p.ui_fft(ui);
-        ui.add(egui::Slider::new(&mut self.depth, DEPTH.0..=DEPTH.1).text("depth").fixed_decimals(2))
-            .on_hover_text("Scales the z spacing of the stack (1 = default). The layer count \
-                 scales with it. Negative values flip the stack towards the viewer.");
+        ui.add(
+            egui::Slider::new(&mut self.depth, DEPTH.0..=DEPTH.1)
+                .text("depth")
+                .fixed_decimals(2),
+        )
+        .on_hover_text(
+            "Scales the z spacing of the stack (1 = default). The layer count \
+                 scales with it. Negative values flip the stack towards the viewer.",
+        );
         ui.add(
             RangeSlider::new(
                 &mut self.range_hz.0,
@@ -195,11 +216,15 @@ impl Module for Impulse {
         );
         self.p.ui_gate(ui);
         ui.add(egui::Slider::new(&mut self.hue_offset, -1.0..=1.0).text("hue offset"))
-            .on_hover_text("Rotates the hue of older layers (±½ turn at the back) and lets \
-                 off-hue channels fade faster, tinting the fade.");
+            .on_hover_text(
+                "Rotates the hue of older layers (±½ turn at the back) and lets \
+                 off-hue channels fade faster, tinting the fade.",
+            );
         ui.add(egui::Slider::new(&mut self.line_opacity, 0.0..=1.0).text("line opacity"))
-            .on_hover_text("Opacity of the outline drawn on history slices; the front \
-                 (current) slice always keeps a solid line.");
+            .on_hover_text(
+                "Opacity of the outline drawn on history slices; the front \
+                 (current) slice always keeps a solid line.",
+            );
         ui.weak("Drag: orbit · middle-drag: pan · scroll: zoom");
         ui.weak("Double-click to reset view");
     }
@@ -299,6 +324,10 @@ impl Module for Impulse {
             let hz = bounds.0 * (bounds.1 / bounds.0).powf((j as f32 + 0.5) / BANDS as f32);
             hz >= active.0 && hz <= active.1
         };
+        // Per-band membership, once per frame rather than per point per layer.
+        let inside_band: Vec<bool> = (0..BANDS).map(in_active).collect();
+        // Skip flat-floor points only when the floor is raised above its lowest setting.
+        let at_bottom = self.p.db.range.floor <= dynamic_range::BOUNDS.0;
         let x_of_u = |u: f32| (u - u0) / (u1 - u0) * 2.0 - 1.0;
         let x_of = |j: usize| x_of_u((j as f32 + 0.5) / BANDS as f32);
         // The depth axis parks on the end of the filled (active) region nearer
@@ -312,7 +341,12 @@ impl Module for Impulse {
         let step = (((hi - lo) as f32 * POINT_PX / plane_w).ceil() as usize).max(1);
 
         let total = self.p.rows.max(2);
-        smooth_time(&self.rows.history, self.time_smooth, total, &mut self.smoothed);
+        smooth_time(
+            &self.rows.history,
+            self.time_smooth,
+            total,
+            &mut self.smoothed,
+        );
         let source: Vec<&[f32]> = if self.time_smooth > 0.0 {
             self.smoothed.iter().map(Vec::as_slice).collect()
         } else {
@@ -348,15 +382,26 @@ impl Module for Impulse {
             );
             // (top point, its vertex index, inside the active range)
             let mut previous: Option<(Pos2, u32, bool)> = None;
+            // Outline: consecutive segments sharing a stroke form one polyline
+            // (one shape per run instead of one per segment).
             let mut outlines = Vec::new();
+            let mut run: Vec<Pos2> = Vec::new();
+            let mut run_stroke = inside_stroke;
             for j in (lo..hi).step_by(step) {
                 let db = row[j..(j + step).min(hi)]
                     .iter()
                     .copied()
                     .fold(f32::MIN, f32::max);
                 let lv = self.p.level(db);
+                if lv <= 0.0 && !at_bottom {
+                    // Flat floor: no fill or outline. The next non-zero point starts a new run.
+                    // At the lowest floor setting, flat points are drawn as before.
+                    previous = None;
+                    push_run(&mut outlines, &mut run, run_stroke);
+                    continue;
+                }
                 let centre = (j + (j + step).min(hi) - 1) / 2;
-                let inside = in_active(centre);
+                let inside = inside_band[centre];
                 let x = x_of(centre);
                 let top = project(x, lv * 0.65, z);
                 let v = mesh.vertices.len() as u32;
@@ -370,14 +415,28 @@ impl Module for Impulse {
                         mesh.add_triangle(prev_v, prev_v + 1, v);
                         mesh.add_triangle(prev_v + 1, v, v + 1);
                     }
-                    if both {
-                        outlines.push(egui::Shape::line_segment([prev, top], inside_stroke));
+                    let stroke = if both {
+                        Some(inside_stroke)
                     } else if current {
-                        outlines.push(egui::Shape::line_segment([prev, top], outside_stroke));
+                        Some(outside_stroke)
+                    } else {
+                        None
+                    };
+                    match stroke {
+                        Some(s) => {
+                            if run.last() != Some(&prev) || s != run_stroke {
+                                push_run(&mut outlines, &mut run, run_stroke);
+                                run.push(prev);
+                                run_stroke = s;
+                            }
+                            run.push(top);
+                        }
+                        None => push_run(&mut outlines, &mut run, run_stroke),
                     }
                 }
                 previous = Some((top, v, inside));
             }
+            push_run(&mut outlines, &mut run, run_stroke);
             painter.add(mesh);
             painter.extend(outlines);
         }
@@ -405,7 +464,10 @@ impl Module for Impulse {
         // labels sit on the side away from the fill.
         let depth_ms = (total - 1) as f32 * self.p.row_ms;
         painter.line_segment(
-            [project(fill_x, 0.0, z_of(0.0)), project(fill_x, 0.0, z_of(1.0))],
+            [
+                project(fill_x, 0.0, z_of(0.0)),
+                project(fill_x, 0.0, z_of(1.0)),
+            ],
             Stroke::new(1.0, plot::TICK),
         );
         for back in [0.0, 0.5, 1.0] {
@@ -416,7 +478,11 @@ impl Module for Impulse {
             );
             painter.text(
                 point + vec2(6.0 * out, -3.0),
-                if out > 0.0 { Align2::LEFT_BOTTOM } else { Align2::RIGHT_BOTTOM },
+                if out > 0.0 {
+                    Align2::LEFT_BOTTOM
+                } else {
+                    Align2::RIGHT_BOTTOM
+                },
                 format!("{} ms", plot::trim(back * depth_ms)),
                 egui::FontId::monospace(9.0),
                 theme::WAVE,
@@ -470,6 +536,15 @@ impl Impulse {
         let layers = (self.density as f32 * self.depth.abs()).round().max(2.0) as usize;
         self.p.rows = layers;
         self.p.row_ms = self.window_ms / (layers - 1) as f32;
+    }
+}
+
+/// Emit a run of connected points as one polyline (if it has a segment), then clear it.
+fn push_run(out: &mut Vec<egui::Shape>, run: &mut Vec<Pos2>, stroke: Stroke) {
+    if run.len() >= 2 {
+        out.push(egui::Shape::line(std::mem::take(run), stroke));
+    } else {
+        run.clear();
     }
 }
 

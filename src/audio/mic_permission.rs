@@ -54,7 +54,11 @@ mod imp {
         let send: unsafe extern "C" fn(*mut c_void, *mut c_void, *const c_void) -> isize =
             unsafe { std::mem::transmute(objc_msgSend as unsafe extern "C" fn()) };
         let v = unsafe {
-            send(cls, sel_registerName(c"authorizationStatusForMediaType:".as_ptr()), AVMediaTypeAudio)
+            send(
+                cls,
+                sel_registerName(c"authorizationStatusForMediaType:".as_ptr()),
+                AVMediaTypeAudio,
+            )
         };
         match v {
             0 => MicAuth::NotDetermined,
@@ -82,7 +86,10 @@ mod imp {
     unsafe impl Sync for Block {}
 
     const BLOCK_IS_GLOBAL: i32 = 1 << 28;
-    static DESCRIPTOR: BlockDescriptor = BlockDescriptor { reserved: 0, size: size_of::<Block>() };
+    static DESCRIPTOR: BlockDescriptor = BlockDescriptor {
+        reserved: 0,
+        size: size_of::<Block>(),
+    };
 
     /// 0: no answer yet, 1: granted, 2: refused.
     static ANSWER: AtomicU8 = AtomicU8::new(0);
@@ -119,7 +126,8 @@ mod imp {
 
     /// The app macOS holds responsible for this process, e.g. "Terminal".
     pub fn responsible_app() -> Option<String> {
-        let pid = unsafe { responsibility_get_pid_responsible_for_pid(std::process::id() as c_int) };
+        let pid =
+            unsafe { responsibility_get_pid_responsible_for_pid(std::process::id() as c_int) };
         if pid <= 0 {
             return None;
         }
@@ -130,8 +138,14 @@ mod imp {
         }
         let path = String::from_utf8_lossy(&buf[..n as usize]).into_owned();
         // ".../Terminal.app/Contents/MacOS/Terminal" -> "Terminal"
-        let app = path.split('/').find(|c| c.ends_with(".app")).map(|c| c.trim_end_matches(".app"));
-        Some(app.unwrap_or_else(|| path.rsplit('/').next().unwrap_or(&path)).to_owned())
+        let app = path
+            .split('/')
+            .find(|c| c.ends_with(".app"))
+            .map(|c| c.trim_end_matches(".app"));
+        Some(
+            app.unwrap_or_else(|| path.rsplit('/').next().unwrap_or(&path))
+                .to_owned(),
+        )
     }
 
     pub fn open_settings() {

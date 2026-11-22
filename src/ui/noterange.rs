@@ -13,8 +13,8 @@ use egui::{Align2, Color32, CursorIcon, FontId, Rect, Sense, Stroke, Ui, pos2, v
 use serde::{Deserialize, Serialize};
 
 use super::keyglow::KeyGlow;
-use super::plot::{self, Scale};
 use super::outside::{AIR_W, Outside};
+use super::plot::{self, Scale};
 use super::theme;
 use super::widgets::{self, Grab, clamp_pair};
 use crate::pitch;
@@ -148,11 +148,18 @@ pub fn bar(
     *range != before
 }
 
-fn strip(ui: &mut Ui, range: &mut NoteRange, marks: &[f32], outside: Option<&Outside>, glow: &KeyGlow) {
+fn strip(
+    ui: &mut Ui,
+    range: &mut NoteRange,
+    marks: &[f32],
+    outside: Option<&Outside>,
+    glow: &KeyGlow,
+) {
     // With a spectrum, it is drawn over the keys, and an "air" zone right
     // of the keys reaches from the bar top to Nyquist.
     let air_w = if outside.is_some() { AIR_W } else { 0.0 };
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), BAR_H), Sense::click_and_drag());
+    let (rect, resp) =
+        ui.allocate_exact_size(vec2(ui.available_width(), BAR_H), Sense::click_and_drag());
     let full = NoteRange::BOUNDS;
     let main = Rect::from_min_max(rect.min, pos2(rect.right() - air_w, rect.bottom()));
     let notes = full.scale(main);
@@ -192,19 +199,19 @@ fn strip(ui: &mut Ui, range: &mut NoteRange, marks: &[f32], outside: Option<&Out
             // Remember where the drag began, so moving both keeps whole notes.
             ui.data_mut(|d| d.insert_temp(id, (g, notes.value(origin.x), lo, hi)));
         }
-        if resp.dragged() || resp.clicked() {
-            if let Some((g, m0, lo0, hi0)) = ui.data(|d| d.get_temp::<(Grab, f32, f32, f32)>(id)) {
-                let m = notes.value(p.x);
-                match g {
-                    Grab::Lo => lo = m.round(),
-                    Grab::Hi => hi = m.round(),
-                    Grab::Both => {
-                        let d = (m - m0).round();
-                        (lo, hi) = (lo0 + d, hi0 + d);
-                    }
+        if (resp.dragged() || resp.clicked())
+            && let Some((g, m0, lo0, hi0)) = ui.data(|d| d.get_temp::<(Grab, f32, f32, f32)>(id))
+        {
+            let m = notes.value(p.x);
+            match g {
+                Grab::Lo => lo = m.round(),
+                Grab::Hi => hi = m.round(),
+                Grab::Both => {
+                    let d = (m - m0).round();
+                    (lo, hi) = (lo0 + d, hi0 + d);
                 }
-                clamp_pair(&mut lo, &mut hi, bounds, gap, g);
             }
+            clamp_pair(&mut lo, &mut hi, bounds, gap, g);
         }
         if resp.hovered() {
             // Scroll shifts the window a note per notch-ish.
@@ -322,7 +329,10 @@ fn strip(ui: &mut Ui, range: &mut NoteRange, marks: &[f32], outside: Option<&Out
         p.text(
             pos2(rect.right(), rect.top() + 1.0),
             Align2::RIGHT_TOP,
-            format!("→{}", plot::fmt_hz(pitch::midi_to_freq(o.hi.midi.1, A4).round())),
+            format!(
+                "→{}",
+                plot::fmt_hz(pitch::midi_to_freq(o.hi.midi.1, A4).round())
+            ),
             FontId::monospace(9.0),
             Color32::from_gray(140),
         );

@@ -13,7 +13,11 @@ pub enum AboutIntent {
     ResetState,
 }
 
-pub fn show(ui: &mut egui::Ui, devices: &[crate::audio::DeviceInfo], using: Option<&str>) -> Option<AboutIntent> {
+pub fn show(
+    ui: &mut egui::Ui,
+    devices: &[crate::audio::DeviceInfo],
+    using: Option<&str>,
+) -> Option<AboutIntent> {
     let mut out = None;
     let about = ui
         .add(egui::Button::new(egui::RichText::new("zAUDIOSCOPE").size(13.0).strong()).frame(false))
@@ -59,14 +63,19 @@ fn inputs(ui: &mut egui::Ui, devices: &[crate::audio::DeviceInfo], using: Option
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 3.0;
-            ui.label(egui::RichText::new("Audio inputs").size(SMALL_TEXT).strong());
+            ui.label(
+                egui::RichText::new("Audio inputs")
+                    .size(SMALL_TEXT)
+                    .strong(),
+            );
             ui.add_space(2.0);
             if devices.is_empty() {
                 ui.label(egui::RichText::new("none").size(SMALL_TEXT).weak());
             }
             for d in devices {
                 let text = if Some(d.id.as_str()) == using {
-                    egui::RichText::new(format!("{} (using)", d.name)).color(super::theme::ACCENT_BRIGHT)
+                    egui::RichText::new(format!("{} (using)", d.name))
+                        .color(super::theme::ACCENT_BRIGHT)
                 } else {
                     egui::RichText::new(&d.name)
                 };
@@ -81,7 +90,9 @@ fn reset_state(ui: &mut egui::Ui, confirm_id: egui::Id) -> bool {
     if !confirming {
         if ui
             .button("Reset state…")
-            .on_hover_text("Forget the input device, gain and module layout, then restart as on first run.")
+            .on_hover_text(
+                "Forget the input device, gain and module layout, then restart as on first run.",
+            )
             .clicked()
         {
             ui.data_mut(|d| d.insert_temp(confirm_id, true));

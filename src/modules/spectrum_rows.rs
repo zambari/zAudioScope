@@ -11,11 +11,11 @@ use egui::{Color32, Rect, Ui};
 
 use super::Shared;
 use crate::audio::spectrum::Bands;
+use crate::ui::dynamic_range::DynamicRange;
 use crate::ui::handle::EdgeHandle;
 use crate::ui::noterange::NoteRange;
 use crate::ui::plot::{self, Edge, Link, Scale};
 use crate::ui::theme;
-use crate::ui::dynamic_range::DynamicRange;
 
 /// Across the note bar's whole span (8 per semitone); a module shows the
 /// slice in the selected range, so changing the range keeps the history.
@@ -55,13 +55,25 @@ pub struct Params {
 
 impl Default for Params {
     fn default() -> Self {
-        Self { fft_pow: 12, rows: 160, db: DynamicRange::default(), floor_db: f32::NAN, ceil_db: f32::NAN, range_db: f32::NAN, follow_gate: false, row_ms: 15.0 }
+        Self {
+            fft_pow: 12,
+            rows: 160,
+            db: DynamicRange::default(),
+            floor_db: f32::NAN,
+            ceil_db: f32::NAN,
+            range_db: f32::NAN,
+            follow_gate: false,
+            row_ms: 15.0,
+        }
     }
 }
 
 impl Params {
     pub fn with_rows(rows: usize) -> Self {
-        Self { rows, ..Self::default() }
+        Self {
+            rows,
+            ..Self::default()
+        }
     }
 
     /// Pull loaded values back into the ranges the UI allows.
@@ -113,8 +125,16 @@ impl Params {
         self.db.ui(ui, shared);
         self.ui_fft(ui);
         ui.add(egui::Slider::new(&mut self.rows, ROWS.0..=ROWS.1).text("history rows"))
-            .on_hover_text("Number of spectrum rows retained. Time between rows is set by ms / row.");
-        link.slider(ui, Key::Speed, egui::Slider::new(&mut self.row_ms, ROW_MS.0..=ROW_MS.1).logarithmic(true).text("ms / row"));
+            .on_hover_text(
+                "Number of spectrum rows retained. Time between rows is set by ms / row.",
+            );
+        link.slider(
+            ui,
+            Key::Speed,
+            egui::Slider::new(&mut self.row_ms, ROW_MS.0..=ROW_MS.1)
+                .logarithmic(true)
+                .text("ms / row"),
+        );
         self.ui_gate(ui);
     }
 
@@ -130,7 +150,13 @@ impl Params {
     /// Call [`Link::tick`] earlier in the frame.
     pub fn speed_handle(&mut self, ui: &mut Ui, rect: Rect, id: &str, link: &mut Link<Key>) {
         let rows = self.rows as f32;
-        let fmt = |ms: f32| format!("{} ms/row · {}", plot::trim(ms), plot::fmt_secs(rows * ms / 1000.0));
+        let fmt = |ms: f32| {
+            format!(
+                "{} ms/row · {}",
+                plot::trim(ms),
+                plot::fmt_secs(rows * ms / 1000.0)
+            )
+        };
         time_handle(ui, rect, id, link, &mut self.row_ms, ROW_MS, 15.0, &fmt);
     }
 }
@@ -138,9 +164,22 @@ impl Params {
 /// Log-scaled time handle on the right edge (up is shorter), linked to the
 /// [`Key::Speed`] slider. Call [`Link::tick`] earlier in the frame.
 #[allow(clippy::too_many_arguments)]
-pub fn time_handle(ui: &mut Ui, rect: Rect, id: &str, link: &mut Link<Key>, value: &mut f32, range: (f32, f32), reset: f32, fmt: &dyn Fn(f32) -> String) {
+pub fn time_handle(
+    ui: &mut Ui,
+    rect: Rect,
+    id: &str,
+    link: &mut Link<Key>,
+    value: &mut f32,
+    range: (f32, f32),
+    reset: f32,
+    fmt: &dyn Fn(f32) -> String,
+) {
     let scale = Scale::log(range, (rect.top() + 6.0, rect.bottom() - 6.0));
-    let r = EdgeHandle::new(id, Edge::Right, scale, value).reset(reset).guide(false).label(fmt).show(ui, rect);
+    let r = EdgeHandle::new(id, Edge::Right, scale, value)
+        .reset(reset)
+        .guide(false)
+        .label(fmt)
+        .show(ui, rect);
     if r.hovered() || r.dragged() {
         link.touch(Key::Speed);
     }
@@ -153,7 +192,11 @@ pub fn time_handle(ui: &mut Ui, rect: Rect, id: &str, link: &mut Link<Key>, valu
 pub fn heat(t: f32) -> Color32 {
     let t = t.clamp(0.0, 1.0);
     let base = Color32::from_gray(13);
-    if t < 0.6 { theme::lerp(base, theme::ACCENT, t / 0.6) } else { theme::lerp(theme::ACCENT, theme::ON_ACCENT, (t - 0.6) / 0.4) }
+    if t < 0.6 {
+        theme::lerp(base, theme::ACCENT, t / 0.6)
+    } else {
+        theme::lerp(theme::ACCENT, theme::ON_ACCENT, (t - 0.6) / 0.4)
+    }
 }
 
 /// Band index range `[lo, hi)` and the bounds-relative span `(u0, u1)` of
@@ -204,7 +247,9 @@ impl Rows {
             Some(t) if !shared.reset && t <= end + hop && end - t.min(end) <= catchup => t,
             _ => end,
         };
-        let Some(bands) = self.bands.as_ref() else { return out };
+        let Some(bands) = self.bands.as_ref() else {
+            return out;
+        };
         while t <= end {
             // Gated: the window itself (shared with anyone else asking for
             // it this frame). Otherwise the `n` samples ending at `t`.
@@ -212,7 +257,8 @@ impl Rows {
                 Some(w) if p.follow_gate => w,
                 _ => (t.saturating_sub(n as u64), t),
             };
-            self.history.push_front(bands.db(&shared.spectrum(n, range)));
+            self.history
+                .push_front(bands.db(&shared.spectrum(n, range)));
             out.rows += 1;
             t += hop;
         }

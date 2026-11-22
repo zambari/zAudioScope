@@ -68,6 +68,7 @@ struct Note {
     off: Option<f64>,
 }
 
+#[derive(Default)]
 pub struct MidiMonitor {
     p: Params,
     /// Hub state as of the last update, for the "no device" text.
@@ -79,20 +80,6 @@ pub struct MidiMonitor {
     count: [u64; 16],
     /// Last message on the source channel(s), for the readout.
     last_msg: Option<(u8, [u8; 3])>,
-}
-
-impl Default for MidiMonitor {
-    fn default() -> Self {
-        Self {
-            p: Params::default(),
-            connected: false,
-            missing: false,
-            notes: VecDeque::new(),
-            last: [None; 16],
-            count: [0; 16],
-            last_msg: None,
-        }
-    }
 }
 
 impl MidiMonitor {
@@ -373,7 +360,11 @@ impl MidiMonitor {
         let range = shared.range.get();
         let (lo, hi) = (range.lo, range.hi);
         let span = self.p.span_s as f64;
-        let plot = if full { Rect::from_min_max(rect.min, pos2(rect.right(), rect.bottom() - 14.0)) } else { rect.with_max_y(rect.bottom() - 3.0) };
+        let plot = if full {
+            Rect::from_min_max(rect.min, pos2(rect.right(), rect.bottom() - 14.0))
+        } else {
+            rect.with_max_y(rect.bottom() - 3.0)
+        };
         let kw = plot.width() / range.count() as f32;
         // Left edge of key `k`'s lane: lanes are centred on the note.
         let x_scale = range.scale(plot);
@@ -427,22 +418,21 @@ impl MidiMonitor {
                 );
                 s += step;
             }
-
         }
         let (mut below, mut above) = (0, 0);
         let style = &self.p.style;
         let min_hold = MIN_BOX_PX as f64 * span / plot.height().max(1.0) as f64;
         let (mut ghosts, mut mesh, mut edges) = (Mesh::default(), Mesh::default(), Vec::new());
+        let (dim, bright) = (
+            style.tint(theme::ACCENT).gamma_multiply(0.6),
+            style.tint(theme::ACCENT_BRIGHT),
+        );
         for n in &self.notes {
             if !self.passes(n.ch) || now - n.off.map_or(now, |t| t + style.tail_s()) > span {
                 continue;
             }
             let k = self.shown_key(n);
-            let base = theme::lerp(
-                theme::ACCENT.gamma_multiply(0.6),
-                theme::ACCENT_BRIGHT,
-                style.vel_gain(n.vel),
-            );
+            let base = theme::lerp(dim, bright, style.vel_gain(n.vel));
             let fill = if n.off.is_none() {
                 theme::lerp(base, theme::ON_ACCENT, 0.35)
             } else {

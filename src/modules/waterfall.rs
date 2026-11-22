@@ -52,7 +52,8 @@ impl Module for Waterfall {
             self.colored.clear();
         }
         for row in self.rows.history.iter().take(added.rows).rev() {
-            self.colored.push_front(row.iter().map(|&db| self.p.color(db)).collect());
+            self.colored
+                .push_front(row.iter().map(|&db| self.p.color(db)).collect());
         }
         self.colored.truncate(self.p.rows);
         self.dirty |= added.cleared || added.rows > 0;
@@ -82,7 +83,12 @@ impl Waterfall {
         let key = (self.p.db.range.floor, self.p.db.range.ceil, self.p.rows);
         if self.colored_for != key {
             self.colored_for = key;
-            self.colored = self.rows.history.iter().map(|r| r.iter().map(|&db| self.p.color(db)).collect()).collect();
+            self.colored = self
+                .rows
+                .history
+                .iter()
+                .map(|r| r.iter().map(|&db| self.p.color(db)).collect())
+                .collect();
             self.dirty = true;
         }
         if self.texture.is_none() || self.dirty {
@@ -94,7 +100,13 @@ impl Waterfall {
             }
             match &mut self.texture {
                 Some(t) => t.set(img, TextureOptions::LINEAR),
-                None => self.texture = Some(ui.ctx().load_texture("waterfall", img, TextureOptions::LINEAR)),
+                None => {
+                    self.texture = Some(ui.ctx().load_texture(
+                        "waterfall",
+                        img,
+                        TextureOptions::LINEAR,
+                    ))
+                }
             }
         }
     }
@@ -106,22 +118,35 @@ impl Waterfall {
             return;
         }
         self.refresh(ui);
-        let Some(tex) = self.texture.as_ref().map(|t| t.id()) else { return };
+        let Some(tex) = self.texture.as_ref().map(|t| t.id()) else {
+            return;
+        };
         let painter = ui.painter_at(rect);
         let range = shared.range.get();
         let (_, (u0, u1)) = visible_bands(range);
-        painter.image(tex, rect, Rect::from_min_max(pos2(u0, 0.0), pos2(u1, 1.0)), Color32::WHITE);
+        painter.image(
+            tex,
+            rect,
+            Rect::from_min_max(pos2(u0, 0.0), pos2(u1, 1.0)),
+            Color32::WHITE,
+        );
         if !full {
             return;
         }
 
         // Frequency along the bottom, time ago down the left.
-        Axis::new(Edge::Bottom, range.hz_scale(rect)).spacing(48.0).draw(&painter, rect, plot::fmt_hz);
-        Axis::new(Edge::Left, Scale::linear((0.0, self.p.secs()), (rect.top(), rect.bottom())))
-            .spacing(32.0)
-            .grid(false)
-            .draw(&painter, rect, plot::fmt_secs);
+        Axis::new(Edge::Bottom, range.hz_scale(rect))
+            .spacing(48.0)
+            .draw(&painter, rect, plot::fmt_hz);
+        Axis::new(
+            Edge::Left,
+            Scale::linear((0.0, self.p.secs()), (rect.top(), rect.bottom())),
+        )
+        .spacing(32.0)
+        .grid(false)
+        .draw(&painter, rect, plot::fmt_secs);
 
-        self.p.speed_handle(ui, rect, "waterfall_speed", &mut self.link);
+        self.p
+            .speed_handle(ui, rect, "waterfall_speed", &mut self.link);
     }
 }

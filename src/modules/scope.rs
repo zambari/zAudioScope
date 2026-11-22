@@ -92,7 +92,10 @@ impl Params {
     }
 
     fn fold(&self) -> Fold {
-        Fold { floor: loudness::lin(self.db.range.floor), top: loudness::lin(self.db.range.ceil) }
+        Fold {
+            floor: loudness::lin(self.db.range.floor),
+            top: loudness::lin(self.db.range.ceil),
+        }
     }
 }
 
@@ -107,7 +110,9 @@ struct Fold {
 impl Fold {
     /// -1..1 of the half height, clamped.
     fn norm(&self, s: f32) -> f32 {
-        ((s.abs() - self.floor) / (self.top - self.floor)).clamp(0.0, 1.0).copysign(s)
+        ((s.abs() - self.floor) / (self.top - self.floor))
+            .clamp(0.0, 1.0)
+            .copysign(s)
     }
 
     /// Screen y for a sample value.
@@ -165,7 +170,9 @@ impl AutoLevel {
     }
 
     fn threshold(&self, reach_db: f32) -> f32 {
-        (self.hold * loudness::lin(-reach_db)).max(self.avg * AVG_FACTOR).clamp(AUTO_MIN, 1.0)
+        (self.hold * loudness::lin(-reach_db))
+            .max(self.avg * AVG_FACTOR)
+            .clamp(AUTO_MIN, 1.0)
     }
 }
 
@@ -241,7 +248,10 @@ impl Scope {
             return;
         }
         let x_of_ms = |ms: f32| rect.left() + rect.width() * ms / self.p.view_ms;
-        let gate = Rect::from_x_y_ranges(x_of_ms(self.p.win_start_ms)..=x_of_ms(self.p.win_end_ms), rect.y_range());
+        let gate = Rect::from_x_y_ranges(
+            x_of_ms(self.p.win_start_ms)..=x_of_ms(self.p.win_end_ms),
+            rect.y_range(),
+        );
         painter.rect_filled(gate, 0.0, theme::ACCENT.gamma_multiply(0.25));
     }
 
@@ -254,13 +264,21 @@ impl Scope {
         for c in 0..cols {
             let a = lo + c * view / cols;
             let b = (lo + (c + 1) * view / cols).max(a + 1);
-            let Some(seg) = f.samples.get(a..b.min(f.samples.len())) else { break };
+            let Some(seg) = f.samples.get(a..b.min(f.samples.len())) else {
+                break;
+            };
             if seg.is_empty() {
                 break;
             }
-            let (mn, mx) = seg.iter().fold((f32::MAX, f32::MIN), |(mn, mx), &s| (mn.min(s), mx.max(s)));
+            let (mn, mx) = seg
+                .iter()
+                .fold((f32::MAX, f32::MIN), |(mn, mx), &s| (mn.min(s), mx.max(s)));
             let x = rect.left() + c as f32 + 0.5;
-            painter.vline(x, fold.y(rect, mx)..=fold.y(rect, mn), Stroke::new(1.0, theme::WAVE));
+            painter.vline(
+                x,
+                fold.y(rect, mx)..=fold.y(rect, mn),
+                Stroke::new(1.0, theme::WAVE),
+            );
         }
     }
 }
@@ -316,11 +334,18 @@ impl Module for Scope {
                 let f = &shared.frame;
                 if self.p.mode == Mode::Auto {
                     // Nothing hit lately (or the stream restarted): passthrough.
-                    let stale = f.ms_to_samples(self.p.view_ms.max(self.p.win_end_ms) + AUTO_STALE_MS) as u64;
-                    self.trigger = self.trigger.filter(|&t| t <= f.end() && f.end() - t <= stale);
+                    let stale = f
+                        .ms_to_samples(self.p.view_ms.max(self.p.win_end_ms) + AUTO_STALE_MS)
+                        as u64;
+                    self.trigger = self
+                        .trigger
+                        .filter(|&t| t <= f.end() && f.end() - t <= stale);
                 }
                 shared.gate.window = self.trigger.map(|t| {
-                    (t + f.ms_to_samples(self.p.win_start_ms) as u64, t + f.ms_to_samples(self.p.win_end_ms) as u64)
+                    (
+                        t + f.ms_to_samples(self.p.win_start_ms) as u64,
+                        t + f.ms_to_samples(self.p.win_end_ms) as u64,
+                    )
                 });
             }
         }
@@ -338,18 +363,44 @@ impl Module for Scope {
         });
         let auto_thr = self.threshold();
         let link = &mut self.link;
-        link.slider(ui, Key::View, egui::Slider::new(&mut self.p.view_ms, 50.0..=2000.0).text("view ms"));
+        link.slider(
+            ui,
+            Key::View,
+            egui::Slider::new(&mut self.p.view_ms, 50.0..=2000.0).text("view ms"),
+        );
         ui.add_enabled_ui(self.p.mode != Mode::Free, |ui| {
             if self.p.mode == Mode::Auto {
-                link.slider(ui, Key::Reach, egui::Slider::new(&mut self.p.auto_reach_db, 0.0..=24.0).text("reach dB"))
-                    .on_hover_text("How much quieter than the last hit the next one may be and still trigger.");
+                link.slider(
+                    ui,
+                    Key::Reach,
+                    egui::Slider::new(&mut self.p.auto_reach_db, 0.0..=24.0).text("reach dB"),
+                )
+                .on_hover_text(
+                    "How much quieter than the last hit the next one may be and still trigger.",
+                );
                 ui.label(format!("auto threshold {:.1} dBFS", loudness::db(auto_thr)));
             } else {
-                link.slider(ui, Key::Threshold, egui::Slider::new(&mut self.p.threshold, 0.01..=1.0).text("threshold"));
+                link.slider(
+                    ui,
+                    Key::Threshold,
+                    egui::Slider::new(&mut self.p.threshold, 0.01..=1.0).text("threshold"),
+                );
             }
-            link.slider(ui, Key::Holdoff, egui::Slider::new(&mut self.p.holdoff_ms, 0.0..=1000.0).text("holdoff ms"));
-            link.slider(ui, Key::From, egui::Slider::new(&mut self.p.win_start_ms, 0.0..=self.p.view_ms).text("gate from"));
-            link.slider(ui, Key::To, egui::Slider::new(&mut self.p.win_end_ms, 0.0..=self.p.view_ms).text("gate to"));
+            link.slider(
+                ui,
+                Key::Holdoff,
+                egui::Slider::new(&mut self.p.holdoff_ms, 0.0..=1000.0).text("holdoff ms"),
+            );
+            link.slider(
+                ui,
+                Key::From,
+                egui::Slider::new(&mut self.p.win_start_ms, 0.0..=self.p.view_ms).text("gate from"),
+            );
+            link.slider(
+                ui,
+                Key::To,
+                egui::Slider::new(&mut self.p.win_end_ms, 0.0..=self.p.view_ms).text("gate to"),
+            );
         });
         if self.p.win_end_ms < self.p.win_start_ms {
             std::mem::swap(&mut self.p.win_start_ms, &mut self.p.win_end_ms);
@@ -374,7 +425,9 @@ impl Module for Scope {
         // Gate window, with drag-to-select.
         if trig {
             let resp = ui.interact(rect, ui.scope_id().with("scope_drag"), Sense::drag());
-            let ms_at = |p: Pos2| ((p.x - rect.left()) / rect.width() * self.p.view_ms).clamp(0.0, self.p.view_ms);
+            let ms_at = |p: Pos2| {
+                ((p.x - rect.left()) / rect.width() * self.p.view_ms).clamp(0.0, self.p.view_ms)
+            };
             if resp.drag_started() {
                 self.drag_from_ms = resp.interact_pointer_pos().map(ms_at);
             }
@@ -390,7 +443,11 @@ impl Module for Scope {
         Axis::new(Edge::Bottom, xs).draw(&painter, rect, plot::fmt_ms);
         draw_db_axis(&painter, rect, fold);
         // Raised floor folds quiet signal onto the centre line: flag it orange.
-        let centre = if self.p.db.range.floor_raised() { theme::ACCENT_BRIGHT } else { Color32::from_gray(40) };
+        let centre = if self.p.db.range.floor_raised() {
+            theme::ACCENT_BRIGHT
+        } else {
+            Color32::from_gray(40)
+        };
         painter.hline(rect.x_range(), rect.center().y, Stroke::new(1.0, centre));
 
         self.paint_wave(&painter, rect, shared);
@@ -398,7 +455,10 @@ impl Module for Scope {
         // Auto threshold: a guide only, the follower owns it.
         if self.p.mode == Mode::Auto {
             let thr = self.threshold();
-            let stroke = Stroke::new(1.0, theme::ACCENT.gamma_multiply(if trig { 0.8 } else { 0.35 }));
+            let stroke = Stroke::new(
+                1.0,
+                theme::ACCENT.gamma_multiply(if trig { 0.8 } else { 0.35 }),
+            );
             for s in [thr, -thr] {
                 painter.hline(rect.x_range(), fold.y(rect, s), stroke);
             }
@@ -409,7 +469,11 @@ impl Module for Scope {
             if self.p.mode == Mode::Trigger {
                 let thr = Scale::linear((fold.floor, fold.top), (rect.center().y, rect.top()));
                 let fmt = |v: f32| format!("thr {v:.2}  {:.1} dB", 20.0 * v.log10());
-                let r = EdgeHandle::new("scope_thr", Edge::Left, thr, &mut self.p.threshold).clamp(0.01, 1.0).reset(0.3).label(&fmt).show(ui, rect);
+                let r = EdgeHandle::new("scope_thr", Edge::Left, thr, &mut self.p.threshold)
+                    .clamp(0.01, 1.0)
+                    .reset(0.3)
+                    .label(&fmt)
+                    .show(ui, rect);
                 if r.hovered() || r.dragged() {
                     self.link.touch(Key::Threshold);
                 }
@@ -441,7 +505,10 @@ impl Module for Scope {
                 plot::fmt_ms(self.p.win_end_ms)
             ),
             (true, None) => format!("{} · waiting for trigger", plot::fmt_ms(self.p.view_ms)),
-            (false, _) if self.p.mode == Mode::Auto => format!("last {} · auto: no hits, passthrough", plot::fmt_ms(self.p.view_ms)),
+            (false, _) if self.p.mode == Mode::Auto => format!(
+                "last {} · auto: no hits, passthrough",
+                plot::fmt_ms(self.p.view_ms)
+            ),
             (false, _) => format!("last {}", plot::fmt_ms(self.p.view_ms)),
         };
         plot::caption(&painter, rect, Align2::RIGHT_TOP, caption);
@@ -449,14 +516,27 @@ impl Module for Scope {
         // Peak and loudness of what's on screen.
         let settle = f.ms_to_samples(100.0);
         if let Some((peak, lufs)) = loudness::measure(&f.samples, f.rate, lo, lo + view, settle) {
-            let fmt = |v: f32| if v.is_finite() { format!("{v:.1}") } else { "-inf".to_owned() };
-            let text = format!("peak {} dBFS · {} LUFS · zoom ×{}", fmt(loudness::db(peak)), fmt(lufs), plot::trim(fold.zoom()));
+            let fmt = |v: f32| {
+                if v.is_finite() {
+                    format!("{v:.1}")
+                } else {
+                    "-inf".to_owned()
+                }
+            };
+            let text = format!(
+                "peak {} dBFS · {} LUFS · zoom ×{}",
+                fmt(loudness::db(peak)),
+                fmt(lufs),
+                plot::trim(fold.zoom())
+            );
             plot::caption(&painter, rect, Align2::CENTER_TOP, text);
         }
 
         match self.link.shown() {
             Some(Key::View) => self.link.point_x(ui, rect, rect.right() - 1.0),
-            Some(Key::Threshold | Key::Reach) => self.link.point_y(ui, rect, fold.y(rect, self.threshold())),
+            Some(Key::Threshold | Key::Reach) => {
+                self.link.point_y(ui, rect, fold.y(rect, self.threshold()))
+            }
             Some(Key::Holdoff) => self.link.point_x(ui, rect, x_of_ms(self.p.holdoff_ms)),
             Some(Key::From) => self.link.point_x(ui, rect, x_of_ms(self.p.win_start_ms)),
             Some(Key::To) => self.link.point_x(ui, rect, x_of_ms(self.p.win_end_ms)),
@@ -464,17 +544,10 @@ impl Module for Scope {
         }
     }
 
-    /// Above the opaque waterfall, below the spectrum lines.
-    fn layer_depth(&self) -> Option<u8> {
-        Some(1)
-    }
-
-    /// Time runs across instead of pitch: the trace and gate stretched over
-    /// the panel, so hits line up visually with what they excite.
-    fn layer(&mut self, ui: &mut Ui, rect: Rect, shared: &Shared) {
-        let painter = ui.painter_at(rect);
-        self.paint_gate(&painter, rect);
-        self.paint_wave(&painter, rect, shared);
+    /// Time runs across the panel, not pitch, so it gets a pane of its own
+    /// under the composite layers rather than being stacked over them.
+    fn composite_pane(&self) -> bool {
+        true
     }
 }
 
@@ -500,11 +573,21 @@ fn draw_db_axis(painter: &egui::Painter, rect: Rect, fold: Fold) {
         let y_neg = fold.y(rect, -v);
         for yy in [y, y_neg] {
             painter.hline(rect.x_range(), yy, Stroke::new(1.0, plot::GRID));
-            painter.line_segment([egui::pos2(rect.left(), yy), egui::pos2(rect.left() + 5.0, yy)], Stroke::new(1.0, plot::TICK));
+            painter.line_segment(
+                [
+                    egui::pos2(rect.left(), yy),
+                    egui::pos2(rect.left() + 5.0, yy),
+                ],
+                Stroke::new(1.0, plot::TICK),
+            );
         }
         let unit = if kept.len() == 1 { " dBFS" } else { "" };
         let g = painter.layout_no_wrap(format!("{db:.0}{unit}"), plot::font(), plot::LABEL);
-        let ty = if y - g.size().y < rect.top() + 1.0 { y + 1.0 } else { y - g.size().y };
+        let ty = if y - g.size().y < rect.top() + 1.0 {
+            y + 1.0
+        } else {
+            y - g.size().y
+        };
         painter.galley(egui::pos2(rect.left() + 7.0, ty), g, plot::LABEL);
     }
 }

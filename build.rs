@@ -9,7 +9,10 @@ fn main() {
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=Cargo.lock");
 
-    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     println!("cargo:rustc-env=ZAUDIOSCOPE_BUILD={secs}");
     let (days, rem) = (secs / 86_400, secs % 86_400);
     let (y, m, d) = civil_from_days(days as i64);
@@ -26,7 +29,10 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("Info.plist");
         std::fs::write(&out, INFO_PLIST).unwrap();
-        println!("cargo:rustc-link-arg-bins=-Wl,-sectcreate,__TEXT,__info_plist,{}", out.display());
+        println!(
+            "cargo:rustc-link-arg-bins=-Wl,-sectcreate,__TEXT,__info_plist,{}",
+            out.display()
+        );
     }
 }
 
