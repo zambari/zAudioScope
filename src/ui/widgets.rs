@@ -26,6 +26,22 @@ pub fn placeholder(ui: &Ui, rect: egui::Rect, label: &str) {
     );
 }
 
+/// Max height of the device and channel popups (twice egui's default of 200).
+pub const POPUP_HEIGHT: f32 = 400.0;
+
+/// Device names longer than this are cut with an ellipsis in the list; the
+/// full name shows as a hover tooltip.
+const DEVICE_NAME_MAX: usize = 40;
+
+/// `name` cut to `DEVICE_NAME_MAX` characters, with "…" when shortened.
+pub fn short_device_name(name: &str) -> String {
+    if name.chars().count() <= DEVICE_NAME_MAX {
+        return name.to_owned();
+    }
+    let kept: String = name.chars().take(DEVICE_NAME_MAX - 1).collect();
+    format!("{}…", kept.trim_end())
+}
+
 /// Audio device dropdown. Returns the id picked this frame.
 pub fn device_picker(
     ui: &mut Ui,
@@ -38,11 +54,13 @@ pub fn device_picker(
     let mut picked = None;
     let r = egui::ComboBox::from_id_salt(salt)
         .width(width)
+        .height(POPUP_HEIGHT)
         .selected_text(selected)
         .show_ui(ui, |ui| {
             for d in devices {
                 if ui
-                    .selectable_label(current == Some(d.id.as_str()), &d.name)
+                    .selectable_label(current == Some(d.id.as_str()), short_device_name(&d.name))
+                    .on_hover_text(&d.name)
                     .clicked()
                 {
                     picked = Some(d.id.clone());
@@ -84,7 +102,8 @@ pub fn module_header(
             .size()
             .x
     };
-    let name_left = label.left() + 2.0 + measure("⏷  ".to_owned());
+    // Room for the disclosure triangle (drawn in the 16px before the title).
+    let name_left = label.left() + 16.0;
     // The arrow plus the title: both fold the section.
     let name = egui::Rect::from_min_max(
         pos2(label.left(), label.top()),
@@ -105,17 +124,16 @@ pub fn module_header(
             ui.painter()
                 .rect_filled(hit, 2.0, ui.visuals().widgets.hovered.weak_bg_fill);
         }
-        let arrow = if *open { "⏷" } else { "⏵" };
-        let text_rect = ui
-            .painter()
-            .with_clip_rect(label.intersect(ui.clip_rect()))
-            .text(
-                label.left_center() + vec2(2.0, 0.0),
-                Align2::LEFT_CENTER,
-                format!("{arrow}  {title}"),
-                FontId::proportional(13.0),
-                ui.style().interact(&response).text_color(),
-            );
+        let text_color = ui.style().interact(&response).text_color();
+        let clipped = ui.painter().with_clip_rect(label.intersect(ui.clip_rect()));
+        super::icons::disclosure(&clipped, label.left_center() + vec2(8.0, 0.0), *open, text_color);
+        let text_rect = clipped.text(
+            label.left_center() + vec2(16.0, 0.0),
+            Align2::LEFT_CENTER,
+            title,
+            FontId::proportional(13.0),
+            text_color,
+        );
         label_end = pos2(text_rect.right() + 35.0, text_rect.center().y);
     }
     (label_end, switch.left() - 4.0)
@@ -261,11 +279,11 @@ impl<S: AsIdSalt> Foldout<S> {
                         .gamma_multiply(0.5),
                 );
             }
-            let arrow = if open { "⏷" } else { "⏵" };
+            super::icons::disclosure(painter, rect.left_center() + vec2(6.0, 0.0), open, v.text_color());
             painter.text(
-                rect.left_center() + vec2(2.0, 0.0),
+                rect.left_center() + vec2(16.0, 0.0),
                 Align2::LEFT_CENTER,
-                format!("{arrow} {}", self.title),
+                self.title,
                 FontId::proportional(12.0),
                 v.text_color(),
             );

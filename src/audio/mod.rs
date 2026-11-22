@@ -17,6 +17,7 @@ macro_rules! by_format {
 }
 pub(crate) use by_format;
 
+pub mod endpoints;
 pub mod input;
 pub mod levels;
 pub mod loudness;

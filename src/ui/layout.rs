@@ -6,7 +6,7 @@ use egui::{Align, Align2, FontId, Id, Layout, Rect, Sense, Stroke, Ui, UiBuilder
 use serde::{Deserialize, Serialize};
 
 use super::outside as noterange_outside;
-use super::{noterange, plot, theme, widgets};
+use super::{icons, noterange, plot, theme, widgets};
 use crate::modules::{Module, Shared, Slot, tuner};
 
 const DIVIDER: f32 = 8.0;
@@ -623,15 +623,27 @@ impl Workspace {
         // Stays open while the mixer is used; only the button (or Esc) closes it.
         let popup_id = header.scope_id().with("layers_popup");
         let open = egui::Popup::is_id_open(header.ctx(), popup_id);
-        let label = egui::RichText::new("Layers ⏷");
+        // Trailing spaces leave room for the triangle painted at the right edge.
+        let label = egui::RichText::new("Layers    ");
+        let text_color = if open {
+            ui.visuals().text_color()
+        } else {
+            theme::ON_ACCENT
+        };
         let button = if open {
             egui::Button::new(label)
         } else {
-            egui::Button::new(label.color(super::theme::ON_ACCENT)).fill(super::theme::ACCENT)
+            egui::Button::new(label.color(text_color)).fill(theme::ACCENT)
         };
         let button = header
             .add(button.small())
             .on_hover_text("Layer visibility and opacity");
+        icons::disclosure(
+            header.painter(),
+            pos2(button.rect.right() - 9.0, button.rect.center().y),
+            open,
+            text_color,
+        );
         egui::Popup::menu(&button)
             .id(popup_id)
             .close_behavior(egui::PopupCloseBehavior::IgnoreClicks)
@@ -823,19 +835,24 @@ impl Workspace {
                 Some(g) => format!("{title} + {g}"),
                 None => title.to_owned(),
             };
-            let label = if stack {
-                format!("{}  {name}", if slot.visible { "⏷" } else { "⏵" })
-            } else {
-                name
-            };
             let color = ui.visuals().weak_text_color();
             let strip = if header > 0.0 {
                 let strip = rect.with_max_y(rect.top() + HEADER);
                 let font = FontId::proportional(11.0);
+                let mut text_x = 8.0;
+                if stack {
+                    icons::disclosure(
+                        pane.painter(),
+                        strip.left_center() + vec2(12.0, 0.0),
+                        slot.visible,
+                        color,
+                    );
+                    text_x = 22.0;
+                }
                 let name = pane.painter().text(
-                    strip.left_center() + vec2(8.0, 0.0),
+                    strip.left_center() + vec2(text_x, 0.0),
                     Align2::LEFT_CENTER,
-                    label,
+                    name,
                     font,
                     color,
                 );
@@ -846,7 +863,7 @@ impl Workspace {
                     rect,
                     rect.right_top() + vec2(-6.0, 2.0),
                     Align2::RIGHT_TOP,
-                    label,
+                    name,
                     color,
                 );
                 (tag, tag)

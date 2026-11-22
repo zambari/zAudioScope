@@ -18,6 +18,7 @@ use super::{Module, Shared};
 use crate::pitch::{self, Method};
 use crate::ui::noterange::NoteRange;
 use crate::ui::plot::{self, Lanes, NOTE_LANE};
+use crate::ui::icons::{self, Dir};
 use crate::ui::theme;
 use crate::ui::widgets::Foldout;
 
@@ -568,12 +569,12 @@ impl Tuner {
             .gamma_multiply(a);
             let dim = Color32::from_gray(170).gamma_multiply(a);
             let units = cents / 100.0 * self.p.units_per_semitone;
-            let advice = if in_tune {
-                "in tune".to_owned()
+            let (advice, arrow) = if in_tune {
+                ("in tune".to_owned(), None)
             } else if cents > 0.0 {
-                format!("▼ down {:.2}", units.abs())
+                (format!("down {:.2}", units.abs()), Some(Dir::Down))
             } else {
-                format!("▲ up {:.2}", units.abs())
+                (format!("up {:.2}", units.abs()), Some(Dir::Up))
             };
             let hz = pitch::midi_to_freq(self.shown_midi, self.p.a4);
 
@@ -590,13 +591,17 @@ impl Tuner {
                 FontId::proportional(26.0),
                 col,
             );
-            painter.text(
+            let advice_rect = painter.text(
                 panel.right_top() + vec2(-8.0, 6.0),
                 Align2::RIGHT_TOP,
                 &advice,
                 FontId::proportional(14.0),
                 col,
             );
+            if let Some(dir) = arrow {
+                let c = pos2(advice_rect.left() - 9.0, advice_rect.center().y);
+                icons::triangle(&painter, c, dir, 4.5, col);
+            }
             painter.text(
                 panel.right_top() + vec2(-8.0, 24.0),
                 Align2::RIGHT_TOP,

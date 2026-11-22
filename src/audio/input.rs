@@ -1,12 +1,14 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SizedSample};
 use serde::{Deserialize, Serialize};
 
 use super::Frame;
+use super::endpoints;
 use super::tap::{MonitorTap, StereoRing};
 
 /// Capture lengths offered, seconds. The ring is rounded up to a power of
@@ -19,6 +21,19 @@ const STEREO_LEN: usize = 4096;
 const STANDARD_RATES: [u32; 7] = [32_000, 44_100, 48_000, 88_200, 96_000, 176_400, 192_000];
 /// Buffer sizes (frames) offered when the device's range allows them.
 const STANDARD_BUFFERS: [u32; 9] = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096];
+/// Reconnect delays after a loss, by attempt; the last one repeats.
+const BACKOFF_MS: [u64; 4] = [250, 500, 1000, 2000];
+/// Timer retries for an ASIO device before waiting for an endpoint change:
+/// each try loads the driver, and some show a dialog when the box is gone.
+const ASIO_TIMER_RETRIES: u32 = 3;
+/// Without endpoint notifications, how often a missing wanted device is
+/// looked for while running on the default.
+const PRESENCE_POLL: Duration = Duration::from_secs(3);
+/// No callback for this long right after opening counts as a stall. Some
+/// drivers take a while to start.
+const FIRST_CALLBACK_WAIT: Duration = Duration::from_secs(3);
+/// Shortest stall that counts once callbacks have been arriving.
+const MIN_STALL: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Debug)]
 pub struct DeviceInfo {
@@ -184,6 +199,63 @@ struct Shared {
     skipped: AtomicU64,
     /// Set by the error callback on an xrun, cleared by the data callback.
     xrun_flag: AtomicBool,
+    /// Callbacks delivered, empty ones included: the stall watchdog's pulse.
+    callbacks: AtomicU64,
+    /// Set by the error callback when the stream died and must be rebuilt.
+    lost: AtomicBool,
+}
+
+/// Whether the stream is healthy, or down and being retried.
+enum Link {
+    Up,
+    Lost {
+        reason: String,
+        attempt: u32,
+        retry_at: Instant,
+    },
+}
+
+fn backoff(attempt: u32) -> Duration {
+    let i = (attempt as usize).min(BACKOFF_MS.len() - 1);
+    Duration::from_millis(BACKOFF_MS[i])
+}
+
+fn is_asio(id: Option<&str>) -> bool {
+    id.is_some_and(|id| id.starts_with("asio:"))
+}
+
+/// A stream error in words a user can act on.
+pub(crate) fn describe_err(e: &cpal::Error) -> String {
+    use cpal::ErrorKind as K;
+    match e.kind() {
+        K::DeviceBusy => "device is in use by another app (exclusive mode?)".into(),
+        K::DeviceNotAvailable => "device not available (unplugged or disabled)".into(),
+        K::PermissionDenied => "access denied: check the microphone privacy settings".into(),
+        K::HostUnavailable => "audio service not running".into(),
+        K::StreamInvalidated => "stream invalidated (device format or route changed)".into(),
+        _ => e.to_string(),
+    }
+}
+
+/// What a stream error callback should do about `err`.
+pub(crate) enum ErrAction {
+    /// A dropout: count it.
+    Xrun,
+    /// Informational; the stream carries on.
+    Ignore,
+    /// The stream is dead and must be rebuilt.
+    Lost(String),
+}
+
+pub(crate) fn classify(err: &cpal::Error) -> ErrAction {
+    use cpal::ErrorKind as K;
+    match err.kind() {
+        K::Xrun => ErrAction::Xrun,
+        // DeviceChanged: rerouted and still running. RealtimeDenied: runs
+        // anyway, just without the priority boost.
+        K::DeviceChanged | K::RealtimeDenied => ErrAction::Ignore,
+        _ => ErrAction::Lost(describe_err(err)),
+    }
 }
 
 /// Input choices that survive a restart.
@@ -229,7 +301,23 @@ enum Capture {
 pub struct Input {
     stream: Option<Capture>,
     shared: Arc<Shared>,
+    /// The device asked for (`None`: system default). Persisted, and kept
+    /// while that device is missing, so it comes back when the device does.
     pub device_id: Option<String>,
+    /// The device actually open: the default while the wanted one is
+    /// missing.
+    opened_id: Option<String>,
+    /// Running on the default because the wanted device is missing.
+    fallback: bool,
+    /// When `fallback` last looked for the wanted device.
+    presence_checked: Instant,
+    /// Health of the stream.
+    link: Link,
+    /// Endpoint change count last acted on.
+    seen_gen: u64,
+    /// Stall watchdog: callback count at the last look, and when it moved.
+    last_callbacks: u64,
+    last_progress: Instant,
     pub device_name: String,
     /// The rate the stream runs (or would run) at.
     pub rate: u32,
@@ -253,7 +341,6 @@ pub struct Input {
     /// Ask the callback to measure every channel (channel picker open).
     meter_all: Arc<AtomicBool>,
     paused: bool,
-    open_error: Option<String>,
     /// Input gain as `f32` bits, applied in the callback so every analyser,
     /// the meter and the trigger all see the same scaled signal.
     gain: Arc<AtomicU32>,
@@ -272,6 +359,13 @@ impl Input {
             stream: None,
             shared: new_shared(1, 0),
             device_id: None,
+            opened_id: None,
+            fallback: false,
+            presence_checked: Instant::now(),
+            link: Link::Up,
+            seen_gen: endpoints::generation(),
+            last_callbacks: 0,
+            last_progress: Instant::now(),
             device_name: "none".into(),
             rate: 48_000,
             channels: 0,
@@ -285,7 +379,6 @@ impl Input {
             history_secs: settings.history_secs.clamp(1, 600),
             meter_all: Arc::new(AtomicBool::new(false)),
             paused: settings.paused,
-            open_error: None,
             gain: Arc::new(AtomicU32::new(1f32.to_bits())),
             channel: Arc::new(AtomicU32::new(settings.channel.to_bits())),
             device_channels: settings.device_channels.clone(),
@@ -307,20 +400,46 @@ impl Input {
         }
     }
 
+    /// Every input device, ASIO included. Listing ASIO loads each driver
+    /// (some grab the hardware or show dialogs), so this is for startup and
+    /// the explicit rescan only.
     pub fn devices() -> Vec<DeviceInfo> {
+        #[cfg_attr(not(feature = "asio"), allow(unused_mut))]
+        let mut list = Self::system_devices();
+        #[cfg(feature = "asio")]
+        if let Ok(asio) = cpal::host_from_id(cpal::HostId::Asio) {
+            list.extend(asio.input_devices().map(describe).unwrap_or_default());
+        }
+        list
+    }
+
+    /// The list after an endpoint change: system devices rescanned, ASIO
+    /// entries carried over from `prev` without touching the drivers.
+    pub fn devices_refresh(prev: &[DeviceInfo]) -> Vec<DeviceInfo> {
+        let mut list = Self::system_devices();
+        list.extend(prev.iter().filter(|d| is_asio(Some(&d.id))).cloned());
+        list
+    }
+
+    fn system_devices() -> Vec<DeviceInfo> {
         let mut list: Vec<DeviceInfo> = cpal::default_host()
             .input_devices()
             .map(describe)
             .unwrap_or_default();
         #[cfg(windows)]
         list.extend(super::dsound::devices());
-        // ASIO drivers are only loaded by listing them, so this is kept to
-        // the device list refresh, not the per-frame path.
-        #[cfg(feature = "asio")]
-        if let Ok(asio) = cpal::host_from_id(cpal::HostId::Asio) {
-            list.extend(asio.input_devices().map(describe).unwrap_or_default());
-        }
         list
+    }
+
+    /// The device actually open, which differs from `device_id` while
+    /// falling back to the default.
+    pub fn opened_id(&self) -> Option<&str> {
+        self.opened_id.as_deref()
+    }
+
+    /// Running on the system default because the wanted device is missing.
+    pub fn fallback(&self) -> bool {
+        self.fallback && !self.paused
     }
 
     /// The feed the monitor output plays from.
@@ -331,18 +450,127 @@ impl Input {
     /// Close the current stream and open another device (`None`: system
     /// default). While paused, only looks the device up.
     pub fn switch(&mut self, device_id: Option<&str>) {
+        self.device_id = device_id.map(str::to_owned);
+        self.attempt(0);
+    }
+
+    /// Close and reopen the wanted device; `attempt` counts failures in a
+    /// row, for the retry delay.
+    fn attempt(&mut self, attempt: u32) {
         self.stream = None;
-        // A fresh open supersedes any error latched by the old stream.
+        // A fresh open supersedes anything latched by the old stream.
         if let Ok(mut e) = self.shared.error.lock() {
             *e = None;
         }
-        self.open_error = self.open_stream(device_id).err();
+        self.shared.lost.store(false, Ordering::Relaxed);
+        self.link = match self.open_stream() {
+            Ok(()) => Link::Up,
+            Err(reason) => Link::Lost {
+                reason,
+                attempt,
+                retry_at: Instant::now() + backoff(attempt),
+            },
+        };
+        self.last_callbacks = self.shared.callbacks.load(Ordering::Relaxed);
+        self.last_progress = Instant::now();
+        self.presence_checked = Instant::now();
     }
 
-    /// True while audio is actually arriving: not paused, and the stream
-    /// opened without error. A disconnected interface reads as not connected.
+    /// Reopen after a loss, keeping the captured audio when the format is
+    /// unchanged.
+    fn retry(&mut self, attempt: u32) {
+        self.keep_ring = true;
+        self.attempt(attempt);
+    }
+
+    fn lose(&mut self, reason: String) {
+        self.stream = None;
+        self.link = Link::Lost {
+            reason,
+            attempt: 0,
+            retry_at: Instant::now() + backoff(0),
+        };
+    }
+
+    /// Call once per UI frame: notices a dead or stalled stream, retries
+    /// with backoff, and returns to the wanted device once it is back.
+    /// Never blocks unless it reopens.
+    pub fn tick(&mut self) {
+        if self.paused {
+            return;
+        }
+        let generation = endpoints::generation();
+        let changed = generation != self.seen_gen;
+        self.seen_gen = generation;
+        let now = Instant::now();
+        match &self.link {
+            Link::Up => {
+                if self.shared.lost.load(Ordering::Relaxed) {
+                    let reason = self
+                        .shared
+                        .error
+                        .lock()
+                        .ok()
+                        .and_then(|e| e.clone())
+                        .unwrap_or_else(|| "stream stopped".into());
+                    self.lose(reason);
+                } else if self.stream.is_some() && self.stalled(now) {
+                    self.lose("no audio arriving: driver stalled or device gone".into());
+                } else if self.fallback && self.wanted_present(changed, now) {
+                    self.retry(0);
+                }
+            }
+            &Link::Lost {
+                attempt, retry_at, ..
+            } => {
+                let timer = now >= retry_at
+                    && (!is_asio(self.device_id.as_deref()) || attempt < ASIO_TIMER_RETRIES);
+                if changed || timer {
+                    self.retry(attempt + 1);
+                }
+            }
+        }
+    }
+
+    /// No callback for much longer than a buffer. Catches drivers that just
+    /// stop calling back without reporting an error, which `gaps` can't:
+    /// it only counts once a late callback finally arrives.
+    fn stalled(&mut self, now: Instant) -> bool {
+        let n = self.shared.callbacks.load(Ordering::Relaxed);
+        if n != self.last_callbacks {
+            self.last_callbacks = n;
+            self.last_progress = now;
+            return false;
+        }
+        let limit = match self.callback_frames() {
+            0 => FIRST_CALLBACK_WAIT,
+            f => MIN_STALL.max(Duration::from_secs_f32(10.0 * f as f32 / self.rate.max(1) as f32)),
+        };
+        now.duration_since(self.last_progress) > limit
+    }
+
+    /// While on the default, whether the wanted device is back. Looks on an
+    /// endpoint change, or on a timer where there are no notifications.
+    /// ASIO is only looked for on a change: looking loads the driver.
+    fn wanted_present(&mut self, changed: bool, now: Instant) -> bool {
+        let id = self.device_id.as_deref();
+        let timer = !endpoints::watched()
+            && !is_asio(id)
+            && now.duration_since(self.presence_checked) >= PRESENCE_POLL;
+        if !(changed || timer) {
+            return false;
+        }
+        self.presence_checked = now;
+        by_id(&host_for(id), id).is_some()
+    }
+
+    /// True while audio is arriving: not paused, and the stream is up.
+    /// A disconnected or stalled interface reads as not connected.
     pub fn connected(&self) -> bool {
-        !self.paused && self.stream.is_some() && self.error().is_none()
+        !self.paused
+            && self.stream.is_some()
+            && matches!(self.link, Link::Up)
+            && !self.shared.lost.load(Ordering::Relaxed)
     }
 
     /// Switch to another device picked by the user, restoring the channel
@@ -356,7 +584,8 @@ impl Input {
     }
 
     fn remember_channel(&mut self) {
-        if let Some(id) = &self.device_id {
+        // The device actually in use: while on the default, picks belong to it.
+        if let Some(id) = &self.opened_id {
             self.device_channels.insert(id.clone(), self.channel());
         }
     }
@@ -431,7 +660,11 @@ impl Input {
     /// Reopen the running stream if it carries a different channel count
     /// than the selection needs, keeping the captured audio.
     fn sync_channels(&mut self) {
-        if self.paused || self.stream.is_none() || self.wanted_channels() == self.stream_channels {
+        if self.paused
+            || self.stream.is_none()
+            || !matches!(self.link, Link::Up)
+            || self.wanted_channels() == self.stream_channels
+        {
             return;
         }
         // DirectSound always captures every channel; nothing to reopen.
@@ -476,6 +709,7 @@ impl Input {
         self.paused = paused;
         if paused {
             self.stream = None;
+            self.link = Link::Up;
         } else {
             let id = self.device_id.clone();
             self.switch(id.as_deref());
@@ -491,19 +725,33 @@ impl Input {
         false
     }
 
-    fn open_stream(&mut self, device_id: Option<&str>) -> Result<(), String> {
+    fn open_stream(&mut self) -> Result<(), String> {
+        let wanted = self.device_id.clone();
+        let wanted = wanted.as_deref();
+        self.fallback = false;
         #[cfg(windows)]
-        if let Some(id) = device_id.filter(|id| id.starts_with(super::dsound::PREFIX)) {
+        if let Some(id) = wanted.filter(|id| id.starts_with(super::dsound::PREFIX)) {
             return self.open_dsound(id);
         }
-        let host = host_for(device_id);
-        let device = by_id(&host, device_id)
-            .or_else(|| host.default_input_device())
-            .ok_or("no input device")?;
-        self.device_id = device.id().ok().map(|id| id.to_string());
+        let host = host_for(wanted);
+        // A wanted device that is missing falls back to the system default,
+        // without forgetting it: `tick` switches back once it returns. The
+        // default handle follows default-device changes on its own (WASAPI
+        // reports one as an invalidated stream, and `tick` reopens).
+        let device = match by_id(&host, wanted) {
+            Some(d) => d,
+            None => {
+                let d = cpal::default_host()
+                    .default_input_device()
+                    .ok_or("no input device")?;
+                self.fallback = wanted.is_some();
+                d
+            }
+        };
+        self.opened_id = device.id().ok().map(|id| id.to_string());
         self.device_name = device_name(&device, "input");
 
-        let default = device.default_input_config().map_err(|e| e.to_string())?;
+        let default = device.default_input_config().map_err(|e| describe_err(&e))?;
         let ranges: Vec<_> = device
             .supported_input_configs()
             .map(|r| r.collect())
@@ -576,7 +824,7 @@ impl Input {
             monitor: self.monitor.clone(),
         };
         let stream = super::by_format!(config.sample_format(), build(&device, sc, taps))?;
-        stream.play().map_err(|e| e.to_string())?;
+        stream.play().map_err(|e| describe_err(&e))?;
         self.stream = Some(Capture::Cpal(stream));
         Ok(())
     }
@@ -588,7 +836,7 @@ impl Input {
     fn open_dsound(&mut self, id: &str) -> Result<(), String> {
         let open = super::dsound::open(id, self.want_rate)?;
         let fmt = open.format;
-        self.device_id = Some(id.to_owned());
+        self.opened_id = Some(id.to_owned());
         self.device_name = open.name.clone();
         self.default_rate = fmt.rate;
         self.rates = vec![fmt.rate];
@@ -618,14 +866,19 @@ impl Input {
             monitor: self.monitor.clone(),
         };
         let mut pipe = Pipe::new(taps, fmt.rate, fmt.channels);
-        let sh = self.shared.clone();
+        let (xrun_sh, err_sh) = (self.shared.clone(), self.shared.clone());
         let capture = super::dsound::start(
             open,
             move |block: &[f32]| pipe.run(block),
+            move || {
+                xrun_sh.xruns.fetch_add(1, Ordering::Relaxed);
+                xrun_sh.xrun_flag.store(true, Ordering::Relaxed);
+            },
             move |e: String| {
-                if let Ok(mut err) = sh.error.lock() {
+                if let Ok(mut err) = err_sh.error.lock() {
                     *err = Some(e);
                 }
+                err_sh.lost.store(true, Ordering::Relaxed);
             },
         );
         self.stream = Some(Capture::DirectSound(capture));
@@ -689,10 +942,15 @@ impl Input {
         self.shared.xruns.load(Ordering::Relaxed)
     }
 
+    /// What is wrong, if anything; says so while a reconnect is pending.
     pub fn error(&self) -> Option<String> {
-        self.open_error
-            .clone()
-            .or_else(|| self.shared.error.lock().ok()?.clone())
+        if self.paused {
+            return None;
+        }
+        match &self.link {
+            Link::Lost { reason, .. } => Some(format!("{reason} · reconnecting…")),
+            Link::Up => self.shared.error.lock().ok()?.clone(),
+        }
     }
 }
 
@@ -705,6 +963,8 @@ fn new_shared(len: usize, channels: u16) -> Arc<Shared> {
         gaps: AtomicU64::new(0),
         skipped: AtomicU64::new(0),
         xrun_flag: AtomicBool::new(false),
+        callbacks: AtomicU64::new(0),
+        lost: AtomicBool::new(false),
     })
 }
 
@@ -796,6 +1056,7 @@ impl Pipe {
             _ => ChannelSel::Mono(0),
         };
         let metering = taps.meter_all.load(Ordering::Relaxed);
+        sh.callbacks.fetch_add(1, Ordering::Relaxed);
         let frames = data.len() / ch;
         sh.callback_frames.store(frames as u32, Ordering::Relaxed);
         let rate = self.in_rate.max(1) as f32;
@@ -885,17 +1146,24 @@ where
         .build_input_stream(
             config,
             move |data: &[T], _: &cpal::InputCallbackInfo| pipe.run(data),
-            move |err: cpal::Error| {
+            move |err: cpal::Error| match classify(&err) {
                 // Overloads are transient (CoreAudio reports one on many
                 // device/rate changes): count them, don't latch an error.
-                if matches!(err.kind(), cpal::ErrorKind::Xrun) {
+                ErrAction::Xrun => {
                     err_sh.xruns.fetch_add(1, Ordering::Relaxed);
                     err_sh.xrun_flag.store(true, Ordering::Relaxed);
-                } else if let Ok(mut e) = err_sh.error.lock() {
-                    *e = Some(err.to_string());
+                }
+                ErrAction::Ignore => {}
+                // Only flag it here; the UI thread rebuilds the stream.
+                // Dropping a stream from its own callback would deadlock.
+                ErrAction::Lost(msg) => {
+                    if let Ok(mut e) = err_sh.error.lock() {
+                        *e = Some(msg);
+                    }
+                    err_sh.lost.store(true, Ordering::Relaxed);
                 }
             },
             None,
         )
-        .map_err(|e| e.to_string())
+        .map_err(|e| describe_err(&e))
 }

@@ -16,6 +16,7 @@ use super::{Module, Shared};
 use crate::pitch;
 use crate::ui::noterange::{NoteRange, is_black};
 use crate::ui::notestyle::{NoteStyle, OVERTONES};
+use crate::ui::icons::{self, Dir};
 use crate::ui::theme;
 
 /// Notes kept in the ring.
@@ -474,22 +475,24 @@ impl MidiMonitor {
         // Notes the key range hides.
         let small = FontId::proportional(10.0);
         if full && below > 0 {
-            p.text(
-                plot.left_top() + vec2(4.0, 3.0),
+            let text = p.text(
+                plot.left_top() + vec2(12.0, 3.0),
                 Align2::LEFT_TOP,
-                format!("◀ {below} below"),
+                format!("{below} below"),
                 small.clone(),
                 theme::ACCENT_BRIGHT,
             );
+            icons::triangle(&p, pos2(plot.left() + 7.0, text.center().y), Dir::Left, 3.5, theme::ACCENT_BRIGHT);
         }
         if full && above > 0 {
-            p.text(
-                plot.right_top() + vec2(-4.0, 3.0),
+            let text = p.text(
+                plot.right_top() + vec2(-12.0, 3.0),
                 Align2::RIGHT_TOP,
-                format!("{above} above ▶"),
+                format!("{above} above"),
                 small,
                 theme::ACCENT_BRIGHT,
             );
+            icons::triangle(&p, pos2(plot.right() - 7.0, text.center().y), Dir::Right, 3.5, theme::ACCENT_BRIGHT);
         }
 
         // Held notes light up their key along the bottom.

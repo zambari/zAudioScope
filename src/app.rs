@@ -3,6 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::audio::endpoints;
 use crate::audio::mic_permission::{self, MicAuth};
 use crate::audio::{
     ChannelSel, DeviceInfo, HISTORY_CHOICES, Input, InputSettings, Monitor, MonitorSettings,
@@ -74,6 +75,8 @@ pub struct App {
     levels: crate::audio::levels::LevelHistogram,
     /// FFT plans reused across frames; results are cached per frame only.
     fft_plans: FftPlans,
+    /// Endpoint change count the device lists were last refreshed at.
+    devices_gen: u64,
 }
 
 impl App {
@@ -128,6 +131,21 @@ impl App {
             missed_reset: vec![false; slots_len],
             levels: Default::default(),
             fft_plans: FftPlans::default(),
+            devices_gen: endpoints::generation(),
+        }
+    }
+
+    /// Keep the streams alive across device changes, and the device lists
+    /// current. ASIO entries are carried over, not rescanned: listing ASIO
+    /// loads its drivers, which the ⟳ button alone may do.
+    fn watch_devices(&mut self) {
+        self.input.tick();
+        self.monitor.tick();
+        let generation = endpoints::generation();
+        if generation != self.devices_gen {
+            self.devices_gen = generation;
+            self.devices = Input::devices_refresh(&self.devices);
+            self.out_devices = Monitor::devices();
         }
     }
 
@@ -186,7 +204,7 @@ impl App {
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if let Some(ui::infobox::AboutIntent::ResetState) =
-                ui::infobox::show(ui, &self.devices, self.input.device_id.as_deref())
+                ui::infobox::show(ui, &self.devices, self.input.opened_id())
             {
                 self.reset_state = true;
                 self.relaunch = true;
@@ -208,10 +226,6 @@ impl App {
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             }
-            ui.separator();
-            ui.label("Debug");
-            ui.add(ui::widgets::flicktoggle(&mut self.profiler.enabled))
-                .on_hover_text("Show UI-thread load and per-module timings");
             ui.separator();
             ui.label("Input");
             let (_, picked) = ui::widgets::device_picker(
@@ -237,6 +251,17 @@ impl App {
             ui.separator();
             self.meter.show(ui, &self.input, &mut self.gain);
             ui.separator();
+            self.meter.phase_strip(ui, &self.input);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add(ui::widgets::flicktoggle(&mut self.profiler.enabled))
+                    .on_hover_text("Show UI-thread load and per-module timings");
+                ui.label("Debug");
+            });
+        });
+        ui.separator();
+        ui.horizontal_wrapped(|ui| {
+            self.midi.picker(ui);
+            ui.separator();
             ui::monitor_bar::show(
                 ui,
                 &mut self.monitor,
@@ -244,11 +269,6 @@ impl App {
                 &self.out_devices,
                 &self.input.device_name,
             );
-            self.meter.phase_strip(ui, &self.input);
-        });
-        ui.separator();
-        ui.horizontal_wrapped(|ui| {
-            self.midi.picker(ui);
             for slot in self.slots.iter_mut().filter(|s| s.module.has_top_row()) {
                 ui.separator();
                 ui.push_id(slot.module.title(), |ui| slot.module.top_row(ui));
@@ -260,16 +280,29 @@ impl App {
     /// and shows a greyed-out "Paused".
     fn listen_toggle(&mut self, ui: &mut egui::Ui) {
         let mut listening = !self.input.paused();
-        let label = if listening {
-            egui::RichText::new("▶ Listening")
-        } else {
-            egui::RichText::new("⏸ Paused").color(ui.visuals().weak_text_color())
-        };
-        if ui
-            .toggle_value(&mut listening, label)
-            .on_hover_text("Click to pause: disconnects from the interface so another app (e.g. a DAW in exclusive mode) can use it. The last captured audio stays on screen.")
-            .changed()
-        {
+        let before = listening;
+        ui.horizontal(|ui| {
+            // Icon drawn as a shape (see theme::transport); clicking it toggles too.
+            let (rect, icon) = ui.allocate_exact_size(egui::vec2(12.0, 14.0), egui::Sense::click());
+            if icon.clicked() {
+                listening = !listening;
+            }
+            if ui.is_rect_visible(rect) {
+                let color = if listening {
+                    ui.visuals().text_color()
+                } else {
+                    ui.visuals().weak_text_color()
+                };
+                crate::ui::icons::transport(ui.painter(), rect.center(), listening, color);
+            }
+            let label = if listening {
+                egui::RichText::new("Listening")
+            } else {
+                egui::RichText::new("Paused").color(ui.visuals().weak_text_color())
+            };
+            ui.toggle_value(&mut listening, label).on_hover_text("Click to pause: disconnects from the interface so another app (e.g. a DAW in exclusive mode) can use it. The last captured audio stays on screen.");
+        });
+        if listening != before {
             self.input.set_paused(!listening);
         }
     }
@@ -291,6 +324,7 @@ impl App {
         let mut pick_hist = None;
         let popup = egui::ComboBox::from_id_salt("input_channel")
             .width(130.0)
+            .height(ui::widgets::POPUP_HEIGHT)
             .selected_text(head)
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
             .show_ui(ui, |ui| {
@@ -461,6 +495,20 @@ impl App {
                 ui.colored_label(ui.visuals().warn_fg_color, format!("input interrupted {g}×"))
                     .on_hover_text("Audio stopped arriving for longer than a buffer. If this keeps counting up, macOS is pausing the input: usually missing microphone permission for the app that launched this one, or another app holding the interface exclusively. The menu-bar mic indicator blinks when this happens.");
             }
+            if self.input.fallback() {
+                let wanted = self.input.device_id.as_deref();
+                let name = self
+                    .devices
+                    .iter()
+                    .find(|d| Some(d.id.as_str()) == wanted)
+                    .map_or("Saved input", |d| d.name.as_str());
+                ui.separator();
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    format!("{name} missing: using {}", self.input.device_name),
+                )
+                .on_hover_text("Switches back by itself once the device is connected again.");
+            }
             if let Some(e) = self.input.error() {
                 ui.separator();
                 ui.colored_label(ui.visuals().error_fg_color, e);
@@ -474,6 +522,7 @@ impl eframe::App for App {
         let timing = self.profiler.begin();
         self.build_watch.poll(ui.ctx());
         self.poll_mic(ui.ctx());
+        self.watch_devices();
         // Live modules: visible, and drawn by the page on screen (a solo page
         // draws one analyser), or needed by others. The rest pause in place.
         let requested = self.layout.requested(&self.slots);

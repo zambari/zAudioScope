@@ -4778,6 +4778,7 @@ dependencies = [
  "midir",
  "serde",
  "windows",
+ "windows-core",
 ]
 
 [[package]]

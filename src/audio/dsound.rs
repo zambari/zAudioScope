@@ -3,18 +3,21 @@
 //! blocks it reads go through the same `Pipe` as cpal callbacks, so the
 //! analysers, meter and monitor see no difference.
 
+use std::collections::HashMap;
 use std::ffi::c_void;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr::null_mut;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows::Win32::Media::Audio::DirectSound::{
     DSCBSTART_LOOPING, DSCBUFFERDESC, DirectSoundCaptureCreate8, DirectSoundCaptureEnumerateW,
     IDirectSoundCapture, IDirectSoundCaptureBuffer,
 };
 use windows::Win32::Media::Audio::{WAVEFORMATEX, WAVEFORMATEXTENSIBLE};
+use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
 use windows::core::{BOOL, GUID, IUnknown, PCWSTR};
 
 use super::input::DeviceInfo;
@@ -29,6 +32,15 @@ const BUFFER_SECS: u32 = 1;
 const POLL: Duration = Duration::from_millis(3);
 /// Rates tried after the wanted one, in order.
 const FALLBACK_RATES: [u32; 2] = [48_000, 44_100];
+/// Away from the buffer this long (a fraction of `BUFFER_SECS`), the
+/// hardware may have lapped the read point: resync instead of reading.
+const OVERRUN_FRACTION: f32 = 0.75;
+
+/// Names seen by the last `devices()` call, so `open` doesn't enumerate again.
+static NAMES: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+/// Format each device last accepted, tried first on the next open so a
+/// reconnect doesn't probe dozens of formats again.
+static LAST_FORMAT: Mutex<Option<HashMap<String, Format>>> = Mutex::new(None);
 
 /// Sample encodings tried, best first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,13 +93,22 @@ pub fn devices() -> Vec<DeviceInfo> {
             Some(&mut found as *mut _ as *const c_void),
         )
     };
-    found
+    let list: Vec<DeviceInfo> = found
         .into_iter()
         .map(|(guid, name)| DeviceInfo {
             id: format!("{PREFIX}{}", format_guid(&guid)),
             name: format!("{name} (DirectSound)"),
         })
-        .collect()
+        .collect();
+    if let Ok(mut names) = NAMES.lock() {
+        *names = list.iter().map(|d| (d.id.clone(), d.name.clone())).collect();
+    }
+    list
+}
+
+fn cached_name(id: &str) -> Option<String> {
+    let names = NAMES.lock().ok()?;
+    names.iter().find(|(i, _)| i == id).map(|(_, n)| n.clone())
 }
 
 unsafe extern "system" fn enum_cb(
@@ -121,6 +142,9 @@ fn parse_id(id: &str) -> Result<GUID, String> {
 /// A capture buffer the device accepted, not yet running.
 pub struct Opened {
     buffer: SendBuffer,
+    /// The device object, kept alive as long as its buffer: some drivers
+    /// don't hold their own reference to it.
+    _device: IDirectSoundCapture,
     pub format: Format,
     pub name: String,
 }
@@ -134,25 +158,30 @@ pub fn open(id: &str, wanted: Option<u32>) -> Result<Opened, String> {
     unsafe { DirectSoundCaptureCreate8(Some(&guid as *const GUID), &mut cap, None::<&IUnknown>) }
         .map_err(|e| format!("DirectSound open failed: {e}"))?;
     let cap = cap.ok_or("DirectSound returned no capture device")?;
-    let name = devices()
-        .into_iter()
-        .find(|d| d.id == id)
-        .map(|d| d.name)
-        .unwrap_or_else(|| id.to_owned());
+    let name = cached_name(id).unwrap_or_else(|| id.to_owned());
 
+    let last = LAST_FORMAT
+        .lock()
+        .ok()
+        .and_then(|m| m.as_ref()?.get(id).copied())
+        .filter(|f| wanted.is_none_or(|r| r == f.rate));
     let rates = wanted.into_iter().chain(FALLBACK_RATES);
-    for rate in rates {
-        for channels in (1..=MAX_CHANNELS).rev() {
-            for kind in KINDS {
-                let format = Format { rate, channels, kind };
-                if let Some(buffer) = make_buffer(&cap, format) {
-                    return Ok(Opened {
-                        buffer: SendBuffer(buffer),
-                        format,
-                        name,
-                    });
-                }
+    let probe = rates.flat_map(|rate| {
+        (1..=MAX_CHANNELS)
+            .rev()
+            .flat_map(move |channels| KINDS.map(|kind| Format { rate, channels, kind }))
+    });
+    for format in last.into_iter().chain(probe) {
+        if let Some(buffer) = make_buffer(&cap, format) {
+            if let Ok(mut m) = LAST_FORMAT.lock() {
+                m.get_or_insert_default().insert(id.to_owned(), format);
             }
+            return Ok(Opened {
+                buffer: SendBuffer(buffer),
+                _device: cap,
+                format,
+                name,
+            });
         }
     }
     Err(format!("{name} accepted no capture format"))
@@ -213,61 +242,108 @@ impl Drop for Capture {
 }
 
 /// Start reading. `on_block` gets each run of interleaved samples as `f32`
-/// in [-1, 1]; `on_error` is called once if the buffer stops working.
+/// in [-1, 1]; `on_xrun` when audio was lost (the reader fell a buffer
+/// behind); `on_error` once if the buffer stops working, after which the
+/// reader exits. A device that silently stops moving its cursor (unplugged,
+/// on some drivers) just stops calling `on_block`: the input's stall
+/// watchdog catches that.
 pub fn start(
     opened: Opened,
-    mut on_block: impl FnMut(&[f32]) + Send + 'static,
-    on_error: impl FnOnce(String) + Send + 'static,
+    on_block: impl FnMut(&[f32]) + Send + 'static,
+    on_xrun: impl Fn() + Send + 'static,
+    on_error: impl Fn(String) + Send + Sync + 'static,
 ) -> Capture {
     let stop = Arc::new(AtomicBool::new(false));
     let flag = stop.clone();
     let owned = SendOpen(opened);
-    let thread = thread::spawn(move || {
-        let open = owned.into_inner();
-        let buffer = open.buffer.0;
-        let f = open.format;
-        let size = f.buffer_bytes();
-        let block = f.block();
-        if let Err(e) = unsafe { buffer.Start(DSCBSTART_LOOPING) } {
-            on_error(format!("DirectSound start failed: {e}"));
+    let on_error = Arc::new(on_error);
+    let thread_err = on_error.clone();
+    let spawned = thread::Builder::new()
+        .name("dsound capture".into())
+        .spawn(move || {
+            // DirectSound works without it, but other COM calls here would not.
+            let com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
+            let mut on_block = on_block;
+            let run = catch_unwind(AssertUnwindSafe(|| {
+                reader(owned.into_inner(), &flag, &mut on_block, &on_xrun, &*thread_err)
+            }));
+            if run.is_err() {
+                thread_err("DirectSound capture thread panicked".into());
+            }
+            if com {
+                unsafe { CoUninitialize() };
+            }
+        });
+    let thread = match spawned {
+        Ok(t) => Some(t),
+        Err(e) => {
+            on_error(format!("DirectSound capture thread failed to start: {e}"));
+            None
+        }
+    };
+    Capture { stop, thread }
+}
+
+fn reader(
+    open: Opened,
+    stop: &AtomicBool,
+    on_block: &mut dyn FnMut(&[f32]),
+    on_xrun: &dyn Fn(),
+    on_error: &dyn Fn(String),
+) {
+    let buffer = &open.buffer.0;
+    let f = open.format;
+    let size = f.buffer_bytes();
+    let block = f.block();
+    let bytes_per_sec = f.rate as f32 * block as f32;
+    if let Err(e) = unsafe { buffer.Start(DSCBSTART_LOOPING) } {
+        on_error(format!("DirectSound start failed: {e}"));
+        return;
+    }
+    // Begin at the read cursor, not at stale bytes.
+    let mut pos = match unsafe { read_cursor(buffer) } {
+        Ok(c) => c - c % block,
+        Err(e) => {
+            on_error(format!("DirectSound cursor failed: {e}"));
             return;
         }
-        // Begin at wherever the hardware cursor is, not at stale bytes.
-        let mut pos = match unsafe { cursor(&buffer) } {
+    };
+    let mut last_read = Instant::now();
+    let mut samples = Vec::new();
+    while !stop.load(Ordering::Relaxed) {
+        let cur = match unsafe { read_cursor(buffer) } {
             Ok(c) => c,
             Err(e) => {
                 on_error(format!("DirectSound cursor failed: {e}"));
-                return;
-            }
-        };
-        let mut samples = Vec::new();
-        while !flag.load(Ordering::Relaxed) {
-            let cap = match unsafe { cursor(&buffer) } {
-                Ok(c) => c,
-                Err(e) => {
-                    on_error(format!("DirectSound cursor failed: {e}"));
-                    break;
-                }
-            };
-            // Bytes between our read point and the hardware cursor, wrapping.
-            let lag = (cap + size - pos) % size;
-            if lag < block {
-                thread::sleep(POLL);
-                continue;
-            }
-            if let Err(e) = unsafe { read(&buffer, pos, lag, f.kind, &mut samples) } {
-                on_error(format!("DirectSound read failed: {e}"));
                 break;
             }
-            pos = cap;
-            on_block(&samples);
+        };
+        // Away long enough that the hardware may have lapped us: the bytes
+        // between `pos` and the cursor mix two passes. Skip them.
+        let away = last_read.elapsed().as_secs_f32();
+        if away * bytes_per_sec >= size as f32 * OVERRUN_FRACTION {
+            pos = cur - cur % block;
+            last_read = Instant::now();
+            on_xrun();
+            continue;
         }
-        let _ = unsafe { buffer.Stop() };
-    });
-    Capture {
-        stop,
-        thread: Some(thread),
+        // Bytes between our read point and the read cursor, wrapping, in
+        // whole frames so the channels never shift.
+        let mut lag = (cur + size - pos) % size;
+        lag -= lag % block;
+        if lag == 0 {
+            thread::sleep(POLL);
+            continue;
+        }
+        if let Err(e) = unsafe { read(buffer, pos, lag, f.kind, &mut samples) } {
+            on_error(format!("DirectSound read failed: {e}"));
+            break;
+        }
+        pos = (pos + lag) % size;
+        last_read = Instant::now();
+        on_block(&samples);
     }
+    let _ = unsafe { buffer.Stop() };
 }
 
 struct SendOpen(Opened);
@@ -279,10 +355,12 @@ impl SendOpen {
     }
 }
 
-unsafe fn cursor(buffer: &IDirectSoundCaptureBuffer) -> windows::core::Result<u32> {
-    let mut capture = 0u32;
-    unsafe { buffer.GetCurrentPosition(Some(&mut capture as *mut u32), None)? };
-    Ok(capture)
+/// The read cursor: everything before it is captured and safe to copy. The
+/// capture cursor runs ahead of it, and the bytes between are not valid yet.
+unsafe fn read_cursor(buffer: &IDirectSoundCaptureBuffer) -> windows::core::Result<u32> {
+    let mut read = 0u32;
+    unsafe { buffer.GetCurrentPosition(None, Some(&mut read as *mut u32))? };
+    Ok(read)
 }
 
 /// Copy `len` bytes starting at `at` into `out` as `f32`, wrapping at the

@@ -1,5 +1,6 @@
 pub mod dynamic_range;
 pub mod handle;
+pub mod icons;
 pub mod infobox;
 pub mod keyglow;
 pub mod layout;

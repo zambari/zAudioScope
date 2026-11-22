@@ -33,3 +33,6 @@ perf.data*
 Thumbs.db
 
 AGENTS.md
+
+# Local build/relaunch script
+build.bat

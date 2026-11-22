@@ -4,13 +4,15 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
 use serde::{Deserialize, Serialize};
 
 use super::DeviceInfo;
-use super::input::{by_id, describe, device_name};
+use super::endpoints;
+use super::input::{ErrAction, by_id, classify, describe, describe_err, device_name};
 use super::tap::MonitorTap;
 
 /// Output callback size asked for, clamped to what the device allows.
@@ -19,6 +21,8 @@ const OUT_BUFFER: u32 = 256;
 const FADE_IN_S: f32 = 0.5;
 /// Ramp to silence once the guard trips, seconds.
 const MUTE_S: f32 = 0.02;
+/// Reconnect delays after a loss, by attempt; the last one repeats.
+const BACKOFF_MS: [u64; 4] = [250, 500, 1000, 2000];
 
 /// What the monitor remembers across restarts. Monitoring itself is never
 /// persisted: the app always starts with it off, but keeps the last device.
@@ -83,6 +87,15 @@ struct Shared {
     /// Output L/R peak since the UI last looked, `f32` bits.
     peaks: [AtomicU32; 2],
     error: Mutex<Option<String>>,
+    /// Set by the error callback when the stream died and must be rebuilt.
+    lost: AtomicBool,
+}
+
+/// The output went away while monitoring; retried on the same endpoint.
+struct Lost {
+    reason: String,
+    attempt: u32,
+    retry_at: Instant,
 }
 
 pub struct Monitor {
@@ -90,9 +103,21 @@ pub struct Monitor {
     sh: Arc<Shared>,
     tap: Arc<MonitorTap>,
     enabled: bool,
+    /// Chosen output (`None`: the default at the moment monitoring starts).
     pub device_id: Option<String>,
+    /// The endpoint actually opened. Reconnects only ever go back to it,
+    /// never to whatever is the default by then: after unplugging
+    /// headphones that is usually the speakers.
+    opened_id: Option<String>,
     pub device_name: String,
     open_error: Option<String>,
+    lost: Option<Lost>,
+    seen_gen: u64,
+}
+
+fn backoff(attempt: u32) -> Duration {
+    let i = (attempt as usize).min(BACKOFF_MS.len() - 1);
+    Duration::from_millis(BACKOFF_MS[i])
 }
 
 impl Monitor {
@@ -107,12 +132,16 @@ impl Monitor {
                 rearm: AtomicBool::new(false),
                 peaks: [AtomicU32::new(0), AtomicU32::new(0)],
                 error: Mutex::new(None),
+                lost: AtomicBool::new(false),
             }),
             tap,
             enabled: false,
             device_id: settings.device_id.clone(),
+            opened_id: None,
             device_name: "default output".into(),
             open_error: None,
+            lost: None,
+            seen_gen: endpoints::generation(),
         };
         me.set_gain(settings.gain);
         me
@@ -140,12 +169,73 @@ impl Monitor {
     /// Open or close the output; the input only feeds the tap while on.
     pub fn set_enabled(&mut self, on: bool) {
         self.enabled = on;
-        self.stream = None;
-        self.open_error = if on { self.open().err() } else { None };
-        self.tap.on.store(self.stream.is_some(), Ordering::Relaxed);
+        self.lost = None;
+        self.opened_id = None;
+        self.drop_stream();
         if let Ok(mut e) = self.sh.error.lock() {
             *e = None;
         }
+        let target = self.device_id.clone();
+        let result = if on { self.open(target.as_deref()) } else { Ok(()) };
+        self.open_error = result.err();
+        // A chosen device that is missing now is retried; the default never
+        // is, since by the time one appears it may be the speakers.
+        if self.open_error.is_some() && self.device_id.is_some() {
+            self.opened_id = self.device_id.clone();
+            self.lost = Some(Lost {
+                reason: self.open_error.take().unwrap_or_default(),
+                attempt: 0,
+                retry_at: Instant::now() + backoff(0),
+            });
+        }
+    }
+
+    /// Call once per UI frame: notices a dead output and reopens the same
+    /// endpoint with backoff. Never falls back to another device.
+    pub fn tick(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        let generation = endpoints::generation();
+        let changed = generation != self.seen_gen;
+        self.seen_gen = generation;
+        if self.stream.is_some() && self.sh.lost.load(Ordering::Relaxed) {
+            let reason = self
+                .sh
+                .error
+                .lock()
+                .ok()
+                .and_then(|e| e.clone())
+                .unwrap_or_else(|| "output stopped".into());
+            self.drop_stream();
+            self.lost = Some(Lost {
+                reason,
+                attempt: 0,
+                retry_at: Instant::now() + backoff(0),
+            });
+        }
+        let Some(lost) = &self.lost else { return };
+        if !(changed || Instant::now() >= lost.retry_at) {
+            return;
+        }
+        let attempt = lost.attempt + 1;
+        let target = self.opened_id.clone();
+        match self.open(target.as_deref()) {
+            Ok(()) => self.lost = None,
+            Err(reason) => {
+                self.lost = Some(Lost {
+                    reason,
+                    attempt,
+                    retry_at: Instant::now() + backoff(attempt),
+                })
+            }
+        }
+    }
+
+    fn drop_stream(&mut self) {
+        // Stop feeding the tap first; nothing reads it now.
+        self.tap.on.store(false, Ordering::Relaxed);
+        self.stream = None;
     }
 
     pub fn select_device(&mut self, id: &str) {
@@ -200,22 +290,41 @@ impl Monitor {
     }
 
     pub fn error(&self) -> Option<String> {
+        if let Some(l) = &self.lost {
+            return Some(format!("{} · waiting for {}", l.reason, self.device_name));
+        }
         self.open_error
             .clone()
             .or_else(|| self.sh.error.lock().ok()?.clone())
     }
 
-    fn open(&mut self) -> Result<(), String> {
+    /// Open `id` (`None`: the current default), closing any old stream
+    /// first. On success the tap is fed again and the output fades in.
+    fn open(&mut self, id: Option<&str>) -> Result<(), String> {
+        self.drop_stream();
+        if let Ok(mut e) = self.sh.error.lock() {
+            *e = None;
+        }
+        self.sh.lost.store(false, Ordering::Relaxed);
         let host = cpal::default_host();
         // A saved device that is gone is an error, not a fallback: the
         // default is often the speakers, the one place monitoring a mic
         // must not end up by surprise.
-        let device = match self.device_id.as_deref() {
+        let device = match id {
             Some(id) => by_id(&host, Some(id)).ok_or("monitor output not found")?,
-            None => host.default_output_device().ok_or("no output device")?,
+            // Resolved to the specific endpoint: a default-device stream
+            // would follow the default by itself, e.g. onto the speakers.
+            None => {
+                let d = host.default_output_device().ok_or("no output device")?;
+                let id = d.id().map_err(|e| describe_err(&e))?.to_string();
+                by_id(&host, Some(&id)).ok_or("default output not found")?
+            }
         };
+        self.opened_id = device.id().ok().map(|id| id.to_string());
         self.device_name = device_name(&device, "output");
-        let config = device.default_output_config().map_err(|e| e.to_string())?;
+        let config = device
+            .default_output_config()
+            .map_err(|e| describe_err(&e))?;
         let mut sc: cpal::StreamConfig = config.config();
         if let cpal::SupportedBufferSize::Range { min, max } = *config.buffer_size() {
             sc.buffer_size = cpal::BufferSize::Fixed(OUT_BUFFER.clamp(min, max));
@@ -223,8 +332,9 @@ impl Monitor {
         self.rearm();
         let (sh, tap) = (self.sh.clone(), self.tap.clone());
         let stream = super::by_format!(config.sample_format(), build(&device, sc, sh, tap))?;
-        stream.play().map_err(|e| e.to_string())?;
+        stream.play().map_err(|e| describe_err(&e))?;
         self.stream = Some(stream);
+        self.tap.on.store(true, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -253,16 +363,17 @@ where
             config,
             move |data: &mut [T], _: &cpal::OutputCallbackInfo| player.render(data, ch, &sh, &tap),
             move |err: cpal::Error| {
-                if matches!(err.kind(), cpal::ErrorKind::Xrun) {
-                    return;
-                }
-                if let Ok(mut e) = err_sh.error.lock() {
-                    *e = Some(err.to_string());
+                // Flag only; the UI thread rebuilds (see `Monitor::tick`).
+                if let ErrAction::Lost(msg) = classify(&err) {
+                    if let Ok(mut e) = err_sh.error.lock() {
+                        *e = Some(msg);
+                    }
+                    err_sh.lost.store(true, Ordering::Relaxed);
                 }
             },
             None,
         )
-        .map_err(|e| e.to_string())
+        .map_err(|e| describe_err(&e))
 }
 
 /// Output-callback state: reads the tap a little behind the input's write
