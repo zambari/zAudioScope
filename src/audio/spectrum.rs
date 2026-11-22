@@ -139,6 +139,8 @@ impl Fft {
 pub struct Bands {
     n: usize,
     rate: u32,
+    /// Frequency span the bands cover, Hz.
+    edges: (f32, f32),
     /// Per output band: FFT bin range `[lo, hi)`, or a fractional bin to
     /// interpolate at when the band is narrower than one bin.
     bands: Vec<Band>,
@@ -177,13 +179,16 @@ impl Bands {
         Self {
             n,
             rate,
+            edges: (f_lo, f_hi),
             bands,
             tilt,
         }
     }
 
-    pub fn fits(&self, n: usize, rate: u32) -> bool {
-        self.n == n && self.rate == rate
+    /// Whether this layout is still the one for an `n`-point FFT at `rate`
+    /// spanning `edges` Hz.
+    pub fn fits(&self, n: usize, rate: u32, edges: (f32, f32)) -> bool {
+        self.n == n && self.rate == rate && self.edges == edges
     }
 
     /// dB per band (peak within each band) for a spectrum from `Fft::power`.

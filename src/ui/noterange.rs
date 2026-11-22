@@ -5,8 +5,8 @@
 //! The axis is linear in MIDI note number, i.e. logarithmic in frequency
 //! (A4 = 440 Hz). Note `m` is centred at `m`, its column spans `m ± 0.5`.
 //!
-//! [`bar`] draws the control: 20 Hz–2 kHz log labels over a piano-roll
-//! strip, with the selected range lit. Drag an edge to move one end, drag
+//! [`bar`] draws the control: log Hz labels (20 Hz–2 kHz, or up to 12.5 kHz
+//! when `wide`) over a piano-roll strip, with the selected range lit. Drag an edge to move one end, drag
 //! inside to move both, scroll to shift, double-click to reset.
 
 use egui::{Align2, Color32, CursorIcon, FontId, Rect, Sense, Stroke, Ui, pos2, vec2};
@@ -27,26 +27,59 @@ pub struct NoteRange {
     /// Lowest and highest note shown, MIDI, inclusive.
     pub lo: i32,
     pub hi: i32,
+    /// Selectable up to [`Self::HI_WIDE`] (hi-hats, cymbals) rather than
+    /// [`Self::HI`]. Missing in older saved states, so it defaults to off.
+    #[serde(default)]
+    pub wide: bool,
 }
 
 impl Default for NoteRange {
     fn default() -> Self {
-        Self { lo: 24, hi: 59 } // C1 .. B3
+        Self {
+            lo: 24,
+            hi: 59,
+            wide: false,
+        } // C1 .. B3
     }
 }
 
 impl NoteRange {
-    /// Selectable limits: E0 (20.6 Hz) .. B6 (1976 Hz).
-    pub const BOUNDS: Self = Self { lo: 16, hi: 95 };
+    /// Lowest selectable note: E0 (20.6 Hz).
+    pub const LO: i32 = 16;
+    /// Highest selectable note: B6 (1976 Hz).
+    pub const HI: i32 = 95;
+    /// Highest selectable note when `wide`: G9 (12.5 kHz).
+    pub const HI_WIDE: i32 = 127;
     /// At least an octave is shown.
     pub const MIN_KEYS: i32 = 12;
 
+    /// The selectable limits, as a range (its `lo`/`hi`, same `wide`).
+    pub fn bounds(self) -> Self {
+        Self {
+            lo: Self::LO,
+            hi: if self.wide { Self::HI_WIDE } else { Self::HI },
+            wide: self.wide,
+        }
+    }
+
+    /// Highest selectable frequency, Hz, with or without `wide`.
+    pub fn top_hz(wide: bool) -> f32 {
+        Self {
+            wide,
+            ..Self::default()
+        }
+        .bounds()
+        .hz()
+        .1
+    }
+
     pub fn sanitized(self) -> Self {
-        let (b, gap) = (Self::BOUNDS, Self::MIN_KEYS - 1);
+        let (b, gap) = (self.bounds(), Self::MIN_KEYS - 1);
         let hi = self.hi.clamp(b.lo + gap, b.hi);
         Self {
             lo: self.lo.clamp(b.lo, hi - gap),
             hi,
+            wide: self.wide,
         }
     }
 
@@ -80,8 +113,8 @@ impl NoteRange {
     }
 
     /// Where `m` sits across the full selectable span, 0..1.
-    pub fn bounds_pos(m: f32) -> f32 {
-        let (a, b) = Self::BOUNDS.span();
+    pub fn bounds_pos(self, m: f32) -> f32 {
+        let (a, b) = self.bounds().span();
         (m - a) / (b - a)
     }
 }
@@ -141,6 +174,11 @@ pub fn bar(
                     ui.weak("FFT");
                     ui.weak(format!("{} notes", range.count()));
                 });
+                ui.horizontal(|ui| {
+                    ui.add(widgets::flicktoggle(&mut range.wide))
+                        .on_hover_text("Reach up to G9 (12.5 kHz) for hi-hats and cymbals");
+                    ui.weak(format!("to {}", pitch::note_name(range.bounds().hi)));
+                });
             },
         );
         strip(ui, range, marks, outside, glow);
@@ -160,7 +198,7 @@ fn strip(
     let air_w = if outside.is_some() { AIR_W } else { 0.0 };
     let (rect, resp) =
         ui.allocate_exact_size(vec2(ui.available_width(), BAR_H), Sense::click_and_drag());
-    let full = NoteRange::BOUNDS;
+    let full = range.bounds();
     let main = Rect::from_min_max(rect.min, pos2(rect.right() - air_w, rect.bottom()));
     let notes = full.scale(main);
     let label_h = 12.0;
@@ -184,7 +222,11 @@ fn strip(
         }
     };
     if resp.double_clicked() {
-        *range = NoteRange::default();
+        // Reset the selection, keep the reach (`wide`) the user chose.
+        *range = NoteRange {
+            wide: range.wide,
+            ..NoteRange::default()
+        };
         return;
     }
     // The grab held by an ongoing drag, else the one the pointer hovers.
@@ -245,6 +287,7 @@ fn strip(
     *range = NoteRange {
         lo: lo as i32,
         hi: hi as i32,
+        wide: range.wide,
     }
     .sanitized();
 
@@ -397,5 +440,31 @@ fn strip(
             pitch::note_name(m.round() as i32),
             plot::trim(pitch::midi_to_freq(m, A4).round())
         ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wide_extends_the_top_and_sanitizing_respects_it() {
+        let narrow = NoteRange {
+            lo: 60,
+            hi: 120,
+            wide: false,
+        }
+        .sanitized();
+        assert_eq!(narrow.hi, NoteRange::HI);
+        let wide = NoteRange {
+            lo: 60,
+            hi: 120,
+            wide: true,
+        }
+        .sanitized();
+        assert_eq!((wide.lo, wide.hi, wide.wide), (60, 120, true));
+        assert!(NoteRange::top_hz(true) > 12_000.0);
+        // B6 plus the half-note margin the shown span adds (~2.01 kHz).
+        assert!(NoteRange::top_hz(false) < 2_100.0);
     }
 }

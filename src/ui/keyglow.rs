@@ -101,7 +101,10 @@ impl KeyGlow {
     /// set), then advance the fades. Returns true while anything is still
     /// lit (worth a repaint).
     pub fn update(&mut self, midi: &MidiFrame, channel: Option<u8>) -> bool {
-        let Timing { release, heat_tau_s } = self.timing;
+        let Timing {
+            release,
+            heat_tau_s,
+        } = self.timing;
         let release = release.max(0.05);
         for e in midi.events.iter() {
             let [status, note, vel] = e.b;
@@ -112,15 +115,18 @@ impl KeyGlow {
                 (0x90, v) if v > 0 => self.note_on(note, e.t),
                 (0x80, _) | (0x90, _) => self.note_off(note, e.t),
                 // All sound off / all notes off.
-                (0xB0, _) if note == 120 || note == 123 => {
-                    self.keys.iter_mut().for_each(|k| Self::release(k, e.t, release))
-                }
+                (0xB0, _) if note == 120 || note == 123 => self
+                    .keys
+                    .iter_mut()
+                    .for_each(|k| Self::release(k, e.t, release)),
                 _ => {}
             }
         }
         let now = crate::midi::now();
         if midi.dropped {
-            self.keys.iter_mut().for_each(|k| Self::release(k, now, release));
+            self.keys
+                .iter_mut()
+                .for_each(|k| Self::release(k, now, release));
         }
         // Cap the step so a stalled frame doesn't jump.
         let dt = self

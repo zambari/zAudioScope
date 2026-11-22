@@ -89,7 +89,13 @@ impl Spot {
 impl Layout {
     /// Position of pitch class `pc` around the dial, 0..12 steps from north.
     pub fn step(&self, pc: i32) -> i32 {
-        let order = |pc: i32| if self.fifths { (pc * 7).rem_euclid(12) } else { pc.rem_euclid(12) };
+        let order = |pc: i32| {
+            if self.fifths {
+                (pc * 7).rem_euclid(12)
+            } else {
+                pc.rem_euclid(12)
+            }
+        };
         (order(pc) - order(self.offset)).rem_euclid(12)
     }
 
@@ -230,7 +236,10 @@ mod tests {
     #[test]
     fn fractional_keys_are_continuous() {
         for radial in [Radial::Single, Radial::Spiral] {
-            let l = Layout { radial, ..Default::default() };
+            let l = Layout {
+                radial,
+                ..Default::default()
+            };
             for k in l.lo..l.hi {
                 let (a, b) = (l.place_f(k as f32 + 0.4999), l.place_f(k as f32 + 0.5001));
                 let da = (a.angle - b.angle).rem_euclid(TAU);

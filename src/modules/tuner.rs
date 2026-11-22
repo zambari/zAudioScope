@@ -16,9 +16,9 @@ use super::note_input::{NoteInput, Want, ease, note_db};
 use super::perf::Costs;
 use super::{Module, Shared};
 use crate::pitch::{self, Method};
+use crate::ui::icons::{self, Dir};
 use crate::ui::noterange::NoteRange;
 use crate::ui::plot::{self, Lanes, NOTE_LANE};
-use crate::ui::icons::{self, Dir};
 use crate::ui::theme;
 use crate::ui::widgets::{self, Foldout};
 
@@ -315,7 +315,7 @@ impl Module for Tuner {
             ui.add(egui::Slider::new(&mut p.gate_db, -140.0..=-20.0).suffix(" dB").text("silence gate"))
                 .on_hover_text("Below this input level NSDF is skipped");
         });
-        let NoteRange { lo, hi } = shared.range.get();
+        let NoteRange { lo, hi, .. } = shared.range.get();
         let count = (lo..=hi).filter(|&m| self.is_enabled(m)).count();
         let summary = if count == 0 {
             "any semitone".to_owned()

@@ -88,10 +88,7 @@ pub fn devices() -> Vec<DeviceInfo> {
     let mut found: Vec<(GUID, String)> = Vec::new();
     // Ignore enumeration failures: the list is just empty.
     let _ = unsafe {
-        DirectSoundCaptureEnumerateW(
-            Some(enum_cb),
-            Some(&mut found as *mut _ as *const c_void),
-        )
+        DirectSoundCaptureEnumerateW(Some(enum_cb), Some(&mut found as *mut _ as *const c_void))
     };
     let list: Vec<DeviceInfo> = found
         .into_iter()
@@ -101,7 +98,10 @@ pub fn devices() -> Vec<DeviceInfo> {
         })
         .collect();
     if let Ok(mut names) = NAMES.lock() {
-        *names = list.iter().map(|d| (d.id.clone(), d.name.clone())).collect();
+        *names = list
+            .iter()
+            .map(|d| (d.id.clone(), d.name.clone()))
+            .collect();
     }
     list
 }
@@ -167,9 +167,13 @@ pub fn open(id: &str, wanted: Option<u32>) -> Result<Opened, String> {
         .filter(|f| wanted.is_none_or(|r| r == f.rate));
     let rates = wanted.into_iter().chain(FALLBACK_RATES);
     let probe = rates.flat_map(|rate| {
-        (1..=MAX_CHANNELS)
-            .rev()
-            .flat_map(move |channels| KINDS.map(|kind| Format { rate, channels, kind }))
+        (1..=MAX_CHANNELS).rev().flat_map(move |channels| {
+            KINDS.map(|kind| Format {
+                rate,
+                channels,
+                kind,
+            })
+        })
     });
     for format in last.into_iter().chain(probe) {
         if let Some(buffer) = make_buffer(&cap, format) {
@@ -265,7 +269,13 @@ pub fn start(
             let com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
             let mut on_block = on_block;
             let run = catch_unwind(AssertUnwindSafe(|| {
-                reader(owned.into_inner(), &flag, &mut on_block, &on_xrun, &*thread_err)
+                reader(
+                    owned.into_inner(),
+                    &flag,
+                    &mut on_block,
+                    &on_xrun,
+                    &*thread_err,
+                )
             }));
             if run.is_err() {
                 thread_err("DirectSound capture thread panicked".into());
@@ -389,14 +399,26 @@ unsafe fn read(
     }
     out.clear();
     unsafe {
-        push_samples(std::slice::from_raw_parts(p1 as *const u8, n1 as usize), kind, out);
+        push_samples(
+            std::slice::from_raw_parts(p1 as *const u8, n1 as usize),
+            kind,
+            out,
+        );
         if n2 > 0 {
-            push_samples(std::slice::from_raw_parts(p2 as *const u8, n2 as usize), kind, out);
+            push_samples(
+                std::slice::from_raw_parts(p2 as *const u8, n2 as usize),
+                kind,
+                out,
+            );
         }
         buffer.Unlock(
             p1,
             n1,
-            if n2 > 0 { Some(p2 as *const c_void) } else { None },
+            if n2 > 0 {
+                Some(p2 as *const c_void)
+            } else {
+                None
+            },
             n2,
         )?;
     }

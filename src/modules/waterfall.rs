@@ -234,6 +234,6 @@ impl Waterfall {
         .draw(&painter, rect, plot::fmt_secs);
 
         self.p
-            .speed_handle(ui, rect, "waterfall_speed", &mut self.link);
+            .fall_handle(ui, rect, "waterfall_fall", &mut self.link);
     }
 }

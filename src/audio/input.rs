@@ -548,7 +548,9 @@ impl Input {
         }
         let limit = match self.callback_frames() {
             0 => FIRST_CALLBACK_WAIT,
-            f => MIN_STALL.max(Duration::from_secs_f32(10.0 * f as f32 / self.rate.max(1) as f32)),
+            f => MIN_STALL.max(Duration::from_secs_f32(
+                10.0 * f as f32 / self.rate.max(1) as f32,
+            )),
         };
         now.duration_since(self.last_progress) > limit
     }
@@ -782,7 +784,9 @@ impl Input {
         self.opened_id = device.id().ok().map(|id| id.to_string());
         self.device_name = device_name(&device, "input");
 
-        let default = device.default_input_config().map_err(|e| describe_err(&e))?;
+        let default = device
+            .default_input_config()
+            .map_err(|e| describe_err(&e))?;
         let ranges: Vec<_> = device
             .supported_input_configs()
             .map(|r| r.collect())

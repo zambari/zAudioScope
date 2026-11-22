@@ -279,11 +279,7 @@ impl Scope {
                 .iter()
                 .fold((f32::MAX, f32::MIN), |(mn, mx), &s| (mn.min(s), mx.max(s)));
             let x = rect.left() + c as f32 + 0.5;
-            painter.vline(
-                x,
-                fold.y(rect, mx)..=fold.y(rect, mn),
-                stroke,
-            );
+            painter.vline(x, fold.y(rect, mx)..=fold.y(rect, mn), stroke);
         }
     }
 }

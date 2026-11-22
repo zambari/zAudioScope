@@ -100,7 +100,10 @@ impl Params {
     /// The layout drawn on: one octave always goes round a single circle.
     fn geometry(&self, l: &Layout) -> Layout {
         match self.wrap {
-            Wrap::Octave => Layout { radial: Radial::Single, ..*l },
+            Wrap::Octave => Layout {
+                radial: Radial::Single,
+                ..*l
+            },
             Wrap::Octaves => *l,
         }
     }
@@ -117,9 +120,17 @@ struct Pass {
 fn passes(p: &Params, l: &Layout) -> Vec<Pass> {
     let lo = l.lo as f32;
     match (p.wrap, l.radial) {
-        (Wrap::Octave, _) => vec![Pass { from: lo, to: lo + 12.0, radius: Some(1.0) }],
+        (Wrap::Octave, _) => vec![Pass {
+            from: lo,
+            to: lo + 12.0,
+            radius: Some(1.0),
+        }],
         (Wrap::Octaves, Radial::Spiral) => {
-            vec![Pass { from: lo - 0.5, to: l.hi as f32 + 0.5, radius: None }]
+            vec![Pass {
+                from: lo - 0.5,
+                to: l.hi as f32 + 0.5,
+                radius: None,
+            }]
         }
         // Whole turns, seam at north, each on its octave's ring.
         (Wrap::Octaves, _) => {
@@ -177,7 +188,13 @@ impl RadialSpectrum {
         }
         let n = p.size;
         self.need = (n + 8) * factor as usize;
-        let key = Key { n, rate: rate / factor, m0, count, steps };
+        let key = Key {
+            n,
+            rate: rate / factor,
+            m0,
+            count,
+            steps,
+        };
         let fresh = self.bands.as_ref().is_none_or(|(k, _)| *k != key);
         if fresh {
             let h = 0.5 / steps as f32;
@@ -186,7 +203,10 @@ impl RadialSpectrum {
                 pitch::midi_to_freq(m0 + (count as f32 - 0.5) / steps as f32, A4),
             );
             self.bands = Some((key, Bands::new(n, key.rate, count, span)));
-            self.info = (key.rate as f32 / n as f32, n as f32 / key.rate as f32 * 1000.0);
+            self.info = (
+                key.rate as f32 / n as f32,
+                n as f32 / key.rate as f32 * 1000.0,
+            );
             self.target = vec![FLOOR_DB; count];
             self.shown = self.target.clone();
         }

@@ -10,7 +10,7 @@ use super::spectrum_rows::{self, BANDS, Key, Params, Rows, heat};
 use super::{Module, Shared};
 use crate::ui::dynamic_range;
 use crate::ui::noterange::NoteRange;
-use crate::ui::plot::{self, Link, Scale};
+use crate::ui::plot::{self, Edge, Link, Scale};
 use crate::ui::theme;
 use crate::ui::widgets::RangeSlider;
 
@@ -69,7 +69,7 @@ impl Default for Impulse {
             window_ms: DEFAULT_WINDOW_MS,
             density: 48,
             depth: 1.0,
-            range_hz: (40.0, NoteRange::BOUNDS.hz().1),
+            range_hz: (40.0, NoteRange::top_hz(false)),
             rotation: DEFAULT_ROTATION,
             zoom: DEFAULT_ZOOM,
             fade_curve: 0.5,
@@ -150,7 +150,7 @@ impl Module for Impulse {
             && lo.is_finite()
             && hi.is_finite()
         {
-            let hi = hi.clamp(41.0, NoteRange::BOUNDS.hz().1);
+            let hi = hi.clamp(41.0, NoteRange::top_hz(true));
             self.range_hz = (lo.clamp(40.0, hi - 1.0), hi);
         }
     }
@@ -208,7 +208,7 @@ impl Module for Impulse {
             RangeSlider::new(
                 &mut self.range_hz.0,
                 &mut self.range_hz.1,
-                40.0..=NoteRange::BOUNDS.hz().1,
+                40.0..=NoteRange::top_hz(true),
             )
             .min_gap(1.0)
             .decimals(0)
@@ -313,7 +313,7 @@ impl Module for Impulse {
         };
         let plane_w = (2.0 * scale).max(1.0);
 
-        let bounds = NoteRange::BOUNDS.hz();
+        let bounds = shared.range.get().bounds().hz();
         let band_pos = |hz: f32| (hz / bounds.0).ln() / (bounds.1 / bounds.0).ln();
         let (u0, u1) = (band_pos(self.range_hz.0), band_pos(self.range_hz.1));
         // Only include band centres inside our range (and never below 40 Hz).
@@ -520,12 +520,16 @@ impl Module for Impulse {
         spectrum_rows::time_handle(
             ui,
             rect,
-            "impulse_speed",
+            spectrum_rows::TimeHandle {
+                id: "impulse_speed",
+                edge: Edge::Right,
+                guide: true,
+                range: WINDOW_MS,
+                reset: DEFAULT_WINDOW_MS,
+                fmt: &fmt,
+            },
             &mut self.link,
             &mut self.window_ms,
-            WINDOW_MS,
-            DEFAULT_WINDOW_MS,
-            &fmt,
         );
     }
 }

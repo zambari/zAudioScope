@@ -225,44 +225,60 @@ impl Params {
         ui.checkbox(&mut self.follow_gate, "only gated window");
     }
 
-    /// Speed handle on the right edge (up is faster), tied to its slider.
+    /// Fall-time handle on the left edge (up is shorter), tied to its slider
+    /// without a horizontal guide: it has no level on the graph to point at.
     /// Call [`Link::tick`] earlier in the frame.
-    pub fn speed_handle(&mut self, ui: &mut Ui, rect: Rect, id: &str, link: &mut Link<Key>) {
+    pub fn fall_handle(&mut self, ui: &mut Ui, rect: Rect, id: &str, link: &mut Link<Key>) {
         let rows = self.rows as f32;
         let fmt = |ms: f32| {
             format!(
-                "{} ms/row · {}",
-                plot::trim(ms),
-                plot::fmt_secs(rows * ms / 1000.0)
+                "fall {} · {} ms/row",
+                plot::fmt_secs(rows * ms / 1000.0),
+                plot::trim(ms)
             )
         };
-        time_handle(ui, rect, id, link, &mut self.row_ms, ROW_MS, 15.0, &fmt);
+        time_handle(
+            ui,
+            rect,
+            TimeHandle {
+                id,
+                edge: Edge::Left,
+                guide: false,
+                range: ROW_MS,
+                reset: 15.0,
+                fmt: &fmt,
+            },
+            link,
+            &mut self.row_ms,
+        );
     }
 }
 
-/// Log-scaled time handle on the right edge (up is shorter), linked to the
-/// [`Key::Speed`] slider. Call [`Link::tick`] earlier in the frame.
-#[allow(clippy::too_many_arguments)]
-pub fn time_handle(
-    ui: &mut Ui,
-    rect: Rect,
-    id: &str,
-    link: &mut Link<Key>,
-    value: &mut f32,
-    range: (f32, f32),
-    reset: f32,
-    fmt: &dyn Fn(f32) -> String,
-) {
-    let scale = Scale::log(range, (rect.top() + 6.0, rect.bottom() - 6.0));
-    let r = EdgeHandle::new(id, Edge::Right, scale, value)
-        .reset(reset)
+/// Settings of a log-scaled [`time_handle`] on one graph edge.
+pub struct TimeHandle<'a> {
+    pub id: &'a str,
+    pub edge: Edge,
+    /// Draw a horizontal line to the linked slider's value while it is shown.
+    pub guide: bool,
+    /// Value range; the top of the edge is the lower end (up is shorter).
+    pub range: (f32, f32),
+    pub reset: f32,
+    pub fmt: &'a dyn Fn(f32) -> String,
+}
+
+/// Log-scaled time handle on a graph edge, linked to the [`Key::Speed`]
+/// slider. Call [`Link::tick`] earlier in the frame.
+pub fn time_handle(ui: &mut Ui, rect: Rect, h: TimeHandle, link: &mut Link<Key>, value: &mut f32) {
+    let scale = Scale::log(h.range, (rect.top() + 6.0, rect.bottom() - 6.0));
+    let r = EdgeHandle::new(h.id, h.edge, scale, value)
+        .reset(h.reset)
         .guide(false)
-        .label(fmt)
+        .label(h.fmt)
         .show(ui, rect);
     if r.hovered() || r.dragged() {
         link.touch(Key::Speed);
     }
-    if link.shown() == Some(Key::Speed) {
+    if h.guide && link.shown() == Some(Key::Speed) {
         link.point_y(ui, rect, scale.px(*value));
     }
 }
@@ -282,7 +298,7 @@ pub fn heat(t: f32) -> Color32 {
 /// the shared note range's selection.
 pub fn visible_bands(range: NoteRange) -> ((usize, usize), (f32, f32)) {
     let (a, b) = range.span();
-    let (u0, u1) = (NoteRange::bounds_pos(a), NoteRange::bounds_pos(b));
+    let (u0, u1) = (range.bounds_pos(a), range.bounds_pos(b));
     let lo = (u0 * BANDS as f32).floor().max(0.0) as usize;
     let hi = ((u1 * BANDS as f32).ceil() as usize).min(BANDS);
     ((lo, hi), (u0, u1))
@@ -312,8 +328,13 @@ impl Rows {
         let mut out = Added::default();
         let n = 1usize << p.fft_pow;
         let f = &shared.frame;
-        if self.bands.as_ref().is_none_or(|b| !b.fits(n, f.rate)) {
-            self.bands = Some(Bands::new(n, f.rate, BANDS, NoteRange::BOUNDS.hz()));
+        let edges = shared.range.get().bounds().hz();
+        if self
+            .bands
+            .as_ref()
+            .is_none_or(|b| !b.fits(n, f.rate, edges))
+        {
+            self.bands = Some(Bands::new(n, f.rate, BANDS, edges));
             self.history.clear();
             out.cleared = true;
         }

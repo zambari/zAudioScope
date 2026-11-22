@@ -14,9 +14,9 @@ use egui::{Align2, Color32, FontId, Mesh, Rect, Sense, Shape, Stroke, Ui, pos2, 
 
 use super::{Module, Shared};
 use crate::pitch;
+use crate::ui::icons::{self, Dir};
 use crate::ui::noterange::{NoteRange, is_black};
 use crate::ui::notestyle::{NoteStyle, OVERTONES};
-use crate::ui::icons::{self, Dir};
 use crate::ui::theme;
 
 /// Notes kept in the ring.
@@ -328,6 +328,7 @@ impl Module for MidiMonitor {
                         NoteRange {
                             lo: a - pad,
                             hi: b + pad,
+                            ..shared.range.get()
                         }
                         .sanitized(),
                     );
@@ -486,7 +487,13 @@ impl MidiMonitor {
                 small.clone(),
                 theme::ACCENT_BRIGHT,
             );
-            icons::triangle(&p, pos2(plot.left() + 7.0, text.center().y), Dir::Left, 3.5, theme::ACCENT_BRIGHT);
+            icons::triangle(
+                &p,
+                pos2(plot.left() + 7.0, text.center().y),
+                Dir::Left,
+                3.5,
+                theme::ACCENT_BRIGHT,
+            );
         }
         if full && above > 0 {
             let text = p.text(
@@ -496,7 +503,13 @@ impl MidiMonitor {
                 small,
                 theme::ACCENT_BRIGHT,
             );
-            icons::triangle(&p, pos2(plot.right() - 7.0, text.center().y), Dir::Right, 3.5, theme::ACCENT_BRIGHT);
+            icons::triangle(
+                &p,
+                pos2(plot.right() - 7.0, text.center().y),
+                Dir::Right,
+                3.5,
+                theme::ACCENT_BRIGHT,
+            );
         }
 
         // Held notes light up their key along the bottom.

@@ -210,7 +210,12 @@ pub fn module_header(
         }
         let text_color = ui.style().interact(&response).text_color();
         let clipped = ui.painter().with_clip_rect(label.intersect(ui.clip_rect()));
-        super::icons::disclosure(&clipped, label.left_center() + vec2(8.0, 0.0), *open, text_color);
+        super::icons::disclosure(
+            &clipped,
+            label.left_center() + vec2(8.0, 0.0),
+            *open,
+            text_color,
+        );
         let text_rect = clipped.text(
             label.left_center() + vec2(16.0, 0.0),
             Align2::LEFT_CENTER,
@@ -363,7 +368,12 @@ impl<S: AsIdSalt> Foldout<S> {
                         .gamma_multiply(0.5),
                 );
             }
-            super::icons::disclosure(painter, rect.left_center() + vec2(6.0, 0.0), open, v.text_color());
+            super::icons::disclosure(
+                painter,
+                rect.left_center() + vec2(6.0, 0.0),
+                open,
+                v.text_color(),
+            );
             painter.text(
                 rect.left_center() + vec2(16.0, 0.0),
                 Align2::LEFT_CENTER,
@@ -403,7 +413,13 @@ impl<S: AsIdSalt> Foldout<S> {
 /// `sel[key]` holds each one (keys past `sel`'s end are skipped). `octave`
 /// labels the row and puts the octave in the hover names; keys failing
 /// `active` are greyed out.
-pub fn note_row(ui: &mut Ui, base: i32, octave: Option<i32>, sel: &mut [bool], active: impl Fn(i32) -> bool) {
+pub fn note_row(
+    ui: &mut Ui,
+    base: i32,
+    octave: Option<i32>,
+    sel: &mut [bool],
+    active: impl Fn(i32) -> bool,
+) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing = vec2(1.0, 1.0);
         if let Some(oct) = octave {
@@ -414,11 +430,17 @@ pub fn note_row(ui: &mut Ui, base: i32, octave: Option<i32>, sel: &mut [bool], a
         }
         for n in 0..12 {
             let m = base + n;
-            let Some(on) = sel.get_mut(m as usize) else { continue };
+            let Some(on) = sel.get_mut(m as usize) else {
+                continue;
+            };
             let name = crate::pitch::NOTE_NAMES[n as usize];
             let b = egui::Button::selectable(*on, egui::RichText::new(name).size(9.0))
                 .min_size(vec2(17.0, 15.0));
-            let hover = if octave.is_some() { crate::pitch::note_name(m) } else { name.to_owned() };
+            let hover = if octave.is_some() {
+                crate::pitch::note_name(m)
+            } else {
+                name.to_owned()
+            };
             if ui.add_enabled(active(m), b).on_hover_text(hover).clicked() {
                 *on = !*on;
             }

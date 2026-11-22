@@ -22,8 +22,8 @@
 
 pub mod impulse;
 pub mod midi;
-mod note_input;
 pub mod note_clock;
+mod note_input;
 pub mod note_spectrum;
 mod perf;
 mod radial_spectrum;

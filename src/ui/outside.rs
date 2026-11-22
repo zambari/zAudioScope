@@ -181,7 +181,7 @@ impl Outside {
         fft: usize,
         reused: bool,
     ) {
-        let first = ((NoteRange::BOUNDS.span().0 + 0.5) * BPS).round() as i32;
+        let first = ((range.bounds().span().0 + 0.5) * BPS).round() as i32;
         let last = ((pitch::freq_to_midi(rate as f32 / 2.0, A4) + 0.5) * BPS).floor() as i32;
         let count = (last - first).max(0) as usize;
         let fresh = self.rate != rate || self.db.len() != count;
@@ -215,7 +215,7 @@ impl Outside {
             |m: f32| (((m + 0.5) * BPS).round() as i32 - first).clamp(0, count as i32) as usize;
         let (b0, b1) = (idx(s0), idx(s1));
         self.lo
-            .update(&readings[..b0], (NoteRange::BOUNDS.span().0, s0), fresh);
+            .update(&readings[..b0], (range.bounds().span().0, s0), fresh);
         self.hi.update(&readings[b1..], (s1, nyq_m), fresh);
     }
 
@@ -242,11 +242,11 @@ impl Outside {
     }
 
     /// Draw the spectrum over the keys. `keys` is the full
-    /// [`NoteRange::BOUNDS`] span; `keys.right() .. right` is the "air" from
+    /// [`NoteRange::bounds`] span; `keys.right() .. right` is the "air" from
     /// the bar top to Nyquist. Gray, brighter towards the peaks; inside the
     /// selection only a faint trace. Nothing moves with the selection.
     pub fn paint(&self, p: &Painter, keys: Rect, right: f32, range: NoteRange) {
-        let full = NoteRange::BOUNDS.span();
+        let full = range.bounds().span();
         let air = Rect::from_x_y_ranges(keys.right() + 2.0..=right, keys.y_range());
         p.rect_filled(air, 0.0, Color32::from_gray(14));
         self.paint_span(p, keys, full, range.span());

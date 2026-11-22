@@ -176,7 +176,11 @@ impl Monitor {
             *e = None;
         }
         let target = self.device_id.clone();
-        let result = if on { self.open(target.as_deref()) } else { Ok(()) };
+        let result = if on {
+            self.open(target.as_deref())
+        } else {
+            Ok(())
+        };
         self.open_error = result.err();
         // A chosen device that is missing now is retried; the default never
         // is, since by the time one appears it may be the speakers.

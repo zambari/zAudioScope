@@ -624,9 +624,12 @@ impl Workspace {
                 .max_rect(area.with_max_y(area.top() + HEADER).shrink2(vec2(4.0, 1.0)))
                 .layout(Layout::right_to_left(Align::Center)),
         );
-        widgets::popup_button(&mut header, "Layers", "Layer visibility and opacity", |ui| {
-            self.mixer(ui, slots)
-        });
+        widgets::popup_button(
+            &mut header,
+            "Layers",
+            "Layer visibility and opacity",
+            |ui| self.mixer(ui, slots),
+        );
     }
 
     /// One row per layer, topmost first: on/off and opacity. Own-pane

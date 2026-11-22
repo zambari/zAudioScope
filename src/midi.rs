@@ -273,9 +273,9 @@ impl MidiHub {
                 pick
             });
         if let Some(name) = self.port.as_ref().filter(|_| missing) {
-            combo
-                .response
-                .on_hover_text(format!("{name} is unplugged; it reopens when it comes back"));
+            combo.response.on_hover_text(format!(
+                "{name} is unplugged; it reopens when it comes back"
+            ));
         }
         if let Some(pick) = combo.inner.flatten() {
             self.select(pick);
