@@ -1,4 +1,4 @@
-//! Short-time spectra for the waterfall: a small radix-2 FFT, a Hann window,
+//! Short-time spectra for the spectrogram and waterfall: a small radix-2 FFT, a Hann window,
 //! and log-spaced display bands (the shared note axis is log frequency).
 
 use std::f32::consts::TAU;

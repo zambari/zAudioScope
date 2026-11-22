@@ -1,5 +1,5 @@
 //! The shared note / frequency range: one span of notes that every
-//! frequency-axis analyser (tuner, waterfall, MIDI roll) uses for its x
+//! frequency-axis analyser (tuner, spectrogram, waterfall, MIDI roll) uses for its x
 //! axis, so a given pitch sits at the same x in all of them.
 //!
 //! The axis is linear in MIDI note number, i.e. logarithmic in frequency

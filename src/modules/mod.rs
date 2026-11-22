@@ -19,6 +19,8 @@
 
 pub mod midi;
 pub mod scope;
+pub mod spectrogram;
+mod spectrum_rows;
 pub mod tuner;
 pub mod waterfall;
 
@@ -205,6 +207,7 @@ pub fn all() -> Vec<Slot> {
     vec![
         slot(Box::new(scope::Scope::default())),
         slot(Box::new(tuner::Tuner::default())),
+        slot(Box::new(spectrogram::Spectrogram::default())),
         slot(Box::new(waterfall::Waterfall::default())),
         slot(Box::new(midi::MidiMonitor::default())),
     ]

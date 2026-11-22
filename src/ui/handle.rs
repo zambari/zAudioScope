@@ -1,6 +1,6 @@
 //! Edge handles: a small reddish triangle glued to one side of a graph that
 //! drags a value along that side (the scope's threshold on its left edge,
-//! the waterfall's frequency zoom along its bottom...). The tip touches the
+//! the scope's gate window along its bottom...). The tip touches the
 //! edge at the value. With the pointer elsewhere it shrinks to a dot;
 //! hovering that side of the graph brings it back, with its label.
 //!
