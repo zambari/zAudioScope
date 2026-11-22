@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{noterange, plot, theme, widgets};
 use super::outside as noterange_outside;
-use crate::modules::{Shared, Slot};
+use crate::modules::{Shared, Slot, tuner};
 
 const DIVIDER: f32 = 8.0;
 const HEADER: f32 = 22.0;
@@ -74,6 +74,11 @@ pub struct Workspace {
     /// Live spectrum outside the note range, drawn into the range bar.
     #[serde(skip)]
     outside: noterange_outside::Outside,
+    /// MIDI note glow on the range bar keys.
+    #[serde(skip)]
+    glow: super::keyglow::KeyGlow,
+    /// Live spectrum (and its FFTs) in the note range bar.
+    range_fft: bool,
 }
 
 impl Default for Workspace {
@@ -87,6 +92,8 @@ impl Default for Workspace {
             touched: None,
             reveal: None,
             outside: Default::default(),
+            glow: Default::default(),
+            range_fft: true,
         }
     }
 }
@@ -97,7 +104,7 @@ impl Workspace {
         ui.allocate_rect(full, Sense::hover());
         let area = Rect::from_min_max(
             full.min,
-            pos2(full.right(), (full.bottom() - 44.0).max(full.top())),
+            pos2(full.right(), (full.bottom() - 8.0 - noterange::BAR_H).max(full.top())),
         );
         let max_width = (area.width() - 240.0 - DIVIDER).max(0.0);
         let min_width = INSPECTOR_MIN.min(max_width);
@@ -300,29 +307,45 @@ impl Workspace {
         let mut range_ui = child(ui, "note_range", range_rect);
         let mut range = shared.range.get();
         let readout_width = self.inspector_width + DIVIDER - range_ui.spacing().item_spacing.x;
-        // Out-of-range spectrum: a fine decimated FFT for the low end, plus
-        // the largest FFT an analyser already ran (else our own) above it.
-        let rate = shared.frame.rate;
+        if self.range_fft {
+            // Out-of-range spectrum: a fine decimated FFT for the low end, plus
+            // the largest FFT an analyser already ran (else our own) above it.
+            let rate = shared.frame.rate;
+            let start = profiler.start();
+            let (n, coarse, reused) = shared.any_spectrum(noterange_outside::COARSE_FFT);
+            profiler.record("Range", if reused { "coarse FFT shared" } else { "coarse FFT own" }, start);
+            let start = profiler.start();
+            let (d, fn_) = (noterange_outside::FINE_DECIMATE, noterange_outside::FINE_FFT);
+            let fine = shared.decimated_spectrum(d, fn_);
+            profiler.record("Range", "fine FFT /16", start);
+            let start = profiler.start();
+            let fine_rate = rate as f32 / d as f32;
+            self.outside.update(
+                &noterange_outside::Source::new(&fine, fine_rate, fn_, fine_rate * noterange_outside::FINE_TOP),
+                &noterange_outside::Source::new(&coarse, rate as f32, n, rate as f32 / 2.0),
+                rate,
+                range,
+                n,
+                reused,
+            );
+            profiler.record("Range", "side stats", start);
+        }
         let start = profiler.start();
-        let (n, coarse, reused) = shared.any_spectrum(noterange_outside::COARSE_FFT);
-        profiler.record("Range", if reused { "coarse FFT shared" } else { "coarse FFT own" }, start);
-        let start = profiler.start();
-        let (d, fn_) = (noterange_outside::FINE_DECIMATE, noterange_outside::FINE_FFT);
-        let fine = shared.decimated_spectrum(d, fn_);
-        profiler.record("Range", "fine FFT /16", start);
-        let start = profiler.start();
-        let fine_rate = rate as f32 / d as f32;
-        self.outside.update(
-            &noterange_outside::Source::new(&fine, fine_rate, fn_, fine_rate * noterange_outside::FINE_TOP),
-            &noterange_outside::Source::new(&coarse, rate as f32, n, rate as f32 / 2.0),
-            rate,
-            range,
-            n,
-            reused,
-        );
-        profiler.record("Range", "side stats", start);
-        let start = profiler.start();
-        if noterange::bar(&mut range_ui, &mut range, marks, readout_width, Some(&self.outside)) {
+        // Live pitch markers only where a pitch source is the point of the page.
+        let marks = if matches!(current, Tab::Stack | Tab::Solo(tuner::TITLE)) { marks } else { &[] };
+        let outside = self.range_fft.then_some(&self.outside);
+        if self.glow.update(&shared.midi) {
+            ui.ctx().request_repaint();
+        }
+        if noterange::bar(
+            &mut range_ui,
+            &mut range,
+            &mut self.range_fft,
+            marks,
+            readout_width,
+            outside,
+            &self.glow,
+        ) {
             shared.range.set(range);
         }
         profiler.record("Range", "bar draw", start);

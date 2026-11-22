@@ -28,6 +28,26 @@ pub fn lerp(a: Color32, b: Color32, u: f32) -> Color32 {
     Color32::from_rgb(c(a.r(), b.r()), c(a.g(), b.g()), c(a.b(), b.b()))
 }
 
+/// Rotate `c`'s hue by `turns` of the colour wheel, then fade it towards
+/// `bg` by `fade` per channel: channels weak in the rotated colour's hue
+/// fade faster (by `tint`, 0 = plain `lerp`), so fading leans into the hue.
+pub fn hue_fade(bg: Color32, c: Color32, turns: f32, fade: f32, tint: f32) -> Color32 {
+    let c = if turns == 0.0 {
+        c
+    } else {
+        let mut h = egui::ecolor::Hsva::from(c);
+        h.h = (h.h + turns).rem_euclid(1.0);
+        Color32::from(h)
+    };
+    let fade = fade.clamp(0.0, 1.0);
+    let peak = c.r().max(c.g()).max(c.b()).max(1) as f32;
+    let ch = |x: u8, y: u8| {
+        let u = fade.powf(1.0 + tint * (1.0 - y as f32 / peak));
+        (x as f32 + (y as f32 - x as f32) * u) as u8
+    };
+    Color32::from_rgb(ch(bg.r(), c.r()), ch(bg.g(), c.g()), ch(bg.b(), c.b()))
+}
+
 /// Orange bar along the left edge of the selected module, both its
 /// inspector foldout and its display panel.
 pub fn selected_edge(painter: &egui::Painter, x: f32, y: egui::Rangef) {

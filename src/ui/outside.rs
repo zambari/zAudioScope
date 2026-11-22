@@ -1,6 +1,6 @@
-//! What the shared note range leaves out: the spectrum below the selection
-//! (down to the bar's lowest note) and above it (up to Nyquist), drawn into
-//! the dimmed parts of the range bar (see [`super::noterange::bar`]).
+//! The live spectrum along the shared note range, from the bar's lowest note
+//! up to Nyquist, drawn over the range bar's keys (see
+//! [`super::noterange::bar`]), plus stats for what the selection leaves out.
 //!
 //! Bands sit on a fixed quarter-tone grid in absolute pitch, so moving the
 //! selection only changes which bands count as "outside", never where they
@@ -9,7 +9,7 @@
 //! FFT an analyser already ran this frame (`Shared::any_spectrum`) or one of
 //! our own.
 
-use egui::{Align2, Color32, FontId, Painter, Rect, Stroke, pos2};
+use egui::{Color32, Painter, Rect, pos2};
 
 use super::noterange::{A4, NoteRange};
 use super::plot::{self, Scale};
@@ -26,7 +26,7 @@ pub const FINE_FFT: usize = 4096;
 pub const COARSE_FFT: usize = 4096;
 /// The decimator is gentle; trust the fine source only this far up its band.
 pub const FINE_TOP: f32 = 0.35;
-/// Width of the always-visible "air" zone (bar top .. Nyquist), px.
+/// Width of the "air" zone (bar top .. Nyquist) right of the keys, px.
 pub const AIR_W: f32 = 56.0;
 /// Per-frame smoothing of bands and stats (1 = none).
 const SMOOTH: f32 = 0.25;
@@ -35,6 +35,10 @@ const SMOOTH: f32 = 0.25;
 const HANN_SUM: f32 = 1.5;
 /// Band dB mapped to the strip's height.
 const DB_SPAN: (f32, f32) = (-84.0, -6.0);
+/// Extra high-frequency emphasis for drawing only (on top of the shared
+/// tilt), pivoting at `EMPHASIS_PIVOT` Hz, so the sparse top stays visible.
+const EMPHASIS_DB_PER_OCT: f32 = 3.0;
+const EMPHASIS_PIVOT: f32 = 200.0;
 
 /// One power spectrum and how to read it.
 pub struct Source<'a> {
@@ -200,74 +204,58 @@ impl Outside {
         )
     }
 
-    /// Draw into the dimmed key areas. `keys` is the piano strip (the full
-    /// [`NoteRange::BOUNDS`] span), `sel` the selection's x span, `air` the
-    /// zone right of the keys for bar top .. Nyquist. Everything lines up
-    /// with the keys; nothing moves when the selection does.
-    pub fn paint(&self, p: &Painter, keys: Rect, sel: (f32, f32), air: Rect, range: NoteRange) {
+    /// Draw the spectrum over the keys. `keys` is the full
+    /// [`NoteRange::BOUNDS`] span; `keys.right() .. right` is the "air" from
+    /// the bar top to Nyquist. Gray, brighter towards the peaks; inside the
+    /// selection only a faint trace. Nothing moves with the selection.
+    pub fn paint(&self, p: &Painter, keys: Rect, right: f32, range: NoteRange) {
         let full = NoteRange::BOUNDS.span();
-        let (s0, s1) = range.span();
-        let y = keys.y_range();
-        self.paint_span(p, Rect::from_x_y_ranges(keys.left()..=sel.0, y), (full.0, s0), &self.lo, false);
-        self.paint_span(p, Rect::from_x_y_ranges(sel.1..=keys.right(), y), (s1, full.1), &self.hi, true);
-        self.paint_span(p, air, (full.1, self.hi.midi.1), &self.hi, false);
-        let meter = |x: f32, s: &Side| {
-            let m = Scale::linear((DB_SPAN.0, 0.0), (keys.bottom(), keys.top()));
-            let top = m.px(s.level_db).clamp(keys.top(), keys.bottom());
-            p.rect_filled(Rect::from_min_max(pos2(x, top), pos2(x + 3.0, keys.bottom())), 0.0, s.tone());
-        };
-        meter(keys.left(), &self.lo);
-        meter(air.right() - 3.0, &self.hi);
+        let air = Rect::from_x_y_ranges(keys.right() + 2.0..=right, keys.y_range());
+        p.rect_filled(air, 0.0, Color32::from_gray(14));
+        self.paint_span(p, keys, full, range.span());
+        self.paint_span(p, air, (full.1, self.hi.midi.1), range.span());
     }
 
-    /// Bands of `side` within MIDI `span`, across `rect` (linear in MIDI).
-    fn paint_span(&self, p: &Painter, rect: Rect, span: (f32, f32), side: &Side, label_right: bool) {
+    /// Bands within MIDI `span` across `rect` (linear in MIDI), with
+    /// high-frequency emphasis; those inside `sel` almost invisible.
+    fn paint_span(&self, p: &Painter, rect: Rect, span: (f32, f32), sel: (f32, f32)) {
         if rect.width() < 2.0 || span.1 <= span.0 || self.db.is_empty() {
             return;
         }
-        let x = Scale::linear(span, (rect.left(), rect.right()));
-        let y = Scale::linear(DB_SPAN, (rect.bottom(), rect.top()));
+        // Height fraction per dB.
+        let y = Scale::linear(DB_SPAN, (0.0, 1.0));
         // At most one column per pixel; each keeps its loudest band.
         let bands = ((span.1 - span.0) * BPS).round().max(1.0) as usize;
         let cols = bands.min(rect.width() as usize).max(1);
-        let mut v = vec![f32::NEG_INFINITY; cols];
+        let mut v = vec![(0.0f32, false); cols];
         for (j, &db) in self.db.iter().enumerate() {
             let (m0, m1) = band_midi(self.first + j as i32);
             let mid = (m0 + m1) / 2.0;
             if mid >= span.0 && mid < span.1 {
-                let c = (((mid - span.0) / (span.1 - span.0)) * cols as f32) as usize;
-                v[c.min(cols - 1)] = v[c.min(cols - 1)].max(db);
+                let c = ((((mid - span.0) / (span.1 - span.0)) * cols as f32) as usize).min(cols - 1);
+                let db = db + EMPHASIS_DB_PER_OCT * (midi_hz(mid) / EMPHASIS_PIVOT).log2();
+                v[c] = (v[c].0.max(y.px(db).clamp(0.0, 1.0)), mid >= sel.0 && mid < sel.1);
             }
         }
-        let fill = side.tone().gamma_multiply(0.55);
         let w = rect.width() / cols as f32;
-        for (c, &db) in v.iter().enumerate() {
-            let top = y.px(db).clamp(rect.top(), rect.bottom());
-            if top < rect.bottom() - 0.5 {
-                let x0 = rect.left() + c as f32 * w;
-                p.rect_filled(Rect::from_min_max(pos2(x0, top), pos2(x0 + w.max(1.0), rect.bottom())), 0.0, fill);
+        for (c, &(t, inside)) in v.iter().enumerate() {
+            if t * rect.height() < 0.5 {
+                continue;
             }
-        }
-        if side.level_db > FLOOR_DB + 1.0 {
-            let inside = |hz: f32| {
-                let m = pitch::freq_to_midi(hz.max(1.0), A4);
-                (m >= span.0 && m < span.1).then(|| x.px(m))
-            };
-            if let Some(px) = inside(side.peak) {
-                p.vline(px, rect.y_range(), Stroke::new(1.0, theme::ON_ACCENT.gamma_multiply(0.8)));
-            }
-            if let Some(px) = inside(side.centroid) {
-                p.circle_filled(pos2(px, rect.bottom() - 3.0), 2.0, Color32::WHITE);
-            }
-        }
-        if rect.width() > 80.0 {
-            let (at, align) = if label_right {
-                (pos2(rect.right() - 5.0, rect.top() + 1.0), Align2::RIGHT_TOP)
+            // A local maximum stands out: brighter fill and a white cap.
+            let peak = (c == 0 || v[c - 1].0 < t) && v.get(c + 1).is_none_or(|n| n.0 <= t);
+            let gray = Color32::from_gray((70.0 + 150.0 * t * t) as u8);
+            let (fill, cap) = if peak {
+                (theme::lerp(gray, Color32::WHITE, 0.35), Color32::WHITE)
             } else {
-                (pos2(rect.left() + 5.0, rect.top() + 1.0), Align2::LEFT_TOP)
+                (gray, theme::lerp(gray, Color32::WHITE, 0.3))
             };
-            let text = format!("{:.0} dB · {}", side.level_db, plot::fmt_hz(side.peak.round()));
-            p.text(at, align, text, FontId::monospace(9.0), Color32::from_gray(200));
+            let alpha = if inside { 0.07 } else { 0.55 + 0.4 * t };
+            let x0 = rect.left() + c as f32 * w;
+            let top = rect.bottom() - t * rect.height();
+            let col = Rect::from_min_max(pos2(x0, top), pos2(x0 + w.max(1.0), rect.bottom()));
+            p.rect_filled(col, 0.0, fill.gamma_multiply(alpha));
+            p.rect_filled(col.with_max_y(top + 1.0), 0.0, cap.gamma_multiply(alpha));
         }
     }
 }
@@ -292,10 +280,5 @@ impl Side {
         // The peak glides while it stays within a semitone, else jumps.
         let peak = bands.iter().max_by(|x, y| x.peak.total_cmp(&y.peak)).map_or(0.0, |r| r.peak_hz);
         self.peak = if self.peak > 0.0 && (peak / self.peak).log2().abs() < 1.0 / 12.0 { log_ema(self.peak, peak) } else { peak };
-    }
-
-    /// Tonal content in the accent colour, noise in grey.
-    fn tone(&self) -> Color32 {
-        Color32::from_gray(150).lerp_to_gamma(theme::ACCENT_BRIGHT, 1.0 - self.flatness)
     }
 }

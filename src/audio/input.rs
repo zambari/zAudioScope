@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -7,6 +7,7 @@ use cpal::{FromSample, Sample, SizedSample};
 use serde::{Deserialize, Serialize};
 
 use super::Frame;
+use super::tap::{MonitorTap, StereoRing};
 
 /// Capture lengths offered, seconds. The ring is rounded up to a power of
 /// two samples, so the actual length is a little longer.
@@ -113,10 +114,8 @@ struct Ring {
     /// Per-channel peak since the UI last looked, for the level meter.
     /// Non-negative `f32` bits order like the floats, so `fetch_max` works.
     peaks: [AtomicU32; 2],
-    /// The selected L/R pair (or the mono channel twice), packed L<<32 | R,
-    /// for the phase strip.
-    stereo: Box<[AtomicU64]>,
-    stereo_written: AtomicUsize,
+    /// The selected L/R pair (or the mono channel twice), for the phase strip.
+    stereo: StereoRing,
     /// Every device channel's peak since the UI last looked; only filled
     /// while the channel picker is open.
     all_peaks: Box<[AtomicU32]>,
@@ -132,8 +131,7 @@ impl Ring {
             buf: atomics(len.max(1), || AtomicU32::new(0)),
             written: AtomicU64::new(0),
             peaks: [AtomicU32::new(0), AtomicU32::new(0)],
-            stereo: atomics(STEREO_LEN, || AtomicU64::new(0)),
-            stereo_written: AtomicUsize::new(0),
+            stereo: StereoRing::new(STEREO_LEN),
             all_peaks: atomics(channels as usize, || AtomicU32::new(0)),
         }
     }
@@ -141,29 +139,16 @@ impl Ring {
     /// Writer side; only the audio callback calls these.
     fn write(&self, at: u64, s: f32, stereo_at: usize, l: f32, r: f32) {
         self.buf[(at % self.buf.len() as u64) as usize].store(s.to_bits(), Ordering::Relaxed);
-        let packed = (l.to_bits() as u64) << 32 | r.to_bits() as u64;
-        self.stereo[stereo_at % STEREO_LEN].store(packed, Ordering::Relaxed);
+        self.stereo.write(stereo_at, l, r);
     }
 
     fn publish(&self, written: u64, stereo_written: usize) {
-        self.stereo_written.store(stereo_written, Ordering::Release);
+        self.stereo.publish(stereo_written);
         self.written.store(written, Ordering::Release);
     }
 
     fn written(&self) -> u64 {
         self.written.load(Ordering::Acquire)
-    }
-
-    /// The last `n` L/R frames, oldest first.
-    fn latest_stereo(&self, n: usize) -> Vec<(f32, f32)> {
-        let w = self.stereo_written.load(Ordering::Acquire);
-        let n = n.min(STEREO_LEN / 2).min(w);
-        (w - n..w)
-            .map(|i| {
-                let v = self.stereo[i % STEREO_LEN].load(Ordering::Relaxed);
-                (f32::from_bits((v >> 32) as u32), f32::from_bits(v as u32))
-            })
-            .collect()
     }
 
     /// The last `n` samples, oldest first, and the absolute index of the first.
@@ -267,6 +252,8 @@ pub struct Input {
     channel: Arc<AtomicU32>,
     /// Last channel picked on each device id.
     device_channels: BTreeMap<String, ChannelSel>,
+    /// Feed for the monitor output, kept across reopens.
+    monitor: Arc<MonitorTap>,
 }
 
 impl Input {
@@ -292,6 +279,7 @@ impl Input {
             gain: Arc::new(AtomicU32::new(1f32.to_bits())),
             channel: Arc::new(AtomicU32::new(settings.channel.to_bits())),
             device_channels: settings.device_channels.clone(),
+            monitor: Arc::default(),
         };
         me.switch(settings.device_id.as_deref());
         me
@@ -310,16 +298,12 @@ impl Input {
     }
 
     pub fn devices() -> Vec<DeviceInfo> {
-        let host = cpal::default_host();
-        let Ok(devs) = host.input_devices() else {
-            return Vec::new();
-        };
-        devs.filter_map(|d| {
-            let id = d.id().ok()?.to_string();
-            let name = d.description().map(|x| x.name().to_owned()).unwrap_or_else(|_| id.clone());
-            Some(DeviceInfo { id, name })
-        })
-        .collect()
+        cpal::default_host().input_devices().map(describe).unwrap_or_default()
+    }
+
+    /// The feed the monitor output plays from.
+    pub fn monitor_tap(&self) -> Arc<MonitorTap> {
+        self.monitor.clone()
     }
 
     /// Close the current stream and open another device (`None`: system
@@ -456,14 +440,9 @@ impl Input {
 
     fn open_stream(&mut self, device_id: Option<&str>) -> Result<(), String> {
         let host = cpal::default_host();
-        let device = device_id
-            .and_then(|id| id.parse::<cpal::DeviceId>().ok())
-            .and_then(|id| host.device_by_id(&id))
-            .or_else(|| host.default_input_device())
-            .ok_or("no input device")?;
+        let device = by_id(&host, device_id).or_else(|| host.default_input_device()).ok_or("no input device")?;
         self.device_id = device.id().ok().map(|id| id.to_string());
-        self.device_name =
-            device.description().map(|d| d.name().to_owned()).unwrap_or_else(|_| "input".to_owned());
+        self.device_name = device_name(&device, "input");
 
         let default = device.default_input_config().map_err(|e| e.to_string())?;
         let ranges: Vec<_> = device.supported_input_configs().map(|r| r.collect()).unwrap_or_default();
@@ -522,15 +501,9 @@ impl Input {
             gain: self.gain.clone(),
             channel: self.channel.clone(),
             meter_all: self.meter_all.clone(),
+            monitor: self.monitor.clone(),
         };
-        let stream = match config.sample_format() {
-            cpal::SampleFormat::F32 => build::<f32>(&device, sc, taps),
-            cpal::SampleFormat::F64 => build::<f64>(&device, sc, taps),
-            cpal::SampleFormat::I16 => build::<i16>(&device, sc, taps),
-            cpal::SampleFormat::I32 => build::<i32>(&device, sc, taps),
-            cpal::SampleFormat::U16 => build::<u16>(&device, sc, taps),
-            other => return Err(format!("unsupported device sample format {other}")),
-        }?;
+        let stream = super::by_format!(config.sample_format(), build(&device, sc, taps))?;
         stream.play().map_err(|e| e.to_string())?;
         self.stream = Some(stream);
         Ok(())
@@ -556,7 +529,7 @@ impl Input {
 
     /// The last `n` L/R frames, after gain.
     pub fn scope(&self, n: usize) -> Vec<(f32, f32)> {
-        self.shared.ring.latest_stereo(n)
+        self.shared.ring.stereo.latest(n)
     }
 
     pub fn is_stereo(&self) -> bool {
@@ -608,6 +581,25 @@ struct Taps {
     gain: Arc<AtomicU32>,
     channel: Arc<AtomicU32>,
     meter_all: Arc<AtomicBool>,
+    monitor: Arc<MonitorTap>,
+}
+
+/// `DeviceInfo` for every device that reports an id.
+pub(crate) fn describe(devs: impl Iterator<Item = cpal::Device>) -> Vec<DeviceInfo> {
+    devs.filter_map(|d| {
+        let id = d.id().ok()?.to_string();
+        Some(DeviceInfo { name: device_name(&d, &id), id })
+    })
+    .collect()
+}
+
+pub(crate) fn device_name(d: &cpal::Device, fallback: &str) -> String {
+    d.description().map(|x| x.name().to_owned()).unwrap_or_else(|_| fallback.to_owned())
+}
+
+/// A saved device id, if that device is present.
+pub(crate) fn by_id(host: &cpal::Host, id: Option<&str>) -> Option<cpal::Device> {
+    host.device_by_id(&id?.parse::<cpal::DeviceId>().ok()?)
 }
 
 fn build<T>(device: &cpal::Device, config: cpal::StreamConfig, taps: Taps) -> Result<cpal::Stream, String>
@@ -615,7 +607,8 @@ where
     T: SizedSample,
     f32: FromSample<T>,
 {
-    let Taps { sh, gain, channel, meter_all } = taps;
+    let Taps { sh, gain, channel, meter_all, monitor } = taps;
+    let in_rate = config.sample_rate;
     let ch = config.channels.max(1) as usize;
     let err_sh = sh.clone();
     let rate = config.sample_rate.max(1) as f32;
@@ -667,7 +660,9 @@ where
                 let ring = &sh.ring;
                 // Only this callback writes, so the published counts are ours.
                 let mut w = ring.written.load(Ordering::Relaxed);
-                let mut sw = ring.stereo_written.load(Ordering::Relaxed);
+                let mut sw = ring.stereo.written();
+                let mon = monitor.enabled();
+                let mut mw = monitor.ring.written();
                 let mut pk = [0f32; 2];
                 for frame in data.chunks_exact(ch) {
                     let at = |i: usize| f32::from_sample(frame[i]) * g;
@@ -687,12 +682,19 @@ where
                         }
                     };
                     ring.write(w, m, sw, l, r);
+                    if mon {
+                        monitor.ring.write(mw, l, r);
+                        mw += 1;
+                    }
                     w += 1;
                     sw += 1;
                     pk[0] = pk[0].max(l.abs());
                     pk[1] = pk[1].max(r.abs());
                 }
                 ring.publish(w, sw);
+                if mon {
+                    monitor.publish(mw, in_rate, frames as u32);
+                }
                 for (dst, p) in ring.peaks.iter().zip(pk) {
                     dst.fetch_max(p.to_bits(), Ordering::Relaxed);
                 }

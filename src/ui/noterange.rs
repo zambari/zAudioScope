@@ -12,10 +12,11 @@
 use egui::{Align2, Color32, CursorIcon, FontId, Rect, Sense, Stroke, Ui, pos2, vec2};
 use serde::{Deserialize, Serialize};
 
+use super::keyglow::KeyGlow;
 use super::plot::{self, Scale};
 use super::outside::{AIR_W, Outside};
 use super::theme;
-use super::widgets::{Grab, clamp_pair};
+use super::widgets::{self, Grab, clamp_pair};
 use crate::pitch;
 
 /// Reference tuning of the shared axis.
@@ -89,53 +90,74 @@ pub fn is_black(key: i32) -> bool {
     matches!(key.rem_euclid(12), 1 | 3 | 6 | 8 | 10)
 }
 
+/// Height of the range bar: Hz labels over the keys, px.
+pub const BAR_H: f32 = 46.0;
+
 /// Pick-up distance of an edge handle, px.
 const EDGE_PX: f32 = 6.0;
 
 /// The range control. `marks` are live pitches (fractional MIDI) reported
-/// by the analysers, lit on the keys. Returns true when the range changed.
-pub fn bar(ui: &mut Ui, range: &mut NoteRange, marks: &[f32], readout_width: f32, outside: Option<&Outside>) -> bool {
+/// by the analysers, lit on the keys. `spectrum` switches the live spectrum
+/// over the keys (and its FFTs) on or off. `glow` lights keys played over
+/// MIDI. Returns true when the range changed.
+pub fn bar(
+    ui: &mut Ui,
+    range: &mut NoteRange,
+    spectrum: &mut bool,
+    marks: &[f32],
+    readout_width: f32,
+    outside: Option<&Outside>,
+    glow: &KeyGlow,
+) -> bool {
     let before = *range;
     ui.horizontal(|ui| {
         // Readout in the parameter column, so the strip lines up with graphs.
         ui.allocate_ui_with_layout(
-            vec2(readout_width, 34.0),
+            vec2(readout_width, BAR_H),
             egui::Layout::top_down(egui::Align::Min),
             |ui| {
                 ui.set_width(readout_width);
+                ui.spacing_mut().item_spacing.y = 2.0;
                 let (f0, f1) = range.hz();
-                ui.label(
-                    egui::RichText::new(format!(
-                        "{} – {}",
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} – {} Hz",
+                            plot::fmt_hz(f0.round()),
+                            plot::fmt_hz(f1.round())
+                        ))
+                        .strong(),
+                    );
+                    ui.weak(format!(
+                        "({:.1} octaves {}–{})",
+                        range.count() as f32 / 12.0,
                         pitch::note_name(range.lo),
                         pitch::note_name(range.hi)
-                    ))
-                    .strong(),
-                );
-                ui.weak(format!(
-                    "{} – {} Hz · {} notes",
-                    plot::fmt_hz(f0.round()),
-                    plot::fmt_hz(f1.round()),
-                    range.count()
-                ));
+                    ));
+                });
+                ui.horizontal(|ui| {
+                    ui.add(widgets::flicktoggle(spectrum))
+                        .on_hover_text("Live spectrum over the keys (runs its own FFTs)");
+                    ui.weak("FFT");
+                    ui.weak(format!("{} notes", range.count()));
+                });
             },
         );
-        strip(ui, range, marks, outside);
+        strip(ui, range, marks, outside, glow);
     });
     *range != before
 }
 
-fn strip(ui: &mut Ui, range: &mut NoteRange, marks: &[f32], outside: Option<&Outside>) {
-    let (rect, resp) =
-        ui.allocate_exact_size(vec2(ui.available_width(), 36.0), Sense::click_and_drag());
-    let full = NoteRange::BOUNDS;
-    // With side spectra, an "air" zone right of the keys shows bar top .. Nyquist.
+fn strip(ui: &mut Ui, range: &mut NoteRange, marks: &[f32], outside: Option<&Outside>, glow: &KeyGlow) {
+    // With a spectrum, it is drawn over the keys, and an "air" zone right
+    // of the keys reaches from the bar top to Nyquist.
     let air_w = if outside.is_some() { AIR_W } else { 0.0 };
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), BAR_H), Sense::click_and_drag());
+    let full = NoteRange::BOUNDS;
     let main = Rect::from_min_max(rect.min, pos2(rect.right() - air_w, rect.bottom()));
     let notes = full.scale(main);
     let label_h = 12.0;
     let keys = Rect::from_min_max(pos2(main.left(), main.top() + label_h), main.max);
-    let air = Rect::from_min_max(pos2(keys.right() + 2.0, keys.top()), pos2(rect.right(), keys.bottom()));
 
     // ---- interaction ------------------------------------------------------
     let (mut lo, mut hi) = (range.lo as f32, range.hi as f32);
@@ -296,15 +318,14 @@ fn strip(ui: &mut Ui, range: &mut NoteRange, marks: &[f32], outside: Option<&Out
         shade,
     );
     if let Some(o) = outside {
-        p.rect_filled(air, 0.0, Color32::from_gray(14));
+        o.paint(&p, keys, rect.right(), *range);
         p.text(
-            pos2(air.right(), rect.top() + 1.0),
+            pos2(rect.right(), rect.top() + 1.0),
             Align2::RIGHT_TOP,
             format!("→{}", plot::fmt_hz(pitch::midi_to_freq(o.hi.midi.1, A4).round())),
             FontId::monospace(9.0),
             Color32::from_gray(140),
         );
-        o.paint(&p, keys, (sel.left(), sel.right()), air, *range);
     }
     p.rect_filled(sel, 0.0, theme::ACCENT.gamma_multiply(0.18));
     p.rect_stroke(
@@ -320,6 +341,20 @@ fn strip(ui: &mut Ui, range: &mut NoteRange, marks: &[f32], outside: Option<&Out
             keys.y_range(),
             Stroke::new(3.0, if lit { Color32::WHITE } else { theme::HANDLE }),
         );
+    }
+
+    // MIDI glow: held keys bright, recently busy ones keep a dim after-glow.
+    for k in full.notes() {
+        let l = glow.level(k);
+        if l <= 0.0 {
+            continue;
+        }
+        let x0 = notes.px(k as f32 - 0.5);
+        let key = Rect::from_min_max(pos2(x0, keys.top()), pos2(x0 + kw, keys.bottom()));
+        p.rect_filled(key, 0.0, theme::ON_ACCENT.gamma_multiply(0.5 * l));
+        if glow.held(k) {
+            p.rect_filled(key.with_max_y(key.top() + 2.0), 0.0, theme::ON_ACCENT);
+        }
     }
 
     // Live pitches from the analysers.

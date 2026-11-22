@@ -1,0 +1,491 @@
+//! Monitoring: plays the analysed input out of a chosen output device (e.g.
+//! headphones, to check the right source is coming in), with a feedback
+//! guard that mutes the output when the input starts running away with it.
+
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::{FromSample, SizedSample};
+use serde::{Deserialize, Serialize};
+
+use super::DeviceInfo;
+use super::input::{by_id, describe, device_name};
+use super::tap::MonitorTap;
+
+/// Output callback size asked for, clamped to what the device allows.
+const OUT_BUFFER: u32 = 256;
+/// Fade-in after opening or re-arming, seconds.
+const FADE_IN_S: f32 = 0.5;
+/// Ramp to silence once the guard trips, seconds.
+const MUTE_S: f32 = 0.02;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MonitorSettings {
+    pub enabled: bool,
+    /// `None`: the system's default output.
+    pub device_id: Option<String>,
+    /// Linear.
+    pub gain: f32,
+    /// Mute on suspected acoustic feedback.
+    pub guard: bool,
+}
+
+impl Default for MonitorSettings {
+    fn default() -> Self {
+        Self { enabled: false, device_id: None, gain: 0.5, guard: true }
+    }
+}
+
+/// Why the guard muted the output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Trip {
+    /// The input kept getting louder on its own, as a near-pure tone.
+    Runaway,
+    /// A near-pure tone held at clipping.
+    Howl,
+}
+
+impl Trip {
+    fn from_bits(b: u32) -> Option<Self> {
+        match b {
+            1 => Some(Self::Runaway),
+            2 => Some(Self::Howl),
+            _ => None,
+        }
+    }
+
+    fn bits(self) -> u32 {
+        match self {
+            Self::Runaway => 1,
+            Self::Howl => 2,
+        }
+    }
+}
+
+struct Shared {
+    /// User gain, `f32` bits.
+    gain: AtomicU32,
+    guard: AtomicBool,
+    /// The input and output look like the same room (built-in mic into
+    /// built-in speakers): trip on less evidence.
+    sensitive: AtomicBool,
+    /// `Trip::bits`, 0 while armed. Latched until the UI re-arms.
+    trip: AtomicU32,
+    /// Set by the UI; the callback clears it, resets the guard and fades in.
+    rearm: AtomicBool,
+    error: Mutex<Option<String>>,
+}
+
+pub struct Monitor {
+    stream: Option<cpal::Stream>,
+    sh: Arc<Shared>,
+    tap: Arc<MonitorTap>,
+    enabled: bool,
+    pub device_id: Option<String>,
+    pub device_name: String,
+    open_error: Option<String>,
+}
+
+impl Monitor {
+    pub fn new(settings: &MonitorSettings, tap: Arc<MonitorTap>) -> Self {
+        let mut me = Self {
+            stream: None,
+            sh: Arc::new(Shared {
+                gain: AtomicU32::new(0),
+                guard: AtomicBool::new(settings.guard),
+                sensitive: AtomicBool::new(false),
+                trip: AtomicU32::new(0),
+                rearm: AtomicBool::new(false),
+                error: Mutex::new(None),
+            }),
+            tap,
+            enabled: false,
+            device_id: settings.device_id.clone(),
+            device_name: "default output".into(),
+            open_error: None,
+        };
+        me.set_gain(settings.gain);
+        me.set_enabled(settings.enabled);
+        me
+    }
+
+    pub fn settings(&self) -> MonitorSettings {
+        MonitorSettings {
+            enabled: self.enabled,
+            device_id: self.device_id.clone(),
+            gain: self.gain(),
+            guard: self.guard(),
+        }
+    }
+
+    pub fn devices() -> Vec<DeviceInfo> {
+        cpal::default_host().output_devices().map(describe).unwrap_or_default()
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Open or close the output; the input only feeds the tap while on.
+    pub fn set_enabled(&mut self, on: bool) {
+        self.enabled = on;
+        self.tap.on.store(on, Ordering::Relaxed);
+        self.stream = None;
+        self.open_error = if on { self.open().err() } else { None };
+        if let Ok(mut e) = self.sh.error.lock() {
+            *e = None;
+        }
+    }
+
+    pub fn select_device(&mut self, id: &str) {
+        self.device_id = Some(id.to_owned());
+        if self.enabled {
+            self.set_enabled(true);
+        }
+    }
+
+    pub fn gain(&self) -> f32 {
+        f32::from_bits(self.sh.gain.load(Ordering::Relaxed))
+    }
+
+    pub fn set_gain(&self, g: f32) {
+        self.sh.gain.store(g.clamp(0.0, crate::ui::meter::GAIN_MAX).to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn guard(&self) -> bool {
+        self.sh.guard.load(Ordering::Relaxed)
+    }
+
+    /// Turning the guard off also lifts a mute it is holding.
+    pub fn set_guard(&self, on: bool) {
+        self.sh.guard.store(on, Ordering::Relaxed);
+        if !on && self.tripped().is_some() {
+            self.rearm();
+        }
+    }
+
+    pub fn set_sensitive(&self, on: bool) {
+        self.sh.sensitive.store(on, Ordering::Relaxed);
+    }
+
+    pub fn tripped(&self) -> Option<Trip> {
+        Trip::from_bits(self.sh.trip.load(Ordering::Relaxed))
+    }
+
+    /// Unmute after a trip, fading back in.
+    pub fn rearm(&self) {
+        self.sh.rearm.store(true, Ordering::Relaxed);
+    }
+
+    pub fn error(&self) -> Option<String> {
+        self.open_error.clone().or_else(|| self.sh.error.lock().ok()?.clone())
+    }
+
+    fn open(&mut self) -> Result<(), String> {
+        let host = cpal::default_host();
+        // A saved device that is gone is an error, not a fallback: the
+        // default is often the speakers, the one place monitoring a mic
+        // must not end up by surprise.
+        let device = match self.device_id.as_deref() {
+            Some(id) => by_id(&host, Some(id)).ok_or("monitor output not found")?,
+            None => host.default_output_device().ok_or("no output device")?,
+        };
+        self.device_name = device_name(&device, "output");
+        let config = device.default_output_config().map_err(|e| e.to_string())?;
+        let mut sc: cpal::StreamConfig = config.config();
+        if let cpal::SupportedBufferSize::Range { min, max } = *config.buffer_size() {
+            sc.buffer_size = cpal::BufferSize::Fixed(OUT_BUFFER.clamp(min, max));
+        }
+        self.rearm();
+        let (sh, tap) = (self.sh.clone(), self.tap.clone());
+        let stream = super::by_format!(config.sample_format(), build(&device, sc, sh, tap))?;
+        stream.play().map_err(|e| e.to_string())?;
+        self.stream = Some(stream);
+        Ok(())
+    }
+}
+
+/// Input device into output device in the same box, both its own
+/// transducers (MacBook Microphone → MacBook Speakers).
+pub fn risky_pair(input: &str, output: &str) -> bool {
+    let (i, o) = (input.to_lowercase(), output.to_lowercase());
+    i.contains("microphone") && o.contains("speaker")
+}
+
+fn build<T>(
+    device: &cpal::Device,
+    config: cpal::StreamConfig,
+    sh: Arc<Shared>,
+    tap: Arc<MonitorTap>,
+) -> Result<cpal::Stream, String>
+where
+    T: SizedSample + FromSample<f32>,
+{
+    let ch = config.channels.max(1) as usize;
+    let mut player = Player::new(config.sample_rate.max(1));
+    let err_sh = sh.clone();
+    device
+        .build_output_stream(
+            config,
+            move |data: &mut [T], _: &cpal::OutputCallbackInfo| player.render(data, ch, &sh, &tap),
+            move |err: cpal::Error| {
+                if matches!(err.kind(), cpal::ErrorKind::Xrun) {
+                    return;
+                }
+                if let Ok(mut e) = err_sh.error.lock() {
+                    *e = Some(err.to_string());
+                }
+            },
+            None,
+        )
+        .map_err(|e| e.to_string())
+}
+
+/// Output-callback state: reads the tap a little behind the input's write
+/// head, resampling input rate to output rate and nudging the speed so the
+/// two clocks don't drift apart.
+struct Player {
+    out_rate: f32,
+    /// Read position in the tap, absolute input frames.
+    pos: Option<f64>,
+    in_rate: u32,
+    /// Smoothed distance behind the write head, input frames.
+    delay: f64,
+    /// Ran dry; wait for the full target delay before playing again, so
+    /// it stays put instead of stuttering at the edge.
+    starved: bool,
+    fade: f32,
+    /// 1 while armed, ramps to 0 once tripped.
+    mute: f32,
+    guard: Guard,
+}
+
+impl Player {
+    fn new(out_rate: u32) -> Self {
+        Self {
+            out_rate: out_rate as f32,
+            pos: None,
+            in_rate: 0,
+            delay: 0.0,
+            starved: true,
+            fade: 0.0,
+            mute: 1.0,
+            guard: Guard::new(out_rate as f32),
+        }
+    }
+
+    fn render<T: SizedSample + FromSample<f32>>(&mut self, data: &mut [T], ch: usize, sh: &Shared, tap: &MonitorTap) {
+        let silence = T::from_sample(0.0f32);
+        if sh.rearm.swap(false, Ordering::Relaxed) {
+            sh.trip.store(0, Ordering::Relaxed);
+            self.guard = Guard::new(self.out_rate);
+            self.fade = 0.0;
+            self.mute = 1.0;
+        }
+        let in_rate = tap.rate.load(Ordering::Relaxed);
+        if in_rate != self.in_rate {
+            self.in_rate = in_rate;
+            self.pos = None;
+        }
+        let frames = data.len() / ch;
+        let ratio = in_rate as f64 / self.out_rate as f64;
+        let need = frames as f64 * ratio + 2.0;
+        let block = tap.block.load(Ordering::Relaxed).max(1) as f64;
+        // Ride out an input callback landing just after we read, plus ours.
+        let target = (block * 1.5 + need).max(in_rate as f64 * 0.004);
+        let ceiling = (target * 3.0 + in_rate as f64 * 0.05).min(tap.ring.len() as f64 / 2.0);
+        let w = tap.ring.written() as f64;
+        let pos = *self.pos.get_or_insert((w - target).max(0.0));
+        let behind = w - pos;
+        if behind > ceiling {
+            // Fell far behind (output stalled, or input resumed after a
+            // pause): skip to fresh audio.
+            self.pos = Some(w - target);
+            self.delay = target;
+        } else if behind < need || (self.starved && behind < target) {
+            self.starved = true;
+            data.fill(silence);
+            return;
+        }
+        if std::mem::take(&mut self.starved) {
+            self.delay = target;
+        }
+        if in_rate == 0 {
+            data.fill(silence);
+            return;
+        }
+        let mut pos = self.pos.unwrap_or(0.0);
+        self.delay = self.delay * 0.95 + (w - pos) * 0.05;
+        // A few tenths of a percent either way absorbs clock drift.
+        let step = ratio * (1.0 + ((self.delay - target) / target).clamp(-1.0, 1.0) * 0.003);
+
+        let gain = f32::from_bits(sh.gain.load(Ordering::Relaxed));
+        let guard_on = sh.guard.load(Ordering::Relaxed);
+        let sensitive = sh.sensitive.load(Ordering::Relaxed);
+        let mut tripped = guard_on && sh.trip.load(Ordering::Relaxed) != 0;
+        let fade_step = 1.0 / (FADE_IN_S * self.out_rate);
+        let mute_step = 1.0 / (MUTE_S * self.out_rate);
+        for frame in data.chunks_exact_mut(ch) {
+            let i = pos.floor();
+            let t = (pos - i) as f32;
+            let ((l0, r0), (l1, r1)) = (tap.ring.get(i as usize), tap.ring.get(i as usize + 1));
+            let (l, r) = (l0 + (l1 - l0) * t, r0 + (r1 - r0) * t);
+            pos += step;
+
+            if guard_on && !tripped {
+                if let Some(trip) = self.guard.feed(l, r, gain, sensitive) {
+                    sh.trip.store(trip.bits(), Ordering::Relaxed);
+                    tripped = true;
+                }
+            }
+            self.mute = if tripped { (self.mute - mute_step).max(0.0) } else { 1.0 };
+            self.fade = (self.fade + fade_step).min(1.0);
+            let g = gain * self.mute * self.fade * self.fade;
+            let (l, r) = (soft_clip(l * g), soft_clip(r * g));
+            match frame {
+                [m] => *m = T::from_sample((l + r) * 0.5),
+                [a, b, rest @ ..] => {
+                    *a = T::from_sample(l);
+                    *b = T::from_sample(r);
+                    rest.fill(silence);
+                }
+                [] => {}
+            }
+        }
+        self.pos = Some(pos);
+    }
+}
+
+/// Linear up to -1 dBFS, then bends into a hard ceiling at 0 dBFS, so a
+/// runaway can't blast the headphones while the guard decides.
+fn soft_clip(x: f32) -> f32 {
+    const KNEE: f32 = 0.89;
+    let a = x.abs();
+    if a <= KNEE { x } else { x.signum() * (KNEE + (1.0 - KNEE) * ((a - KNEE) / (1.0 - KNEE)).tanh()) }
+}
+
+const GUARD_BLOCK_S: f32 = 0.01;
+
+/// Acoustic feedback shows up as the input climbing on its own: block after
+/// block a little louder, close to a pure tone, until it clips. Played
+/// material rises fast and then decays (a kick, a plucked bass); a howl
+/// keeps building. The guard watches the monitored signal in 10 ms blocks
+/// and trips on either a long, steady, tonal rise or a tone held at
+/// clipping, but only while the output is loud enough to drive a room.
+struct Guard {
+    block: usize,
+    n: usize,
+    sum: f32,
+    peak: f32,
+    /// Smoothed block level, dBFS.
+    level: f32,
+    /// Level where the current rising run started.
+    floor: f32,
+    /// Blocks in the current rising run.
+    run: u32,
+    /// Smoothed peak / RMS: 1.41 for a sine, 3+ for most programme.
+    crest: f32,
+    /// Consecutive tonal blocks at clipping.
+    hot: u32,
+}
+
+impl Guard {
+    fn new(rate: f32) -> Self {
+        Self {
+            block: (rate * GUARD_BLOCK_S).max(1.0) as usize,
+            n: 0,
+            sum: 0.0,
+            peak: 0.0,
+            level: -120.0,
+            floor: -120.0,
+            run: 0,
+            crest: 4.0,
+            hot: 0,
+        }
+    }
+
+    /// One monitored frame (before monitor gain). `Some` once it trips.
+    fn feed(&mut self, l: f32, r: f32, gain: f32, sensitive: bool) -> Option<Trip> {
+        use crate::ui::meter::to_db;
+        self.sum += (l * l + r * r) * 0.5;
+        self.peak = self.peak.max(l.abs().max(r.abs()));
+        self.n += 1;
+        if self.n < self.block {
+            return None;
+        }
+        let rms = (self.sum / self.n as f32).sqrt();
+        let peak = std::mem::take(&mut self.peak);
+        (self.n, self.sum) = (0, 0.0);
+
+        let crest = if rms > 1e-6 { peak / rms } else { 10.0 };
+        self.crest = self.crest * 0.7 + crest * 0.3;
+        let prev = self.level;
+        self.level = prev * 0.6 + to_db(rms.max(1e-6)) * 0.4;
+
+        // Too quiet, at the output, to be driving the room.
+        if self.level + to_db(gain.max(1e-6)) < -45.0 || self.level < -70.0 {
+            (self.run, self.floor, self.hot) = (0, self.level, 0);
+            return None;
+        }
+        if self.level >= prev - 0.5 {
+            self.run += 1;
+            self.floor = self.floor.min(self.level);
+        } else {
+            (self.run, self.floor) = (0, self.level);
+        }
+        let (max_crest, rise_db) = if sensitive { (3.0, 9.0) } else { (2.2, 15.0) };
+        // 80 ms of steady climb, as a tone.
+        if self.crest < max_crest && self.run >= 8 && self.level - self.floor >= rise_db {
+            return Some(Trip::Runaway);
+        }
+        self.hot = if peak > 0.95 && self.crest < 2.0 { self.hot + 1 } else { 0 };
+        // 300 ms of tone at clipping.
+        (self.hot >= 30).then_some(Trip::Howl)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(guard: &mut Guard, secs: f32, sensitive: bool, f: impl Fn(f32) -> f32) -> Option<Trip> {
+        let rate = 48_000.0;
+        (0..(secs * rate) as usize).find_map(|i| {
+            let v = f(i as f32 / rate);
+            guard.feed(v, v, 1.0, sensitive)
+        })
+    }
+
+    #[test]
+    fn growing_tone_trips() {
+        let mut g = Guard::new(48_000.0);
+        // 1 kHz, from -50 dB up 40 dB per second.
+        let hit = run(&mut g, 1.5, false, |t| {
+            (0.003 * 10f32.powf(2.0 * t)).min(1.0) * (t * 1000.0 * std::f32::consts::TAU).sin()
+        });
+        assert_eq!(hit, Some(Trip::Runaway));
+    }
+
+    #[test]
+    fn repeating_kicks_and_steady_tone_pass() {
+        let mut g = Guard::new(48_000.0);
+        // A decaying 50 Hz kick every 500 ms.
+        let kick = |t: f32| {
+            let u = t % 0.5;
+            0.9 * (-u * 12.0).exp() * (u * 50.0 * std::f32::consts::TAU).sin()
+        };
+        assert_eq!(run(&mut g, 4.0, false, kick), None);
+        // A steady, moderate tuning note.
+        let mut g = Guard::new(48_000.0);
+        assert_eq!(run(&mut g, 4.0, true, |t| 0.3 * (t * 110.0 * std::f32::consts::TAU).sin()), None);
+    }
+
+    #[test]
+    fn clipped_tone_trips() {
+        let mut g = Guard::new(48_000.0);
+        let hit = run(&mut g, 1.0, false, |t| (3.0 * (t * 800.0 * std::f32::consts::TAU).sin()).clamp(-1.0, 1.0));
+        assert_eq!(hit, Some(Trip::Howl));
+    }
+}
