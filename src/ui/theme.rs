@@ -16,6 +16,13 @@ pub const HANDLE: Color32 = Color32::from_rgb(222, 78, 60);
 /// In tune / within tolerance.
 pub const GOOD: Color32 = Color32::from_rgb(80, 200, 120);
 
+/// Straight RGB blend from `a` (u = 0) to `b` (u = 1); opaque result.
+pub fn lerp(a: Color32, b: Color32, u: f32) -> Color32 {
+    let u = u.clamp(0.0, 1.0);
+    let c = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * u) as u8;
+    Color32::from_rgb(c(a.r(), b.r()), c(a.g(), b.g()), c(a.b(), b.b()))
+}
+
 pub fn apply(ctx: &egui::Context) {
     ctx.set_theme(egui::Theme::Dark);
     ctx.style_mut_of(egui::Theme::Dark, |style| {

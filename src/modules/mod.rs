@@ -17,11 +17,12 @@
 //! 5. `Module::graph` draws. Then `Shared::finish` drops every cached
 //!    result and hands the FFT plans back for the next frame.
 
+pub mod midi;
 pub mod scope;
 pub mod tuner;
 pub mod waterfall;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -29,6 +30,7 @@ use egui::{Rect, Ui};
 
 use crate::audio::Frame;
 use crate::audio::spectrum::Fft;
+use crate::ui::noterange::NoteRange;
 
 /// Which part of the recent audio the analysers should look at.
 #[derive(Clone, Copy, Debug, Default)]
@@ -59,13 +61,16 @@ pub struct Shared {
     /// True when the stream restarted since the last frame (new device,
     /// rate...): absolute positions from before no longer apply.
     pub reset: bool,
+    /// The shared note range every frequency axis shows (the bar above the
+    /// status bar). A module may set it (e.g. "fit"); the app keeps it.
+    pub range: Cell<NoteRange>,
     plans: RefCell<FftPlans>,
     cache: RefCell<FrameCache>,
 }
 
 impl Shared {
-    pub fn new(frame: Frame, reset: bool, plans: FftPlans) -> Self {
-        Self { frame, gate: Gate::default(), reset, plans: RefCell::new(plans), cache: Default::default() }
+    pub fn new(frame: Frame, reset: bool, range: NoteRange, plans: FftPlans) -> Self {
+        Self { frame, gate: Gate::default(), reset, range: Cell::new(range), plans: RefCell::new(plans), cache: Default::default() }
     }
 
     /// End of frame: drop every cached result, keep the FFT plans.
@@ -169,7 +174,15 @@ pub trait Module {
     }
     /// Analysis for this frame. Runs whether or not the row is open.
     fn update(&mut self, _shared: &mut Shared) {}
-    fn params(&mut self, ui: &mut Ui);
+    /// Live pitches (fractional MIDI) to light on the shared range bar.
+    fn marks(&self, _out: &mut Vec<f32>) {}
+    /// Whether this module adds a settings row under the top bar.
+    fn has_top_row(&self) -> bool {
+        false
+    }
+    /// Device-level settings shown in the module's own top-bar row.
+    fn top_row(&mut self, _ui: &mut Ui) {}
+    fn params(&mut self, ui: &mut Ui, shared: &Shared);
     fn graph(&mut self, ui: &mut Ui, rect: Rect, shared: &Shared);
 }
 
@@ -193,5 +206,6 @@ pub fn all() -> Vec<Slot> {
         slot(Box::new(scope::Scope::default())),
         slot(Box::new(tuner::Tuner::default())),
         slot(Box::new(waterfall::Waterfall::default())),
+        slot(Box::new(midi::MidiMonitor::default())),
     ]
 }

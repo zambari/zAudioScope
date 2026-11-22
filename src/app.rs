@@ -7,6 +7,7 @@ use crate::audio::mic_permission::{self, MicAuth};
 use crate::audio::{ChannelSel, DeviceInfo, HISTORY_CHOICES, Input, InputSettings};
 use crate::modules::{self, FftPlans, Shared, Slot};
 use crate::relaunch::BuildWatch;
+use crate::ui::noterange::{self, NoteRange};
 use crate::ui::{self, theme};
 
 const STATE_KEY: &str = "zaudioscope_state";
@@ -23,11 +24,13 @@ struct Saved {
     modules: Vec<(String, bool, bool)>,
     /// Input gain, linear.
     gain: f32,
+    /// Shared note range of the frequency-axis analysers.
+    range: NoteRange,
 }
 
 impl Default for Saved {
     fn default() -> Self {
-        Self { device_id: None, input: InputSettings::default(), modules: Vec::new(), gain: 1.0 }
+        Self { device_id: None, input: InputSettings::default(), modules: Vec::new(), gain: 1.0, range: NoteRange::default() }
     }
 }
 
@@ -36,6 +39,7 @@ pub struct App {
     devices: Vec<DeviceInfo>,
     slots: Vec<Slot>,
     gain: f32,
+    range: NoteRange,
     meter: ui::meter::Meter,
     /// Levels of every channel, shown in the channel picker.
     ch_meters: ui::meter::ChannelMeters,
@@ -74,6 +78,7 @@ impl App {
             devices: Input::devices(),
             slots,
             gain: saved.gain.clamp(0.0, ui::meter::GAIN_MAX),
+            range: saved.range.sanitized(),
             meter: Default::default(),
             ch_meters: Default::default(),
             build_watch: BuildWatch::new(),
@@ -183,6 +188,11 @@ impl App {
             ui.separator();
             self.meter.show(ui, &self.input, &mut self.gain);
         });
+        // Rows of device-level settings from modules that have them.
+        for slot in self.slots.iter_mut().filter(|s| s.visible && s.module.has_top_row()) {
+            ui.separator();
+            ui.push_id(slot.module.title(), |ui| ui.horizontal(|ui| slot.module.top_row(ui)));
+        }
     }
 
     /// Listening is the lit, active state; clicking releases the interface
@@ -410,7 +420,7 @@ impl eframe::App for App {
         let frame = self.input.frame(n);
         let reset = frame.end() < self.last_end;
         self.last_end = frame.end();
-        let mut shared = Shared::new(frame, reset, std::mem::take(&mut self.fft_plans));
+        let mut shared = Shared::new(frame, reset, self.range, std::mem::take(&mut self.fft_plans));
         // Analysis runs in slot order, so the scope sets the gate first.
         for slot in self.slots.iter_mut().filter(|s| s.visible) {
             slot.module.update(&mut shared);
@@ -418,6 +428,17 @@ impl eframe::App for App {
 
         egui::Panel::top("top_bar").show(ui, |ui| self.top_bar(ui));
         egui::Panel::bottom("status_bar").show(ui, |ui| self.status_bar(ui));
+        // Declared after the status bar, so it sits just above it.
+        let mut marks = Vec::new();
+        for slot in self.slots.iter().filter(|s| s.visible) {
+            slot.module.marks(&mut marks);
+        }
+        egui::Panel::bottom("note_range").show(ui, |ui| {
+            let mut r = shared.range.get();
+            if noterange::bar(ui, &mut r, &marks) {
+                shared.range.set(r);
+            }
+        });
         let paused = self.input.paused();
         egui::CentralPanel::default().show(ui, |ui| {
             if paused {
@@ -431,6 +452,7 @@ impl eframe::App for App {
                 }
             });
         });
+        self.range = shared.range.get().sanitized();
         // Frame done: drop the cached spectra, keep the plans.
         self.fft_plans = shared.finish();
         ui.ctx().request_repaint();
@@ -445,6 +467,7 @@ impl eframe::App for App {
                 input: self.input.settings(),
                 modules: self.slots.iter().map(|s| (s.module.title().to_owned(), s.visible, s.open)).collect(),
                 gain: self.gain,
+                range: self.range,
             }
         };
         eframe::set_value(storage, STATE_KEY, &saved);

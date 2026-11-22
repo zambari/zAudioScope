@@ -1,40 +1,13 @@
 //! Short-time spectra for the waterfall: a small radix-2 FFT, a Hann window,
-//! and a warped frequency axis that gives the lows room without letting a
-//! pure log scale spend half the width below 200 Hz.
+//! and log-spaced display bands (the shared note axis is log frequency).
 
 use std::f32::consts::TAU;
 
-/// Lowest frequency shown.
-pub const F_MIN: f32 = 20.0;
-/// Knee of the warp: roughly linear below, logarithmic above. Smaller means
-/// more log-like (more room for the bass).
-const F_KNEE: f32 = 180.0;
 /// Display tilt, dB per octave around 1 kHz, so typical program material
 /// (which falls off with frequency) looks roughly level.
 const TILT_DB_PER_OCT: f32 = 3.0;
 /// Below this, a bin reads as silence.
 pub const FLOOR_DB: f32 = -96.0;
-
-/// The frequency warp, for `ui::plot::Scale::warped`.
-pub fn warp(f: f32) -> f32 {
-    (1.0 + f / F_KNEE).ln()
-}
-
-pub fn unwarp(w: f32) -> f32 {
-    F_KNEE * (w.exp() - 1.0)
-}
-
-/// Where `freq` sits across the axis, 0..1, for a top frequency of `f_max`.
-pub fn axis_pos(freq: f32, f_max: f32) -> f32 {
-    let (a, b) = (warp(F_MIN), warp(f_max));
-    ((warp(freq) - a) / (b - a)).clamp(0.0, 1.0)
-}
-
-/// The frequency at axis position `u` (0..1).
-pub fn axis_freq(u: f32, f_max: f32) -> f32 {
-    let (a, b) = (warp(F_MIN), warp(f_max));
-    unwarp(a + u * (b - a))
-}
 
 /// A reusable radix-2 FFT plan of one size with a Hann window. Plans are
 /// kept across frames (see `modules::Shared`); spectra are not.
@@ -108,8 +81,8 @@ impl Fft {
     }
 }
 
-/// Maps an FFT power spectrum onto display bands along the warped axis,
-/// with the display tilt applied.
+/// Maps an FFT power spectrum onto log-spaced display bands, with the
+/// display tilt applied.
 pub struct Bands {
     n: usize,
     rate: u32,
@@ -126,15 +99,16 @@ enum Band {
 }
 
 impl Bands {
-    /// Layout for an `n`-point FFT at `rate`, `count` bands wide.
-    pub fn new(n: usize, rate: u32, count: usize) -> Self {
-        let f_max = rate as f32 / 2.0;
+    /// Layout for an `n`-point FFT at `rate`, `count` bands evenly spaced
+    /// in log frequency across `(f_lo, f_hi)` Hz.
+    pub fn new(n: usize, rate: u32, count: usize, (f_lo, f_hi): (f32, f32)) -> Self {
+        let axis_freq = |u: f32| f_lo * (f_hi / f_lo).powf(u);
         let hz_per_bin = rate as f32 / n as f32;
         let mut bands = Vec::with_capacity(count);
         let mut tilt = Vec::with_capacity(count);
         for j in 0..count {
-            let lo = axis_freq(j as f32 / count as f32, f_max);
-            let hi = axis_freq((j + 1) as f32 / count as f32, f_max);
+            let lo = axis_freq(j as f32 / count as f32);
+            let hi = axis_freq((j + 1) as f32 / count as f32);
             let (blo, bhi) = ((lo / hz_per_bin).round() as usize, (hi / hz_per_bin).round() as usize);
             bands.push(if bhi > blo { Band::Range(blo, bhi.min(n / 2)) } else { Band::Lerp(((lo + hi) / 2.0) / hz_per_bin) });
             let centre = ((lo * hi).sqrt()).max(1.0);

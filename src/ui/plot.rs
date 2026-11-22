@@ -1,7 +1,7 @@
 //! Shared graph furniture, so every analyser labels its axes the same way:
 //!
 //! - [`Scale`]: value ↔ pixel along one axis (linear, log, or a custom warp
-//!   such as the waterfall's frequency axis), with "nice" tick values.
+//!   such as a knee-warped frequency axis), with "nice" tick values.
 //! - [`Axis`]: faint technical tick marks glued to one edge of the graph,
 //!   optional grid lines, and small monospace labels inside the plot.
 //! - [`Lanes`]: stacks labels into rows so neighbours don't overlap.
@@ -79,6 +79,7 @@ enum Kind {
     Linear,
     Log,
     /// Monotonic forward / inverse warp; linear in warped units.
+    #[allow(dead_code)] // toolkit
     Warp(fn(f32) -> f32, fn(f32) -> f32),
 }
 
@@ -137,6 +138,7 @@ impl Scale {
 
     /// Linear in `fwd(value)`; `inv` undoes `fwd`. Ticks are picked like a
     /// log axis (1-2-5 per decade, thinned to fit).
+    #[allow(dead_code)] // toolkit
     pub fn warped(fwd: fn(f32) -> f32, inv: fn(f32) -> f32, values: (f32, f32), px: (f32, f32)) -> Self {
         Self::new(Kind::Warp(fwd, inv), values, px)
     }

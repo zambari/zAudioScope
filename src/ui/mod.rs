@@ -1,8 +1,11 @@
 pub mod handle;
 pub mod infobox;
 pub mod meter;
+pub mod noterange;
+pub mod notestyle;
 pub mod plot;
 pub mod theme;
+pub mod widgets;
 
 use egui::{Color32, Sense, Stroke, Ui};
 
@@ -35,7 +38,7 @@ pub fn module_row(ui: &mut Ui, module: &mut dyn Module, open: &mut bool, shared:
             |ui| {
                 ui.set_width(PARAMS_W);
                 ui.set_min_height(graph_h);
-                module.params(ui);
+                ui.push_id("params", |ui| module.params(ui, shared));
             },
         );
         let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), graph_h), Sense::hover());

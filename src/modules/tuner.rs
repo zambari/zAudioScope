@@ -1,8 +1,8 @@
 //! Pitch detector / tuner, drawn as a spectral view over the note range.
 //!
 //! - A constant-Q style spectrum (one windowed DFT per display point, on a
-//!   decimated copy of the input) spans the three octaves of note toggles,
-//!   with a faint semitone grid behind it.
+//!   decimated copy of the input) spans the shared note range (the bar
+//!   above the status bar), with a faint semitone grid behind it.
 //! - Autocorrelation (NSDF) candidates are overlaid as vertical lines with
 //!   note name and clarity; they fade in and out with confidence and level.
 //! - When the pick is clearly periodic, the snapped note and the "tune up /
@@ -15,11 +15,14 @@ use egui::{Align2, Color32, FontId, Mesh, Pos2, Rect, Shape, Stroke, Ui, pos2, v
 
 use super::{Module, Shared};
 use crate::pitch::{self, Method};
+use crate::ui::noterange::NoteRange;
 use crate::ui::plot::{Axis, Edge, Lanes, Scale};
 use crate::ui::theme;
+use crate::ui::widgets::{Foldout, RangeSlider};
 
-const OCTAVES: usize = 3;
-const NOTES: usize = 12 * OCTAVES;
+/// Spectrum view level limits and the smallest floor-to-ceiling span, dB.
+const DB_BOUNDS: (f32, f32) = (-140.0, 6.0);
+const DB_MIN_GAP: f32 = 12.0;
 /// Spectrum points per semitone.
 const STEPS: usize = 12;
 /// Free-running: one analysis per this much new audio.
@@ -41,6 +44,9 @@ const WEIGHT_TAU: f32 = 1.0;
 const SHOW_WEIGHT: f32 = 0.2;
 /// The pick must be at least this clear for the note readout to show.
 const SURE: f32 = 0.8;
+/// A non-picked candidate whose spectrum is this far below the spectral
+/// peak is a period-multiple (subharmonic) ghost of the autocorrelation.
+const GHOST_DB: f32 = 24.0;
 
 /// The persisted settings.
 #[derive(Serialize, Deserialize)]
@@ -53,16 +59,23 @@ struct Params {
     /// Device tune-control units per semitone; calibrate against the
     /// outboard gear ("0.06 per ~6 cents" → 1.0).
     units_per_semitone: f32,
-    /// MIDI note of the lowest toggle (C1 = 24).
-    base_midi: i32,
-    /// One per note from `base_midi`, `NOTES` long.
-    enabled: Vec<bool>,
+    /// Snap-target toggles, indexed by MIDI note, 128 long.
+    notes: Vec<bool>,
     /// Analysis window: longer resolves low notes better, shorter responds faster.
     window_ms: f32,
-    /// Top of the spectrum view (fixed, no auto-follow).
+    /// Bottom and top of the spectrum view (fixed, no auto-follow).
+    floor_db: f32,
+    ceil_db: f32,
+    /// Legacy top / span pair, read once and migrated to floor / ceiling.
+    #[serde(skip_serializing)]
     top_db: f32,
-    /// Vertical span of the spectrum below its top.
+    #[serde(skip_serializing)]
     range_db: f32,
+    /// Legacy (fixed three-octave range), read once and migrated.
+    #[serde(skip_serializing)]
+    base_midi: i32,
+    #[serde(skip_serializing)]
+    enabled: Vec<bool>,
 }
 
 impl Default for Params {
@@ -72,11 +85,14 @@ impl Default for Params {
             smoothing: 0.8,
             a4: 440.0,
             units_per_semitone: 1.0,
-            base_midi: 24,
-            enabled: vec![false; NOTES],
+            notes: vec![false; 128],
             window_ms: 300.0,
-            top_db: -48.0,
-            range_db: 60.0,
+            floor_db: -108.0,
+            ceil_db: -48.0,
+            top_db: f32::NAN,
+            range_db: f32::NAN,
+            base_midi: -1,
+            enabled: Vec::new(),
         }
     }
 }
@@ -87,17 +103,25 @@ impl Params {
         self.smoothing = self.smoothing.clamp(0.0, 0.98);
         self.a4 = self.a4.clamp(415.0, 466.0);
         self.units_per_semitone = self.units_per_semitone.clamp(0.01, 10.0);
-        self.base_midi = self.base_midi.clamp(12, 84);
-        self.enabled.resize(NOTES, false);
+        self.notes.resize(128, false);
+        if self.base_midi >= 0 {
+            let base = self.base_midi.clamp(0, 127);
+            for (i, &on) in self.enabled.iter().enumerate() {
+                if let Some(n) = self.notes.get_mut(base as usize + i) {
+                    *n = on;
+                }
+            }
+            self.base_midi = -1;
+            self.enabled.clear();
+        }
         self.window_ms = self.window_ms.clamp(60.0, 1000.0);
-        self.top_db = self.top_db.clamp(-90.0, 6.0);
-        self.range_db = self.range_db.clamp(24.0, 96.0);
-    }
-
-    /// Displayed range in fractional MIDI notes: half a semitone either side
-    /// of the toggled notes.
-    fn span(&self) -> (f32, f32) {
-        (self.base_midi as f32 - 0.5, (self.base_midi + NOTES as i32) as f32 - 0.5)
+        if self.top_db.is_finite() && self.range_db.is_finite() {
+            self.ceil_db = self.top_db;
+            self.floor_db = self.top_db - self.range_db;
+            (self.top_db, self.range_db) = (f32::NAN, f32::NAN);
+        }
+        self.floor_db = self.floor_db.clamp(DB_BOUNDS.0, DB_BOUNDS.1 - DB_MIN_GAP);
+        self.ceil_db = self.ceil_db.clamp(self.floor_db + DB_MIN_GAP, DB_BOUNDS.1);
     }
 }
 
@@ -187,6 +211,8 @@ struct Track {
 pub struct Tuner {
     p: Params,
     decim: Option<Decimator>,
+    /// The note range the latest analysis (`spec_target`, `raw`) covers.
+    analysed: NoteRange,
     /// Latest analysis.
     spec_target: Vec<f32>,
     /// (midi, clarity, is the pick)
@@ -208,22 +234,31 @@ pub struct Tuner {
 
 impl Tuner {
     fn enabled_notes(&self) -> Vec<i32> {
-        let on: Vec<i32> =
-            (0..self.p.enabled.len()).filter(|&i| self.p.enabled[i]).map(|i| self.p.base_midi + i as i32).collect();
+        let on: Vec<i32> = self.analysed.notes().filter(|&m| self.is_enabled(m)).collect();
         if on.is_empty() { (0..128).collect() } else { on }
     }
 
     fn is_enabled(&self, midi: i32) -> bool {
-        let i = midi - self.p.base_midi;
-        i >= 0 && (i as usize) < NOTES && self.p.enabled[i as usize]
+        (0..128).contains(&midi) && self.p.notes[midi as usize]
+    }
+
+    /// Spectrum level (dB) within half a semitone of `midi`.
+    fn spec_level(&self, midi: f32) -> f32 {
+        let (lo, hi) = self.analysed.span();
+        let n = self.spec_target.len();
+        if n < 2 {
+            return spectrum_floor();
+        }
+        let k = |m: f32| ((m - lo) / (hi - lo) * (n - 1) as f32).round().clamp(0.0, (n - 1) as f32) as usize;
+        self.spec_target[k(midi - 0.5)..=k(midi + 0.5)].iter().copied().fold(spectrum_floor(), f32::max)
     }
 
     /// Hann-windowed DFT magnitude (dB re full-scale sine) at each display
     /// point. Window length follows the frequency (up to `MAX_CYCLES`
     /// periods), capped by what's available.
     fn spectrum(&self, y: &[f32], rate: u32) -> Vec<f32> {
-        let (lo, hi) = self.p.span();
-        let points = NOTES * STEPS + 1;
+        let (lo, hi) = self.analysed.span();
+        let points = self.analysed.count() * STEPS + 1;
         (0..points)
             .map(|k| {
                 let m = lo + (hi - lo) * k as f32 / (points - 1) as f32;
@@ -304,12 +339,14 @@ impl Module for Tuner {
                 }
             }
         };
-        if self.last == Some(key) && !shared.reset {
+        let range = shared.range.get();
+        if self.last == Some(key) && !shared.reset && range == self.analysed {
             return;
         }
         self.last = Some(key);
+        self.analysed = range;
 
-        let (lo, hi) = self.p.span();
+        let (lo, hi) = range.span();
         let (f_lo, f_hi) = (pitch::midi_to_freq(lo - 0.5, self.p.a4), pitch::midi_to_freq(hi + 0.5, self.p.a4));
         if !self.decim.as_ref().is_some_and(|d| d.rate == rate && d.factor == Decimator::factor_for(rate, f_hi)) {
             self.decim = Some(Decimator::new(rate, f_hi));
@@ -326,12 +363,16 @@ impl Module for Tuner {
         self.spec_target = self.spectrum(y, r);
 
         let c = pitch::candidates(y, r, f_lo, f_hi);
+        let peak_db = self.spec_target.iter().copied().fold(spectrum_floor(), f32::max);
         let mut raw: Vec<(f32, f32, bool)> = c
             .list
             .iter()
             .enumerate()
             .map(|(i, k)| (pitch::freq_to_midi(k.freq, self.p.a4), k.clarity, c.pick == Some(i)))
             .filter(|&(m, cl, _)| cl >= MIN_CLARITY && m >= lo - 0.5 && m <= hi + 0.5)
+            // NSDF also peaks at 2T, 3T… of the true period: lines with no
+            // spectral energy under them are those subharmonic ghosts.
+            .filter(|&(m, _, pick)| pick || self.spec_level(m) >= peak_db - GHOST_DB)
             .collect();
         raw.sort_by(|a, b| b.2.cmp(&a.2).then(b.1.total_cmp(&a.1)));
         raw.truncate(MAX_CANDIDATES);
@@ -346,7 +387,13 @@ impl Module for Tuner {
         };
     }
 
-    fn params(&mut self, ui: &mut Ui) {
+    fn marks(&self, out: &mut Vec<f32>) {
+        if let (Some(m), true) = (self.midi, self.pick_clarity >= SURE) {
+            out.push(m);
+        }
+    }
+
+    fn params(&mut self, ui: &mut Ui, shared: &Shared) {
         egui::ComboBox::from_id_salt("tuner_method").selected_text(self.p.method.label()).show_ui(ui, |ui| {
             for m in Method::ALL {
                 ui.selectable_value(&mut self.p.method, m, m.label());
@@ -354,46 +401,41 @@ impl Module for Tuner {
         });
         ui.add(egui::Slider::new(&mut self.p.smoothing, 0.0..=0.98).text("smoothing"));
         ui.add(egui::Slider::new(&mut self.p.window_ms, 60.0..=1000.0).logarithmic(true).suffix(" ms").text("window"));
-        ui.add(egui::Slider::new(&mut self.p.top_db, -90.0..=6.0).suffix(" dB").text("top"));
-        ui.add(egui::Slider::new(&mut self.p.range_db, 24.0..=96.0).suffix(" dB").text("range"));
+        ui.add(RangeSlider::new(&mut self.p.floor_db, &mut self.p.ceil_db, DB_BOUNDS.0..=DB_BOUNDS.1).min_gap(DB_MIN_GAP).text("dB"));
         ui.add(egui::Slider::new(&mut self.p.a4, 415.0..=466.0).text("A4 Hz"));
         ui.add(egui::Slider::new(&mut self.p.units_per_semitone, 0.01..=10.0).logarithmic(true).text("units/semi"));
-        ui.horizontal(|ui| {
-            ui.label("from");
-            if ui.small_button("−").clicked() {
-                self.p.base_midi = (self.p.base_midi - 12).max(12);
+        let NoteRange { lo, hi } = shared.range.get();
+        let count = (lo..=hi).filter(|&m| self.is_enabled(m)).count();
+        let summary = if count == 0 { "any semitone".to_owned() } else { format!("{count} toggled notes") };
+        Foldout::new("snap", "snap to").summary(summary).show(ui, |ui| {
+            if ui.add_enabled(count > 0, egui::Button::new("none").small()).on_hover_text("Clear all note toggles").clicked() {
+                self.p.notes.fill(false);
             }
-            ui.label(pitch::note_name(self.p.base_midi));
-            if ui.small_button("+").clicked() {
-                self.p.base_midi = (self.p.base_midi + 12).min(84);
-            }
-            if ui.small_button("none").clicked() {
-                self.p.enabled.fill(false);
+            // One row per octave in range, one tiny toggle per note.
+            ui.spacing_mut().item_spacing = vec2(1.0, 1.0);
+            for oct in lo.div_euclid(12)..=hi.div_euclid(12) {
+                ui.horizontal(|ui| {
+                    ui.add_sized(vec2(14.0, 15.0), egui::Label::new(egui::RichText::new(format!("{}", oct - 1)).size(9.0).weak()));
+                    for n in 0..12 {
+                        let m = oct * 12 + n;
+                        let label = egui::RichText::new(pitch::NOTE_NAMES[n as usize]).size(9.0);
+                        let b = egui::Button::selectable(self.is_enabled(m), label).min_size(vec2(17.0, 15.0));
+                        if ui.add_enabled(m >= lo && m <= hi, b).on_hover_text(pitch::note_name(m)).clicked() {
+                            self.p.notes[m as usize] = !self.p.notes[m as usize];
+                        }
+                    }
+                });
             }
         });
-        // One row per octave, one tiny toggle per note.
-        ui.spacing_mut().item_spacing = vec2(1.0, 1.0);
-        for oct in 0..OCTAVES {
-            ui.horizontal(|ui| {
-                for n in 0..12 {
-                    let i = oct * 12 + n;
-                    let name = pitch::NOTE_NAMES[n];
-                    let label = egui::RichText::new(name).size(9.0);
-                    let b = egui::Button::selectable(self.p.enabled[i], label).min_size(vec2(17.0, 15.0));
-                    if ui.add(b).on_hover_text(pitch::note_name(self.p.base_midi + i as i32)).clicked() {
-                        self.p.enabled[i] = !self.p.enabled[i];
-                    }
-                }
-            });
-        }
     }
 
-    fn graph(&mut self, ui: &mut Ui, rect: Rect, _shared: &Shared) {
+    fn graph(&mut self, ui: &mut Ui, rect: Rect, shared: &Shared) {
         let dt = ui.input(|i| i.stable_dt).clamp(0.0, 0.1);
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
 
-        let (lo, hi) = self.p.span();
+        let range = shared.range.get();
+        let (lo, hi) = range.span();
         let label_h = 13.0;
         let plot = Rect::from_min_max(pos2(rect.left(), rect.top() + 2.0 * label_h + 2.0), pos2(rect.right(), rect.bottom() - label_h));
         let x_of = |m: f32| rect.left() + (m - lo) / (hi - lo) * rect.width();
@@ -495,8 +537,7 @@ impl Module for Tuner {
 
         // ---- grid ---------------------------------------------------------
         let target = pitch::snap(self.shown_midi, self.enabled_notes());
-        for i in 0..NOTES {
-            let m = self.p.base_midi + i as i32;
+        for m in range.notes() {
             let x = x_of(m as f32);
             let n = m.rem_euclid(12) as usize;
             let sharp = pitch::NOTE_NAMES[n].len() > 1;
@@ -527,8 +568,7 @@ impl Module for Tuner {
                 painter.text(pos2(x, rect.bottom() - 1.0), Align2::CENTER_BOTTOM, text, small.clone(), c);
             }
         }
-        let top_db = self.p.top_db;
-        let bottom_db = top_db - self.p.range_db;
+        let (bottom_db, top_db) = (self.p.floor_db, self.p.ceil_db);
         let db_scale = Scale::linear((bottom_db, top_db), (plot.bottom(), plot.top()));
         let y_of = |db: f32| db_scale.px(db.clamp(bottom_db, top_db));
         Axis::new(Edge::Left, db_scale).spacing(28.0).minor(false).draw(&painter, plot, |db| format!("{db:.0}"));
@@ -542,6 +582,9 @@ impl Module for Tuner {
 
         // ---- spectrum -----------------------------------------------------
         if self.spec.len() > 1 {
+            // Placed by the range it was analysed over (the bar may have
+            // just moved).
+            let (lo, hi) = self.analysed.span();
             let count = self.spec.len();
             let pts: Vec<Pos2> = self
                 .spec
@@ -577,7 +620,7 @@ impl Module for Tuner {
                 continue;
             }
             let x = x_of(t.midi);
-            let base = lerp_color(Color32::from_rgb(196, 176, 150), theme::ACCENT_BRIGHT, t.primary);
+            let base = theme::lerp(Color32::from_rgb(196, 176, 150), theme::ACCENT_BRIGHT, t.primary);
             let col = base.gamma_multiply(t.alpha);
             painter.vline(x, plot.y_range(), Stroke::new(1.0 + 0.8 * t.primary, col));
             let text = format!("{} {:.0}%", pitch::note_name(t.midi.round() as i32), t.clarity * 100.0);
@@ -620,12 +663,6 @@ impl Module for Tuner {
             painter.circle_filled(pos2(mx, strip.center().y), 3.0, col);
         }
     }
-}
-
-fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
-    let t = t.clamp(0.0, 1.0);
-    let c = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t) as u8;
-    Color32::from_rgb(c(a.r(), b.r()), c(a.g(), b.g()), c(a.b(), b.b()))
 }
 
 #[cfg(test)]

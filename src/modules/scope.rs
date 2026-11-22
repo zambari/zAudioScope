@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use egui::{Align2, Color32, Pos2, Rect, Sense, Stroke, Ui};
 
 use super::{Gate, Module, Shared};
+use crate::audio::loudness;
 use crate::ui::handle::EdgeHandle;
 use crate::ui::plot::{self, Axis, Edge, Link, Scale};
 use crate::ui::theme;
@@ -145,7 +146,7 @@ impl Module for Scope {
         }
     }
 
-    fn params(&mut self, ui: &mut Ui) {
+    fn params(&mut self, ui: &mut Ui, _shared: &Shared) {
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.p.mode, Mode::Trigger, "Trigger");
             ui.selectable_value(&mut self.p.mode, Mode::Free, "Free");
@@ -204,7 +205,7 @@ impl Module for Scope {
             }
         }
         Axis::new(Edge::Bottom, xs).draw(&painter, rect, plot::fmt_ms);
-        Axis::new(Edge::Left, amp).spacing(36.0).draw(&painter, rect, plot::trim);
+        draw_db_axis(&painter, rect, &amp, self.p.gain);
         painter.hline(rect.x_range(), rect.center().y, Stroke::new(1.0, Color32::from_gray(40)));
 
         // Min/max per pixel column.
@@ -267,6 +268,14 @@ impl Module for Scope {
         };
         plot::caption(&painter, rect, Align2::RIGHT_TOP, caption);
 
+        // Peak and loudness of what's on screen.
+        let settle = f.ms_to_samples(100.0);
+        if let Some((peak, lufs)) = loudness::measure(&f.samples, f.rate, lo, lo + view, settle) {
+            let fmt = |v: f32| if v.is_finite() { format!("{v:.1}") } else { "-inf".to_owned() };
+            let text = format!("peak {} dBFS · {} LUFS · zoom ×{}", fmt(loudness::db(peak)), fmt(lufs), plot::trim(self.p.gain));
+            plot::caption(&painter, rect, Align2::CENTER_TOP, text);
+        }
+
         match self.link.shown() {
             Some(Key::View) => self.link.point_x(ui, rect, rect.right() - 1.0),
             Some(Key::Threshold) => self.link.point_y(ui, rect, amp.px(self.p.threshold)),
@@ -275,5 +284,35 @@ impl Module for Scope {
             Some(Key::To) => self.link.point_x(ui, rect, x_of_ms(self.p.win_end_ms)),
             None => {}
         }
+    }
+}
+
+/// Left-edge amplitude ticks labelled in dBFS. The trace stays linear, so
+/// the ticks bunch towards the centre line; ones too close to a kept one
+/// are dropped. Labels go on the upper half, ticks on both.
+fn draw_db_axis(painter: &egui::Painter, rect: Rect, amp: &Scale, gain: f32) {
+    const DBS: [f32; 15] = [0.0, -3.0, -6.0, -9.0, -12.0, -18.0, -24.0, -30.0, -36.0, -42.0, -48.0, -54.0, -60.0, -72.0, -84.0];
+    const MIN_GAP: f32 = 14.0;
+    let top = 1.0 / gain;
+    let mut kept: Vec<f32> = Vec::new();
+    for db in DBS {
+        let v = 10f32.powf(db / 20.0);
+        if v > top * 1.0001 {
+            continue;
+        }
+        let y = amp.px(v);
+        if (rect.center().y - y) < MIN_GAP || kept.iter().any(|&k| (k - y).abs() < MIN_GAP) {
+            continue;
+        }
+        kept.push(y);
+        let y_neg = amp.px(-v);
+        for yy in [y, y_neg] {
+            painter.hline(rect.x_range(), yy, Stroke::new(1.0, plot::GRID));
+            painter.line_segment([egui::pos2(rect.left(), yy), egui::pos2(rect.left() + 5.0, yy)], Stroke::new(1.0, plot::TICK));
+        }
+        let unit = if kept.len() == 1 { " dBFS" } else { "" };
+        let g = painter.layout_no_wrap(format!("{db:.0}{unit}"), plot::font(), plot::LABEL);
+        let ty = if y - g.size().y < rect.top() + 1.0 { y + 1.0 } else { y - g.size().y };
+        painter.galley(egui::pos2(rect.left() + 7.0, ty), g, plot::LABEL);
     }
 }
