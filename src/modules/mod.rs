@@ -26,6 +26,7 @@ mod note_input;
 pub mod note_clock;
 pub mod note_spectrum;
 mod perf;
+mod radial_spectrum;
 pub mod scope;
 mod spectrum_rows;
 pub mod tuner;

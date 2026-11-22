@@ -49,6 +49,8 @@ pub struct Layout {
     pub hi: i32,
     /// Radius of the innermost ring / spiral start, 0..1.
     pub inner: f32,
+    /// Extra rotation of the whole dial, radians, clockwise.
+    pub turn: f32,
 }
 
 impl Default for Layout {
@@ -62,6 +64,7 @@ impl Default for Layout {
             lo: 36,
             hi: 83,
             inner: 0.35,
+            turn: 0.0,
         }
     }
 }
@@ -93,7 +96,7 @@ impl Layout {
     /// Angle of pitch class `pc`, radians from north (signed by direction).
     pub fn angle(&self, pc: i32) -> f32 {
         let a = self.step(pc) as f32 / 12.0 * TAU;
-        if self.clockwise { a } else { -a }
+        (if self.clockwise { a } else { -a }) + self.turn
     }
 
     /// Octave index of `key`; octaves begin at the pitch class at north.
@@ -136,6 +139,24 @@ impl Layout {
             radius,
             depth,
         }
+    }
+
+    /// Spot of a fractional key: the nearest key's spot, nudged by the
+    /// remainder (±½ semitone) along the dial. Chromatic order makes this
+    /// continuous; in fifths each key gets its own ±½-step wedge. On a spiral
+    /// the radius climbs with it; rings keep the key's ring.
+    pub fn place_f(&self, m: f32) -> Spot {
+        let key = m.round() as i32;
+        let d = m - key as f32;
+        let mut s = self.place(key);
+        let step = TAU / 12.0 * d;
+        s.angle += if self.clockwise { step } else { -step };
+        s.depth += d / 12.0;
+        if self.radial == Radial::Spiral {
+            let dr = (1.0 - self.inner) / (self.octaves() as f32 - 1.0 / 12.0) * d / 12.0;
+            s.radius += if self.invert { -dr } else { dr };
+        }
+        s
     }
 }
 
@@ -204,6 +225,20 @@ mod tests {
         assert_eq!(l.place(36).radius, l.inner);
         assert_eq!(l.place(47).radius, l.inner);
         assert_eq!(l.place(71).radius, 1.0);
+    }
+
+    #[test]
+    fn fractional_keys_are_continuous() {
+        for radial in [Radial::Single, Radial::Spiral] {
+            let l = Layout { radial, ..Default::default() };
+            for k in l.lo..l.hi {
+                let (a, b) = (l.place_f(k as f32 + 0.4999), l.place_f(k as f32 + 0.5001));
+                let da = (a.angle - b.angle).rem_euclid(TAU);
+                assert!(da.min(TAU - da) < 1e-3);
+                assert!((a.radius - b.radius).abs() < 1e-3);
+                assert_eq!(l.place_f(k as f32), l.place(k));
+            }
+        }
     }
 
     #[test]

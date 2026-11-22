@@ -273,7 +273,10 @@ impl Workspace {
                                     if !slot.visible {
                                         ui.set_opacity(0.4);
                                     }
-                                    ui.push_id("params", |ui| slot.module.params(ui, shared));
+                                    // Dim fills; the dB range opts back into ACCENT.
+                                    theme::with_fill(ui, theme::ACCENT_DIM, |ui| {
+                                        ui.push_id("params", |ui| slot.module.params(ui, shared))
+                                    });
                                 });
                             });
                             if !slot.visible {
@@ -352,7 +355,8 @@ impl Workspace {
             let painter = ui.painter().with_clip_rect(area.intersect(ui.clip_rect()));
             let stroke = Stroke::new(1.0, theme::ACCENT_BRIGHT.gamma_multiply(0.35));
             // A parameter guide shares this route; pause ours so they don't overlap.
-            if !plot::links_pending(ui) {
+            // Only the stack needs the leader: solo and composite show one display.
+            if current == Tab::Stack && !plot::links_pending(ui) {
                 painter.extend(egui::Shape::dashed_line(&points, stroke, 5.0, 4.0));
             }
             theme::selected_edge(&painter, panel.left(), panel.y_range());
@@ -783,9 +787,14 @@ impl Workspace {
                     fill.gamma_multiply(0.5)
                 },
             );
+            // Open stack panels float their header as a corner badge over the
+            // graph instead of spending a whole row on it.
+            let badge = stack && slot.visible;
             // At the minimum window height, use an overlaid title so the
             // axes still have room even with every analyzer visible.
-            let header = if !slot.visible || height >= DISPLAY_MIN {
+            let header = if badge {
+                0.0
+            } else if !slot.visible || height >= DISPLAY_MIN {
                 HEADER
             } else {
                 0.0
@@ -811,9 +820,22 @@ impl Workspace {
                 None => title.to_owned(),
             };
             let color = ui.visuals().weak_text_color();
-            let strip = if header > 0.0 {
-                let strip = rect.with_max_y(rect.top() + HEADER);
+            let strip = if header > 0.0 || badge {
                 let font = FontId::proportional(11.0);
+                let strip = if badge {
+                    // Arrow + name, sized to the text, on a translucent backdrop.
+                    let width = pane
+                        .painter()
+                        .layout_no_wrap(name.clone(), font.clone(), color)
+                        .size()
+                        .x;
+                    let strip = Rect::from_min_size(rect.min, vec2(22.0 + width + 8.0, HEADER));
+                    pane.painter()
+                        .rect_filled(strip, 2.0, fill.gamma_multiply(0.75));
+                    strip
+                } else {
+                    rect.with_max_y(rect.top() + HEADER)
+                };
                 let mut text_x = 8.0;
                 if stack {
                     icons::disclosure(

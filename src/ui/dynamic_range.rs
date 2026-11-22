@@ -14,7 +14,7 @@ use std::cell::Cell;
 use egui::{Rect, Response, Sense, Ui, vec2};
 use serde::{Deserialize, Serialize};
 
-use super::theme::{VU_CLIP, WAVE};
+use super::theme::{self, VU_CLIP, WAVE};
 use super::widgets::RangeSlider;
 use crate::audio::Frame;
 use crate::audio::levels::LevelDist;
@@ -138,11 +138,13 @@ impl DynamicRange {
                 }
                 self.sync(hub);
                 let DbRange { floor, ceil } = &mut self.range;
-                let r = ui.add(
-                    RangeSlider::new(floor, ceil, BOUNDS.0..=BOUNDS.1)
-                        .min_gap(MIN_GAP)
-                        .text("dB"),
-                );
+                let r = theme::with_fill(ui, theme::ACCENT, |ui| {
+                    ui.add(
+                        RangeSlider::new(floor, ceil, BOUNDS.0..=BOUNDS.1)
+                            .min_gap(MIN_GAP)
+                            .text("dB"),
+                    )
+                });
                 if self.locked {
                     hub.set(self.range);
                 }

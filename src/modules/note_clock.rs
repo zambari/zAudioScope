@@ -5,7 +5,8 @@
 //! bright, released ones fading, often-played ones keeping a warm glow.
 //!
 //! One list of `(spot, level, held, colour)` feeds every style (LEDs,
-//! segments, ticks, chord polygon), so switching styles is instant. The
+//! segments, ticks, lines), so switching styles is instant. Lines (a chord
+//! polygon, or radial spokes) fade in and out with their own attack/release. The
 //! appearance lives in a "Controls" popup on the display (and in the
 //! inspector); everything is persisted.
 
@@ -17,6 +18,7 @@ use egui::{
 };
 use serde::{Deserialize, Serialize};
 
+use super::radial_spectrum::{self, RadialSpectrum};
 use super::{Module, Shared};
 use crate::pitch;
 use crate::ui::keyglow::{KeyGlow, Timing};
@@ -27,6 +29,36 @@ use crate::ui::widgets;
 pub const TITLE: &str = "Note Clock";
 /// Height of the strip holding the Controls button.
 const BAR_H: f32 = 22.0;
+/// Seconds per turn at full auto-rotation.
+const SPIN_PERIOD_S: f32 = 12.0;
+/// Link end standing for the dial's centre (radial lines).
+const CENTER: i32 = -1;
+/// Computer keys that play the chromatic octave on this page, C upwards:
+/// Z S X D C V G B H N J M, as on a piano keyboard.
+const KEYBOARD: [egui::Key; 12] = [
+    egui::Key::Z,
+    egui::Key::S,
+    egui::Key::X,
+    egui::Key::D,
+    egui::Key::C,
+    egui::Key::V,
+    egui::Key::G,
+    egui::Key::B,
+    egui::Key::H,
+    egui::Key::N,
+    egui::Key::J,
+    egui::Key::M,
+];
+
+/// One line between two notes (or the centre and a note), fading in while
+/// its notes are held and out after.
+struct Link {
+    /// Shown keys, `a < b`; `a` may be [`CENTER`].
+    a: i32,
+    b: i32,
+    on: bool,
+    level: f32,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum Style {
@@ -43,7 +75,7 @@ impl Style {
             Style::Leds => "LEDs",
             Style::Segments => "segments",
             Style::Ticks => "ticks",
-            Style::Chord => "chord polygon",
+            Style::Chord => "lines only",
         }
     }
 }
@@ -66,6 +98,28 @@ impl Hue {
     }
 }
 
+/// How the held notes are joined.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum Lines {
+    /// Neighbours round the dial: a chord becomes an outline.
+    Polygon,
+    /// As `Polygon`, with the shape filled (single ring only).
+    Filled,
+    /// A spoke from the centre to each note.
+    Radial,
+}
+
+impl Lines {
+    const ALL: [Lines; 3] = [Lines::Polygon, Lines::Filled, Lines::Radial];
+    fn label(self) -> &'static str {
+        match self {
+            Lines::Polygon => "polygon",
+            Lines::Filled => "filled polygon",
+            Lines::Radial => "radial",
+        }
+    }
+}
+
 /// The persisted settings.
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
@@ -73,13 +127,20 @@ struct Params {
     style: Style,
     /// Ticks under the main style.
     ticks: bool,
-    /// Chord polygon over the main style.
+    /// Lines joining the held notes, over the main style.
     chord: bool,
+    lines: Lines,
+    /// Line fade-in / fade-out time constants, s.
+    line_attack_s: f32,
+    line_release_s: f32,
     radial: Radial,
     invert: bool,
     fifths: bool,
-    /// Pitch class at north.
+    /// Pitch class at north, semitones from C, -6..=6.
     offset: i32,
+    /// Auto-rotation, -2..=2; signed square sets the speed, 2 ≈ a turn per
+    /// `SPIN_PERIOD_S`. Positive turns clockwise.
+    spin: f32,
     clockwise: bool,
     /// Innermost ring radius, 0..1 of the face.
     inner: f32,
@@ -98,6 +159,12 @@ struct Params {
     follow_range: bool,
     low_octave: i32,
     octaves: i32,
+    /// Pitch classes ringed on the dial, C..B.
+    marked: [bool; 12],
+    /// Octave the computer keys start from (C of this octave, MIDI 12·(n+1)).
+    keys_octave: i32,
+    /// Audio spectrum wrapped round the dial.
+    spectrum: radial_spectrum::Params,
 }
 
 impl Default for Params {
@@ -106,10 +173,14 @@ impl Default for Params {
             style: Style::Leds,
             ticks: false,
             chord: false,
+            lines: Lines::Filled,
+            line_attack_s: 0.03,
+            line_release_s: 0.6,
             radial: Radial::Single,
             invert: false,
             fifths: false,
             offset: 0,
+            spin: 0.0,
             clockwise: true,
             inner: 0.35,
             led_size: 1.0,
@@ -122,13 +193,20 @@ impl Default for Params {
             follow_range: true,
             low_octave: 2,
             octaves: 3,
+            marked: [false; 12],
+            keys_octave: 4,
+            spectrum: Default::default(),
         }
     }
 }
 
 impl Params {
     fn sanitize(&mut self) {
-        self.offset = self.offset.rem_euclid(12);
+        // Older saves held 0..12.
+        self.offset = (self.offset + 6).rem_euclid(12) - 6;
+        self.spin = self.spin.clamp(-2.0, 2.0);
+        self.line_attack_s = self.line_attack_s.clamp(0.005, 2.0);
+        self.line_release_s = self.line_release_s.clamp(0.02, 8.0);
         self.inner = self.inner.clamp(0.0, 0.9);
         self.led_size = self.led_size.clamp(0.3, 3.0);
         self.skeleton = self.skeleton.clamp(0.0, 1.0);
@@ -137,6 +215,8 @@ impl Params {
         self.channel = self.channel.filter(|&c| c < 16);
         self.low_octave = self.low_octave.clamp(-1, 8);
         self.octaves = self.octaves.clamp(1, 8);
+        self.keys_octave = self.keys_octave.clamp(-1, 8);
+        self.spectrum.sanitize();
     }
 }
 
@@ -170,9 +250,57 @@ pub struct NoteClock {
     lit: bool,
     connected: bool,
     missing: bool,
+    /// Auto-rotation so far, radians.
+    turn: f32,
+    /// When the fades and rotation were last advanced, MIDI clock.
+    last_t: Option<f64>,
+    links: Vec<Link>,
+    spectrum: RadialSpectrum,
+    /// The note each computer key is sounding, by [`KEYBOARD`] slot.
+    keys_down: [Option<u8>; 12],
 }
 
 impl NoteClock {
+    /// Computer keys play notes while this page is on screen: a key down
+    /// sounds its note into the same glow as MIDI, and lifting it (or losing
+    /// focus, or typing into a field) ends it. Tracks key state rather than
+    /// events, so a page switch mid-hold cannot leave a note stuck.
+    fn play_keys(&mut self, ui: &Ui) {
+        let (focused, mods, down) = ui.input(|i| {
+            (i.focused, i.modifiers, KEYBOARD.map(|k| i.key_down(k)))
+        });
+        let playable = focused
+            && !ui.ctx().text_edit_focused()
+            && !(mods.command || mods.ctrl || mods.alt);
+        let base = 12 * (self.p.keys_octave + 1);
+        let t = crate::midi::now();
+        for (slot, &pressed) in down.iter().enumerate() {
+            match (self.keys_down[slot], playable && pressed) {
+                (None, true) => {
+                    let note = (base + slot as i32) as u8;
+                    self.keys_down[slot] = Some(note);
+                    self.glow.note_on(note, t);
+                }
+                (Some(note), false) => {
+                    self.keys_down[slot] = None;
+                    self.glow.note_off(note, t);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Advance the auto-rotation; it returns to rest when the speed is 0.
+    fn spin(&mut self, dt: f32) {
+        let s = self.p.spin;
+        self.turn = if s == 0.0 {
+            0.0
+        } else {
+            let turns_per_s = s * s.abs() / 4.0 / SPIN_PERIOD_S;
+            (self.turn + turns_per_s * TAU * dt).rem_euclid(TAU)
+        };
+    }
+
     fn layout(&self, shared: &Shared) -> polar::Layout {
         let p = &self.p;
         let (lo, hi) = if p.follow_range {
@@ -191,6 +319,118 @@ impl NoteClock {
             lo: lo.clamp(0, 127),
             hi: hi.clamp(0, 127),
             inner: p.inner,
+            turn: self.turn,
+        }
+    }
+
+    /// Brightness and held state per shown key. Notes outside the range fold
+    /// by octaves onto its nearest key of the same pitch class, so nothing
+    /// played goes unseen.
+    fn folded(&self, l: &polar::Layout) -> ([f32; 128], [bool; 128]) {
+        let mut levels = [0.0f32; 128];
+        let mut helds = [false; 128];
+        for k in 0..128 {
+            if let Some(f) = fold(k, l.lo, l.hi) {
+                let f = f as usize;
+                levels[f] = levels[f].max(self.glow.level(k));
+                helds[f] |= self.glow.held(k);
+            }
+        }
+        (levels, helds)
+    }
+
+    /// Held keys, one per spot on the dial (a single ring folds octaves
+    /// together), in order round it.
+    fn held_points(&self, l: &polar::Layout) -> Vec<i32> {
+        let (_, held) = self.folded(l);
+        let top = if l.radial == Radial::Single { (l.lo + 11).min(l.hi) } else { l.hi };
+        let mut keys: Vec<i32> = (l.lo..=l.hi)
+            .filter(|&k| held[k as usize])
+            .filter_map(|k| fold(k, l.lo, top))
+            .collect();
+        let at = |k: &i32| {
+            let s = l.place(*k);
+            (s.angle.rem_euclid(TAU), s.radius)
+        };
+        keys.sort_by(|a, b| {
+            let (a, b) = (at(a), at(b));
+            a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1))
+        });
+        keys.dedup();
+        keys
+    }
+
+    /// Lines wanted now, as `(a, b)` with `a < b`.
+    fn wanted_links(&self, l: &polar::Layout) -> Vec<(i32, i32)> {
+        if !(self.p.chord || self.p.style == Style::Chord) {
+            return Vec::new();
+        }
+        let keys = self.held_points(l);
+        match self.p.lines {
+            Lines::Radial => keys.iter().map(|&k| (CENTER, k)).collect(),
+            Lines::Polygon | Lines::Filled => {
+                let n = keys.len();
+                let edges = match n {
+                    0 | 1 => 0,
+                    2 => 1,
+                    _ => n,
+                };
+                (0..edges)
+                    .map(|i| {
+                        let (a, b) = (keys[i], keys[(i + 1) % n]);
+                        (a.min(b), a.max(b))
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    /// Fade lines in towards `want` and out of everything else.
+    fn fade_links(&mut self, want: &[(i32, i32)], dt: f32) {
+        for link in &mut self.links {
+            link.on = want.contains(&(link.a, link.b));
+        }
+        for &(a, b) in want {
+            if !self.links.iter().any(|x| (x.a, x.b) == (a, b)) {
+                self.links.push(Link { a, b, on: true, level: 0.0 });
+            }
+        }
+        let (attack, release) = (self.p.line_attack_s, self.p.line_release_s);
+        for link in &mut self.links {
+            let (target, tau) = if link.on { (1.0, attack) } else { (0.0, release) };
+            link.level += (target - link.level) * (1.0 - (-dt / tau.max(1e-3)).exp());
+        }
+        self.links.retain(|x| x.on || x.level > 0.004);
+    }
+
+    /// The fading lines; a filled polygon on a single ring is also filled.
+    fn draw_links(&self, painter: &egui::Painter, l: &polar::Layout, c: Pos2, r: f32) {
+        let at = |k: i32| if k == CENTER { c } else { c + l.place(k).offset(r) };
+        if self.p.lines == Lines::Filled && l.radial == Radial::Single {
+            let pts: Vec<Pos2> = self.held_points(l).into_iter().map(at).collect();
+            let level = self
+                .links
+                .iter()
+                .filter(|x| x.on)
+                .map(|x| x.level)
+                .fold(1.0f32, f32::min);
+            if pts.len() >= 3 {
+                // Points on one circle sorted by angle form a convex polygon.
+                let fill = theme::ACCENT.gamma_multiply(0.25 * level);
+                painter.add(Shape::convex_polygon(pts, fill, Stroke::NONE));
+            }
+        }
+        for link in &self.links {
+            let color = if link.a == CENTER {
+                let spot = l.place(link.b);
+                theme::lerp(self.hue(l, link.b, &spot), theme::ON_ACCENT, 0.3)
+            } else {
+                theme::ON_ACCENT.gamma_multiply(0.85)
+            };
+            painter.line_segment(
+                [at(link.a), at(link.b)],
+                Stroke::new(2.0, color.gamma_multiply(link.level)),
+            );
         }
     }
 
@@ -224,14 +464,31 @@ impl NoteClock {
     }
 
     /// Every setting, for both the inspector and the Controls popup.
-    fn controls(&mut self, ui: &mut Ui) {
+    fn controls(&mut self, ui: &mut Ui, shared: &Shared) {
         let p = &mut self.p;
         widgets::choice(ui, "style", &mut p.style, &Style::ALL, |s| s.label().into());
         ui.horizontal(|ui| {
             ui.add_enabled(p.style != Style::Ticks, egui::Checkbox::new(&mut p.ticks, "ticks"))
                 .on_hover_text("Radial ticks under the main style");
-            ui.add_enabled(p.style != Style::Chord, egui::Checkbox::new(&mut p.chord, "chord"))
-                .on_hover_text("Join the held notes into a polygon");
+            ui.add_enabled(p.style != Style::Chord, egui::Checkbox::new(&mut p.chord, "lines"))
+                .on_hover_text("Join the held notes with lines");
+        });
+        ui.add_enabled_ui(p.chord || p.style == Style::Chord, |ui| {
+            widgets::choice(ui, "lines", &mut p.lines, &Lines::ALL, |x| x.label().into());
+            ui.add(
+                egui::Slider::new(&mut p.line_attack_s, 0.005..=2.0)
+                    .logarithmic(true)
+                    .suffix(" s")
+                    .text("line attack"),
+            )
+            .on_hover_text("Fade-in time when notes join");
+            ui.add(
+                egui::Slider::new(&mut p.line_release_s, 0.02..=8.0)
+                    .logarithmic(true)
+                    .suffix(" s")
+                    .text("line release"),
+            )
+            .on_hover_text("Fade-out time after a note off breaks the line");
         });
         widgets::choice(ui, "layout", &mut p.radial, &Radial::ALL, |r| r.label().into());
         ui.add_enabled_ui(p.radial != Radial::Single, |ui| {
@@ -245,11 +502,31 @@ impl NoteClock {
                 p.clockwise = !p.clockwise;
             }
         });
-        let names = |pc: i32| pitch::NOTE_NAMES[pc as usize].to_owned();
-        widgets::choice(ui, "at north", &mut p.offset, &(0..12).collect::<Vec<_>>(), names);
+        ui.add(
+            egui::Slider::new(&mut p.offset, -6..=6)
+                .custom_formatter(|v, _| {
+                    format!("{v:+} {}", pitch::NOTE_NAMES[(v as i32).rem_euclid(12) as usize])
+                })
+                .text("at north"),
+        )
+        .on_hover_text("Note at the top, in semitones from C");
+        ui.add(egui::Slider::new(&mut p.spin, -2.0..=2.0).text("auto-rotate"))
+            .on_hover_text("Rotation speed, squared; 0 stops and returns to rest");
         ui.add(egui::Slider::new(&mut p.led_size, 0.3..=3.0).text("LED size"));
         widgets::choice(ui, "colour", &mut p.hue, &Hue::ALL, |h| h.label().into());
         ui.checkbox(&mut p.labels, "note names");
+        ui.horizontal(|ui| {
+            ui.label("mark");
+            widgets::note_row(ui, 0, None, &mut p.marked, |_| true);
+            widgets::clear_notes(ui, &mut p.marked);
+        })
+        .response
+        .on_hover_text("Ring these notes on the dial");
+        ui.horizontal(|ui| {
+            ui.label("computer keys");
+            ui.add(egui::DragValue::new(&mut p.keys_octave).range(-1..=8).prefix("from C"))
+                .on_hover_text("On this page Z S X D C V G B H N J M play C to B from this octave");
+        });
         ui.add(egui::Slider::new(&mut p.skeleton, 0.0..=1.0).text("unlit dots"));
         ui.add(
             egui::Slider::new(&mut p.release, 0.2..=8.0)
@@ -263,10 +540,13 @@ impl NoteClock {
                 .suffix(" s")
                 .text("heat linger"),
         );
-        let channels: Vec<Option<u8>> = std::iter::once(None).chain((0..16).map(Some)).collect();
-        widgets::choice(ui, "MIDI channel", &mut p.channel, &channels, |c| {
-            c.map_or("all".into(), |c| format!("{}", c + 1))
-        });
+        // No open port, nothing to filter: the choice is kept for when it returns.
+        if shared.midi.connected {
+            let channels: Vec<Option<u8>> = std::iter::once(None).chain((0..16).map(Some)).collect();
+            widgets::choice(ui, "MIDI channel", &mut p.channel, &channels, |c| {
+                c.map_or("all".into(), |c| format!("{}", c + 1))
+            });
+        }
         ui.checkbox(&mut p.follow_range, "follow the shared note range");
         if !p.follow_range {
             ui.horizontal(|ui| {
@@ -275,11 +555,17 @@ impl NoteClock {
                 ui.add(egui::DragValue::new(&mut p.octaves).range(1..=8).suffix(" oct"));
             });
         }
+        self.spectrum.controls(&mut p.spectrum, ui, shared);
         p.sanitize();
     }
 
     fn paint(&mut self, ui: &mut Ui, rect: Rect, shared: &Shared) {
         let l = self.layout(shared);
+        if self.p.spectrum.enabled {
+            // Analysed here rather than in `update`: only while on screen.
+            let dt = ui.input(|i| i.stable_dt).clamp(0.0, 0.1);
+            self.spectrum.update(&mut self.p.spectrum, &l, shared, dt);
+        }
         let p = &self.p;
         let margin = if p.labels { 18.0 } else { 6.0 };
         let face = (rect.width().min(rect.height()) * 0.5 - margin).max(12.0);
@@ -289,10 +575,11 @@ impl NoteClock {
         let spacing = l.spacing() * r;
         let bg = ui.visuals().extreme_bg_color;
         let off = theme::lerp(bg, Color32::from_gray(95), p.skeleton);
+        let (levels, helds) = self.folded(&l);
         let lamps: Vec<Lamp> = (l.lo..=l.hi)
             .map(|key| {
                 let spot = l.place(key);
-                let (level, held) = (self.glow.level(key), self.glow.held(key));
+                let (level, held) = (levels[key as usize], helds[key as usize]);
                 let mut on = self.hue(&l, key, &spot);
                 if held {
                     on = theme::lerp(on, theme::ON_ACCENT, 0.3);
@@ -323,6 +610,9 @@ impl NoteClock {
             }
         }
 
+        if p.spectrum.enabled {
+            self.spectrum.paint(&painter, &p.spectrum, &l, c, r, |k, s| self.hue(&l, k, s));
+        }
         if p.ticks || p.style == Style::Ticks {
             let half = (spacing * 0.35).clamp(3.0, 14.0).max(led * 1.4);
             for m in &lamps {
@@ -331,6 +621,14 @@ impl NoteClock {
                     [m.pos - d, m.pos + d],
                     Stroke::new(1.0 + m.level, m.color()),
                 );
+            }
+        }
+        // Marked notes: a soft disc under the lamp, ringed.
+        if p.marked.contains(&true) {
+            let rad = (led * 2.2).max(7.0).max(if p.style == Style::Segments { spacing * 0.45 } else { 0.0 });
+            let ring = Stroke::new(1.5, theme::ON_ACCENT.gamma_multiply(0.35));
+            for m in lamps.iter().filter(|m| p.marked[m.key.rem_euclid(12) as usize]) {
+                painter.circle(m.pos, rad, theme::ON_ACCENT.gamma_multiply(0.08), ring);
             }
         }
         match p.style {
@@ -348,10 +646,8 @@ impl NoteClock {
                 }
             }
         }
+        self.draw_links(&painter, &l, c, r);
         let p = &self.p;
-        if p.chord || p.style == Style::Chord {
-            chord(&painter, &lamps, c, p.radial == Radial::Single);
-        }
 
         if p.labels {
             let font = FontId::proportional(10.0);
@@ -396,14 +692,25 @@ impl NoteClock {
                 painter.circle_filled(m.pos, led, m.color());
             }
             if m.level > 0.0 {
-                let [r, g, b, _] = m.on.gamma_multiply(m.level).to_array();
-                // Zero alpha in premultiplied colour blends additively.
-                let tint = Color32::from_rgba_premultiplied(r, g, b, 0);
+                let tint = theme::additive(m.on, m.level);
                 halos.add_rect_with_uv(Rect::from_center_size(m.pos, egui::Vec2::splat(led * 5.0)), uv, tint);
             }
         }
         painter.add(Shape::mesh(halos));
     }
+}
+
+/// `key` shifted by whole octaves into `lo..=hi`, or `None` when the range
+/// holds no key of that pitch class.
+fn fold(key: i32, lo: i32, hi: i32) -> Option<i32> {
+    let k = if key < lo {
+        key + 12 * (lo - key + 11).div_euclid(12)
+    } else if key > hi {
+        key - 12 * (key - hi + 11).div_euclid(12)
+    } else {
+        key
+    };
+    (lo..=hi).contains(&k).then_some(k)
 }
 
 /// Ring slices: one wedge per key, a twelfth of the turn wide (with a gap),
@@ -433,33 +740,6 @@ fn segments(painter: &egui::Painter, lamps: &[Lamp], c: Pos2, r: f32, spacing: f
     painter.add(Shape::mesh(mesh));
 }
 
-/// Lines joining the held notes in order round the dial: intervals become
-/// shapes (a major triad is the same triangle in any key).
-fn chord(painter: &egui::Painter, lamps: &[Lamp], c: Pos2, fill: bool) {
-    let mut pts: Vec<Pos2> = Vec::new();
-    for m in lamps.iter().filter(|m| m.held) {
-        if !pts.iter().any(|q| q.distance(m.pos) < 0.5) {
-            pts.push(m.pos);
-        }
-    }
-    let around = |q: &Pos2| (q.x - c.x).atan2(c.y - q.y).rem_euclid(TAU);
-    pts.sort_by(|a, b| around(a).total_cmp(&around(b)));
-    let stroke = Stroke::new(2.0, theme::ON_ACCENT.gamma_multiply(0.85));
-    match pts.len() {
-        0 | 1 => {}
-        2 => {
-            painter.line_segment([pts[0], pts[1]], stroke);
-        }
-        _ => {
-            // Points on one circle sorted by angle form a convex polygon.
-            if fill {
-                painter.add(Shape::convex_polygon(pts.clone(), theme::ACCENT.gamma_multiply(0.25), Stroke::NONE));
-            }
-            painter.add(Shape::closed_line(pts, stroke));
-        }
-    }
-}
-
 impl Module for NoteClock {
     fn title(&self) -> &'static str {
         TITLE
@@ -477,7 +757,7 @@ impl Module for NoteClock {
     }
 
     fn lookback(&self, _rate: u32) -> usize {
-        0
+        if self.p.spectrum.enabled { self.spectrum.need } else { 0 }
     }
 
     fn solo_only(&self) -> bool {
@@ -501,16 +781,24 @@ impl Module for NoteClock {
             heat_tau_s: self.p.linger_s,
         };
         self.lit = self.glow.update(midi, self.p.channel);
+        let now = crate::midi::now();
+        let dt = self.last_t.map_or(0.0, |t| (now - t).clamp(0.0, 0.25) as f32);
+        self.last_t = Some(now);
+        self.spin(dt);
+        let want = self.wanted_links(&self.layout(shared));
+        self.fade_links(&want, dt);
+        self.lit |= !self.links.is_empty();
     }
 
-    fn params(&mut self, ui: &mut Ui, _shared: &Shared) {
-        self.controls(ui);
+    fn params(&mut self, ui: &mut Ui, shared: &Shared) {
+        self.controls(ui, shared);
     }
 
     fn graph(&mut self, ui: &mut Ui, rect: Rect, shared: &Shared) {
-        if self.lit {
+        if self.lit || self.p.spin != 0.0 || self.p.spectrum.enabled {
             ui.ctx().request_repaint();
         }
+        self.play_keys(ui);
         self.paint(ui, rect, shared);
         let mut bar = ui.new_child(
             UiBuilder::new()
@@ -519,7 +807,7 @@ impl Module for NoteClock {
                 .layout(egui::Layout::right_to_left(Align::Center)),
         );
         widgets::popup_button(&mut bar, "Controls", "Note clock appearance", |ui| {
-            self.controls(ui)
+            self.controls(ui, shared)
         });
     }
 }

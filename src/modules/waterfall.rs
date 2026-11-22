@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 
 use egui::{Color32, ColorImage, Rect, TextureHandle, TextureOptions, Ui, pos2};
 
-use super::spectrum_rows::{BANDS, Key, Params, Rows, visible_bands};
+use super::spectrum_rows::{BANDS, Key, Palette, Params, Rows, visible_bands};
 use super::{Module, Shared};
 use crate::ui::plot::{self, Axis, Edge, Link, Scale};
 
@@ -18,8 +18,8 @@ pub struct Waterfall {
     rows: Rows,
     /// The rows as colours, made once per row instead of every frame.
     colored: VecDeque<Vec<Color32>>,
-    /// (floor, ceiling, rows) the colours and texture were made with.
-    colored_for: (f32, f32, usize),
+    /// (floor, ceiling, rows, palette) the colours and texture were made with.
+    colored_for: (f32, f32, usize, Palette),
     /// The texture is out of date.
     dirty: bool,
     texture: Option<TextureHandle>,
@@ -60,6 +60,13 @@ impl Module for Waterfall {
     }
 
     fn params(&mut self, ui: &mut Ui, shared: &Shared) {
+        egui::ComboBox::from_label("palette")
+            .selected_text(self.p.palette.name())
+            .show_ui(ui, |ui| {
+                for palette in Palette::ALL {
+                    ui.selectable_value(&mut self.p.palette, palette, palette.name());
+                }
+            });
         self.p.ui(ui, shared, &mut self.link);
     }
 
@@ -80,7 +87,12 @@ impl Waterfall {
     /// Bring the texture up to date with the rows and colour scale.
     fn refresh(&mut self, ui: &Ui) {
         // Colour scale changed: recolour what we have.
-        let key = (self.p.db.range.floor, self.p.db.range.ceil, self.p.rows);
+        let key = (
+            self.p.db.range.floor,
+            self.p.db.range.ceil,
+            self.p.rows,
+            self.p.palette,
+        );
         if self.colored_for != key {
             self.colored_for = key;
             self.colored = self

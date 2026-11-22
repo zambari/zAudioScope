@@ -12,7 +12,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use egui::{Color32, Ui};
+use egui::Ui;
 
 use crate::ui::theme;
 
@@ -107,11 +107,17 @@ pub struct MidiHub {
     frame: MidiFrame,
     /// Set by `disconnect`, reported in the next frame.
     dropped: bool,
+    /// The process' first CoreMIDI client, made on the UI thread: CoreMIDI
+    /// refreshes its device list through the run loop of the thread that
+    /// created the first client, and only the UI thread runs one. Made on
+    /// the watchdog thread instead, the list would never change.
+    _anchor: Option<midir::MidiInput>,
 }
 
 impl MidiHub {
     pub fn new(port: Option<String>) -> Self {
         now(); // start the clock
+        let _anchor = input("zAudioScope").ok(); // before the watchdog's first scan
         Self {
             port,
             ports: Vec::new(),
@@ -122,6 +128,7 @@ impl MidiHub {
             queue: Default::default(),
             frame: MidiFrame::default(),
             dropped: false,
+            _anchor,
         }
     }
 
@@ -231,8 +238,9 @@ impl MidiHub {
     pub fn picker(&mut self, ui: &mut Ui) {
         ui.label("MIDI in");
         let missing = self.missing();
-        let shown = match &self.port {
-            Some(name) if missing => egui::RichText::new(name).color(Color32::from_gray(100)),
+        // While the chosen device is away the input is effectively none; the
+        // name is kept so it reopens when the device returns.
+        let shown = match &self.connected {
             Some(name) => egui::RichText::new(name),
             None => egui::RichText::new("— none —"),
         };
@@ -242,7 +250,7 @@ impl MidiHub {
             .show_ui(ui, |ui| {
                 let mut pick = None;
                 if ui
-                    .selectable_label(self.port.is_none(), "— none —")
+                    .selectable_label(self.connected.is_none(), "— none —")
                     .clicked()
                 {
                     pick = Some(None);
@@ -251,7 +259,7 @@ impl MidiHub {
                 if let Some(name) = self.port.as_ref().filter(|_| missing) {
                     ui.add_enabled(
                         false,
-                        egui::Button::selectable(true, format!("{name} (not connected)")),
+                        egui::Button::selectable(false, format!("{name} (waiting for device)")),
                     );
                 }
                 for name in &self.ports {
@@ -264,10 +272,10 @@ impl MidiHub {
                 }
                 pick
             });
-        if missing {
+        if let Some(name) = self.port.as_ref().filter(|_| missing) {
             combo
                 .response
-                .on_hover_text("Device not connected; it reopens when it comes back");
+                .on_hover_text(format!("{name} is unplugged; it reopens when it comes back"));
         }
         if let Some(pick) = combo.inner.flatten() {
             self.select(pick);

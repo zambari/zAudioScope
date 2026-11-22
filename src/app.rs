@@ -261,23 +261,24 @@ impl App {
         ui.separator();
         ui.horizontal_wrapped(|ui| {
             self.midi.picker(ui);
-            ui.separator();
-            ui::monitor_bar::show(
-                ui,
-                &mut self.monitor,
-                &mut self.out_meter,
-                &self.out_devices,
-                &self.input.device_name,
-            );
             for slot in self.slots.iter_mut().filter(|s| s.module.has_top_row()) {
                 ui.separator();
                 ui.push_id(slot.module.title(), |ui| slot.module.top_row(ui));
             }
+            ui::widgets::right_aligned(ui, "monitor_bar", |ui| {
+                ui::monitor_bar::show(
+                    ui,
+                    &mut self.monitor,
+                    &mut self.out_meter,
+                    &self.out_devices,
+                    &self.input.device_name,
+                )
+            });
         });
     }
 
-    /// Listening is the lit, active state; clicking releases the interface
-    /// and shows a greyed-out "Paused".
+    /// Listening shows an orange frame; clicking releases the interface and
+    /// shows an accent-filled "Paused" that invites a click to resume.
     fn listen_toggle(&mut self, ui: &mut egui::Ui) {
         let mut listening = !self.input.paused();
         let before = listening;
@@ -291,16 +292,28 @@ impl App {
                 let color = if listening {
                     ui.visuals().text_color()
                 } else {
-                    ui.visuals().weak_text_color()
+                    theme::ACCENT_BRIGHT
                 };
                 crate::ui::icons::transport(ui.painter(), rect.center(), listening, color);
             }
-            let label = if listening {
-                egui::RichText::new("Listening")
+            // Listening: quiet orange frame. Paused: solid accent fill, so the
+            // button that resumes is the loudest thing in the bar.
+            let button = if listening {
+                egui::Button::new("Listening")
+                    .fill(egui::Color32::TRANSPARENT)
+                    .stroke(egui::Stroke::new(1.0, theme::ACCENT_BRIGHT.gamma_multiply(0.8)))
             } else {
-                egui::RichText::new("Paused").color(ui.visuals().weak_text_color())
+                egui::Button::new(egui::RichText::new("Paused").color(theme::ON_ACCENT))
+                    .fill(theme::ACCENT)
             };
-            ui.toggle_value(&mut listening, label).on_hover_text("Click to pause: disconnects from the interface so another app (e.g. a DAW in exclusive mode) can use it. The last captured audio stays on screen.");
+            let hint = if listening {
+                "Click to pause: disconnects from the interface so another app (e.g. a DAW in exclusive mode) can use it. The last captured audio stays on screen."
+            } else {
+                "Click to resume listening."
+            };
+            if ui.add(button).on_hover_text(hint).clicked() {
+                listening = !listening;
+            }
         });
         if listening != before {
             self.input.set_paused(!listening);
@@ -355,15 +368,24 @@ impl App {
                     ui.label("Buffer").on_hover_text(
                         "Frames per audio callback (reopens the device). Smaller reacts sooner, larger is safer against dropouts.",
                     );
-                    ui.horizontal_wrapped(|ui| {
+                    ui.horizontal(|ui| {
                         let want = self.input.buffer();
-                        if ui.selectable_label(want.is_none(), "Auto").on_hover_text("The driver's default").clicked() {
-                            pick_buf = Some(None);
-                        }
-                        for &b in &self.input.buffer_sizes {
-                            if ui.selectable_label(want == Some(b), b.to_string()).clicked() {
-                                pick_buf = Some(Some(b));
-                            }
+                        let head = want.map_or_else(|| "Auto".to_string(), |b| b.to_string());
+                        let mut sel = want;
+                        ui.add_enabled_ui(!self.input.buffer_sizes.is_empty(), |ui| {
+                            egui::ComboBox::from_id_salt("input_buffer")
+                                .width(90.0)
+                                .selected_text(head)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut sel, None, "Auto")
+                                        .on_hover_text("The driver's default");
+                                    for &b in &self.input.buffer_sizes {
+                                        ui.selectable_value(&mut sel, Some(b), b.to_string());
+                                    }
+                                });
+                        });
+                        if sel != want {
+                            pick_buf = Some(sel);
                         }
                         if self.input.buffer_sizes.is_empty() {
                             ui.weak("not adjustable on this device");
@@ -469,6 +491,9 @@ impl App {
             if self.input.paused() {
                 ui.separator();
                 ui.colored_label(theme::ACCENT, "paused: interface released");
+            } else if self.input.suspended() {
+                ui.separator();
+                ui.weak("paused: app in background");
             }
             let (cap, filled) = self.input.captured();
             if filled < cap && !self.input.paused() {
@@ -522,6 +547,9 @@ impl eframe::App for App {
         let timing = self.profiler.begin();
         self.build_watch.poll(ui.ctx());
         self.poll_mic(ui.ctx());
+        // Release the interface while another app has focus; resume on return.
+        let focused = ui.input(|i| i.focused);
+        self.input.set_suspended(!focused);
         self.watch_devices();
         // Live modules: visible, and drawn by the page on screen (a solo page
         // draws one analyser), or needed by others. The rest pause in place.
@@ -587,10 +615,12 @@ impl eframe::App for App {
             slot.module.marks(&mut marks);
         }
         let debug_anchor = ui.available_rect_before_wrap().right_top() + egui::vec2(-6.0, 6.0);
-        let paused = self.input.paused();
+        // Paused or no audio arriving: fade the scopes well back so the
+        // stale picture doesn't read as live.
+        let idle = !self.input.connected();
         egui::CentralPanel::default().show(ui, |ui| {
-            if paused {
-                ui.multiply_opacity(0.5);
+            if idle {
+                ui.multiply_opacity(0.25);
             }
             self.layout
                 .show(ui, &mut self.slots, &shared, &marks, &mut self.profiler);

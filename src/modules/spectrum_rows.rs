@@ -26,6 +26,8 @@ const MAX_ROWS_PER_FRAME: usize = 16;
 /// Longest catch-up span, ms, so slow rows don't inflate the per-frame snapshot.
 const MAX_CATCHUP_MS: f32 = 400.0;
 const ROWS: (usize, usize) = (20, 600);
+/// FFT sizes offered as (2^n, label).
+const FFT_SIZES: &[(u32, &str)] = &[(12, "low"), (14, "medium"), (16, "ultra")];
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Key {
@@ -51,6 +53,69 @@ pub struct Params {
     pub follow_gate: bool,
     /// Audio time per row, so the scroll speed doesn't depend on the frame rate.
     pub row_ms: f32,
+    /// Colour ramp for the level.
+    pub palette: Palette,
+}
+
+/// Colour ramps for the rows' levels, floor first.
+#[derive(Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub enum Palette {
+    /// Dark → accent orange → near white (the impulse ramp).
+    Mono,
+    /// Black → muted red → orange → yellow → white.
+    #[default]
+    Fire,
+    /// Black → indigo → maroon → gold → white.
+    Plasma,
+}
+
+impl Palette {
+    pub const ALL: [Self; 3] = [Self::Fire, Self::Plasma, Self::Mono];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Mono => "mono",
+            Self::Fire => "fire",
+            Self::Plasma => "plasma",
+        }
+    }
+
+    /// Colour for a level in 0..=1.
+    pub fn color(self, t: f32) -> Color32 {
+        match self {
+            Self::Mono => heat(t),
+            Self::Fire => ramp(FIRE, t),
+            Self::Plasma => ramp(PLASMA, t),
+        }
+    }
+}
+
+const FIRE: &[(f32, Color32)] = &[
+    (0.0, Color32::from_rgb(0, 0, 0)),
+    (0.25, Color32::from_rgb(88, 26, 18)),
+    (0.5, Color32::from_rgb(180, 66, 36)),
+    (0.75, Color32::from_rgb(250, 160, 70)),
+    (1.0, Color32::from_rgb(255, 250, 225)),
+];
+
+const PLASMA: &[(f32, Color32)] = &[
+    (0.0, Color32::from_rgb(0, 0, 0)),
+    (0.38, Color32::from_rgb(40, 38, 112)),
+    (0.61, Color32::from_rgb(78, 24, 24)),
+    (0.88, Color32::from_rgb(255, 192, 0)),
+    (1.0, Color32::from_rgb(255, 250, 240)),
+];
+
+/// Colour at `t` along `stops` (sorted by position), linear between them.
+fn ramp(stops: &[(f32, Color32)], t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    for w in stops.windows(2) {
+        let ((a, ca), (b, cb)) = (w[0], w[1]);
+        if t <= b {
+            return theme::lerp(ca, cb, (t - a) / (b - a));
+        }
+    }
+    stops[stops.len() - 1].1
 }
 
 impl Default for Params {
@@ -64,6 +129,7 @@ impl Default for Params {
             range_db: f32::NAN,
             follow_gate: false,
             row_ms: 15.0,
+            palette: Palette::default(),
         }
     }
 }
@@ -78,7 +144,12 @@ impl Params {
 
     /// Pull loaded values back into the ranges the UI allows.
     pub fn sanitize(&mut self) {
-        self.fft_pow = self.fft_pow.clamp(10, 15);
+        // Snap to the nearest FFT size offered (older saves may hold others).
+        self.fft_pow = FFT_SIZES
+            .iter()
+            .map(|&(pow, _)| pow)
+            .min_by_key(|pow| pow.abs_diff(self.fft_pow))
+            .unwrap_or(FFT_SIZES[0].0);
         self.rows = self.rows.clamp(ROWS.0, ROWS.1);
         if self.range_db.is_finite() {
             self.ceil_db = self.floor_db + self.range_db;
@@ -102,7 +173,7 @@ impl Params {
     }
 
     pub fn color(&self, db: f32) -> Color32 {
-        heat(self.level(db))
+        self.palette.color(self.level(db))
     }
 
     /// Seconds of history shown.
@@ -139,7 +210,15 @@ impl Params {
     }
 
     pub fn ui_fft(&mut self, ui: &mut Ui) {
-        ui.add(egui::Slider::new(&mut self.fft_pow, 10..=15).text("FFT 2^n"));
+        let name = |pow: u32| FFT_SIZES.iter().find(|s| s.0 == pow).map_or("", |s| s.1);
+        egui::ComboBox::from_label("FFT")
+            .selected_text(name(self.fft_pow))
+            .show_ui(ui, |ui| {
+                for &(pow, label) in FFT_SIZES {
+                    ui.selectable_value(&mut self.fft_pow, pow, label)
+                        .on_hover_text(format!("{} samples", 1u32 << pow));
+                }
+            });
     }
 
     pub fn ui_gate(&mut self, ui: &mut Ui) {

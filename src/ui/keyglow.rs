@@ -83,6 +83,20 @@ impl KeyGlow {
         }
     }
 
+    /// A note starts sounding at `t` (MIDI clock).
+    pub fn note_on(&mut self, note: u8, t: f64) {
+        let k = &mut self.keys[(note & 0x7F) as usize];
+        k.held = true;
+        k.on_t = t;
+        k.heat = (k.heat + HEAT_PER_HIT).min(1.0);
+    }
+
+    /// A note stops sounding at `t` (MIDI clock).
+    pub fn note_off(&mut self, note: u8, t: f64) {
+        let scale = self.timing.release.max(0.05);
+        Self::release(&mut self.keys[(note & 0x7F) as usize], t, scale);
+    }
+
     /// Once per frame: take this frame's MIDI (only `channel` 0..16 when
     /// set), then advance the fades. Returns true while anything is still
     /// lit (worth a repaint).
@@ -95,13 +109,8 @@ impl KeyGlow {
                 continue;
             }
             match (status & 0xF0, vel) {
-                (0x90, v) if v > 0 => {
-                    let k = &mut self.keys[(note & 0x7F) as usize];
-                    k.held = true;
-                    k.on_t = e.t;
-                    k.heat = (k.heat + HEAT_PER_HIT).min(1.0);
-                }
-                (0x80, _) | (0x90, _) => Self::release(&mut self.keys[(note & 0x7F) as usize], e.t, release),
+                (0x90, v) if v > 0 => self.note_on(note, e.t),
+                (0x80, _) | (0x90, _) => self.note_off(note, e.t),
                 // All sound off / all notes off.
                 (0xB0, _) if note == 120 || note == 123 => {
                     self.keys.iter_mut().for_each(|k| Self::release(k, e.t, release))

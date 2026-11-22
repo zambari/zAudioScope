@@ -26,6 +26,31 @@ pub fn placeholder(ui: &Ui, rect: egui::Rect, label: &str) {
     );
 }
 
+/// Lays `add` out left to right, flush against the right edge of the rest of
+/// a horizontal row. A right-to-left layout claims the remaining space (so
+/// the row never wraps it away) and places a box of the width `add` took
+/// last frame at its right end; a width change triggers one more frame.
+pub fn right_aligned<R>(ui: &mut Ui, id_salt: impl AsIdSalt, add: impl FnOnce(&mut Ui) -> R) -> R {
+    let id = ui.scope_id().with(id_salt);
+    let width: f32 = ui.data(|d| d.get_temp(id)).unwrap_or(0.0);
+    let height = ui.spacing().interact_size.y;
+    let r = ui
+        .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.allocate_ui_with_layout(
+                vec2(width, height),
+                egui::Layout::left_to_right(egui::Align::Center),
+                add,
+            )
+        })
+        .inner;
+    let now = r.response.rect.width();
+    if (now - width).abs() > 0.5 {
+        ui.data_mut(|d| d.insert_temp(id, now));
+        ui.ctx().request_repaint();
+    }
+    r.inner
+}
+
 /// Small accent button with a disclosure triangle that opens `body` in a
 /// popup under it. The popup stays open while it is used; only the button
 /// (or Esc) closes it. Returns `body`'s result while open.
@@ -369,6 +394,47 @@ impl<S: AsIdSalt> Foldout<S> {
             .show(ui, body)
             .inner;
         Some(inner)
+    }
+}
+
+// ---- note toggles ----------------------------------------------------------
+
+/// One row of twelve tiny note toggles, C..B, for keys `base..base + 12`;
+/// `sel[key]` holds each one (keys past `sel`'s end are skipped). `octave`
+/// labels the row and puts the octave in the hover names; keys failing
+/// `active` are greyed out.
+pub fn note_row(ui: &mut Ui, base: i32, octave: Option<i32>, sel: &mut [bool], active: impl Fn(i32) -> bool) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing = vec2(1.0, 1.0);
+        if let Some(oct) = octave {
+            ui.add_sized(
+                vec2(14.0, 15.0),
+                egui::Label::new(egui::RichText::new(format!("{oct}")).size(9.0).weak()),
+            );
+        }
+        for n in 0..12 {
+            let m = base + n;
+            let Some(on) = sel.get_mut(m as usize) else { continue };
+            let name = crate::pitch::NOTE_NAMES[n as usize];
+            let b = egui::Button::selectable(*on, egui::RichText::new(name).size(9.0))
+                .min_size(vec2(17.0, 15.0));
+            let hover = if octave.is_some() { crate::pitch::note_name(m) } else { name.to_owned() };
+            if ui.add_enabled(active(m), b).on_hover_text(hover).clicked() {
+                *on = !*on;
+            }
+        }
+    });
+}
+
+/// Small "none" button clearing every toggle in `sel`; disabled when none are on.
+pub fn clear_notes(ui: &mut Ui, sel: &mut [bool]) {
+    let any = sel.iter().any(|&b| b);
+    if ui
+        .add_enabled(any, egui::Button::new("none").small())
+        .on_hover_text("Clear all note toggles")
+        .clicked()
+    {
+        sel.fill(false);
     }
 }
 

@@ -341,6 +341,9 @@ pub struct Input {
     /// Ask the callback to measure every channel (channel picker open).
     meter_all: Arc<AtomicBool>,
     paused: bool,
+    /// Released while the app is in the background. Transient: never saved,
+    /// and separate from the user's own pause.
+    suspended: bool,
     /// Input gain as `f32` bits, applied in the callback so every analyser,
     /// the meter and the trigger all see the same scaled signal.
     gain: Arc<AtomicU32>,
@@ -379,6 +382,7 @@ impl Input {
             history_secs: settings.history_secs.clamp(1, 600),
             meter_all: Arc::new(AtomicBool::new(false)),
             paused: settings.paused,
+            suspended: false,
             gain: Arc::new(AtomicU32::new(1f32.to_bits())),
             channel: Arc::new(AtomicU32::new(settings.channel.to_bits())),
             device_channels: settings.device_channels.clone(),
@@ -496,7 +500,7 @@ impl Input {
     /// with backoff, and returns to the wanted device once it is back.
     /// Never blocks unless it reopens.
     pub fn tick(&mut self) {
-        if self.paused {
+        if self.held() {
             return;
         }
         let generation = endpoints::generation();
@@ -567,7 +571,7 @@ impl Input {
     /// True while audio is arriving: not paused, and the stream is up.
     /// A disconnected or stalled interface reads as not connected.
     pub fn connected(&self) -> bool {
-        !self.paused
+        !self.held()
             && self.stream.is_some()
             && matches!(self.link, Link::Up)
             && !self.shared.lost.load(Ordering::Relaxed)
@@ -660,7 +664,7 @@ impl Input {
     /// Reopen the running stream if it carries a different channel count
     /// than the selection needs, keeping the captured audio.
     fn sync_channels(&mut self) {
-        if self.paused
+        if self.held()
             || self.stream.is_none()
             || !matches!(self.link, Link::Up)
             || self.wanted_channels() == self.stream_channels
@@ -698,6 +702,33 @@ impl Input {
 
     pub fn paused(&self) -> bool {
         self.paused
+    }
+
+    /// The interface is released, by the user or by the app being in the
+    /// background. Nothing opens or reads it meanwhile.
+    fn held(&self) -> bool {
+        self.paused || self.suspended
+    }
+
+    pub fn suspended(&self) -> bool {
+        self.suspended
+    }
+
+    /// Release the interface while the app is in the background (focus
+    /// lost), or take it back on focus. Unlike `set_paused`, this is not
+    /// saved: the user's pause choice is untouched.
+    pub fn set_suspended(&mut self, suspended: bool) {
+        if suspended == self.suspended {
+            return;
+        }
+        self.suspended = suspended;
+        if suspended {
+            self.stream = None;
+            self.link = Link::Up;
+        } else if !self.paused {
+            let id = self.device_id.clone();
+            self.switch(id.as_deref());
+        }
     }
 
     /// Pausing closes the stream, releasing the interface for other apps
@@ -804,7 +835,7 @@ impl Input {
         if !keep {
             self.shared = new_shared(len, self.channels);
         }
-        if self.paused {
+        if self.held() {
             return Ok(());
         }
 
@@ -853,7 +884,7 @@ impl Input {
         if !keep {
             self.shared = new_shared(len, self.channels);
         }
-        if self.paused {
+        if self.held() {
             // Dropping `open` releases the device.
             return Ok(());
         }
@@ -944,7 +975,7 @@ impl Input {
 
     /// What is wrong, if anything; says so while a reconnect is pending.
     pub fn error(&self) -> Option<String> {
-        if self.paused {
+        if self.held() {
             return None;
         }
         match &self.link {

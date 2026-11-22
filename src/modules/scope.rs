@@ -54,6 +54,8 @@ struct Params {
     /// floor sits on the centre line; anything quieter folds to zero, so
     /// raising the floor zooms into the peaks.
     db: DynamicRange,
+    /// Trace opacity, 0..1.
+    wave_opacity: f32,
     /// Legacy linear zoom, read once and migrated to the ceiling.
     #[serde(skip_serializing)]
     gain: f32,
@@ -70,6 +72,7 @@ impl Default for Params {
             win_start_ms: 80.0,
             win_end_ms: 400.0,
             db: DynamicRange::default(),
+            wave_opacity: 0.8,
             gain: f32::NAN,
         }
     }
@@ -87,6 +90,7 @@ impl Params {
         self.threshold = self.threshold.clamp(0.01, 1.0);
         self.holdoff_ms = self.holdoff_ms.clamp(0.0, 1000.0);
         self.auto_reach_db = self.auto_reach_db.clamp(0.0, 24.0);
+        self.wave_opacity = self.wave_opacity.clamp(0.0, 1.0);
         self.win_start_ms = self.win_start_ms.clamp(0.0, self.view_ms);
         self.win_end_ms = self.win_end_ms.clamp(self.win_start_ms, self.view_ms);
     }
@@ -261,6 +265,7 @@ impl Scope {
         let (lo, view) = self.span(shared);
         let fold = self.p.fold();
         let cols = rect.width().max(1.0) as usize;
+        let stroke = Stroke::new(1.0, theme::WAVE.gamma_multiply(self.p.wave_opacity));
         for c in 0..cols {
             let a = lo + c * view / cols;
             let b = (lo + (c + 1) * view / cols).max(a + 1);
@@ -277,7 +282,7 @@ impl Scope {
             painter.vline(
                 x,
                 fold.y(rect, mx)..=fold.y(rect, mn),
-                Stroke::new(1.0, theme::WAVE),
+                stroke,
             );
         }
     }
@@ -368,6 +373,7 @@ impl Module for Scope {
             Key::View,
             egui::Slider::new(&mut self.p.view_ms, 50.0..=2000.0).text("view ms"),
         );
+        ui.add(egui::Slider::new(&mut self.p.wave_opacity, 0.0..=1.0).text("wave opacity"));
         ui.add_enabled_ui(self.p.mode != Mode::Free, |ui| {
             if self.p.mode == Mode::Auto {
                 link.slider(

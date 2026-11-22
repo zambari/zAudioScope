@@ -20,7 +20,7 @@ use crate::ui::noterange::NoteRange;
 use crate::ui::plot::{self, Lanes, NOTE_LANE};
 use crate::ui::icons::{self, Dir};
 use crate::ui::theme;
-use crate::ui::widgets::Foldout;
+use crate::ui::widgets::{self, Foldout};
 
 pub const TITLE: &str = "Tuner";
 
@@ -325,38 +325,12 @@ impl Module for Tuner {
         Foldout::new("snap", "snap to")
             .summary(summary)
             .show(ui, |ui| {
-                if ui
-                    .add_enabled(count > 0, egui::Button::new("none").small())
-                    .on_hover_text("Clear all note toggles")
-                    .clicked()
-                {
-                    self.p.notes.fill(false);
-                }
+                widgets::clear_notes(ui, &mut self.p.notes);
                 // One row per octave in range, one tiny toggle per note.
                 ui.spacing_mut().item_spacing = vec2(1.0, 1.0);
                 for oct in lo.div_euclid(12)..=hi.div_euclid(12) {
-                    ui.horizontal(|ui| {
-                        ui.add_sized(
-                            vec2(14.0, 15.0),
-                            egui::Label::new(
-                                egui::RichText::new(format!("{}", oct - 1)).size(9.0).weak(),
-                            ),
-                        );
-                        for n in 0..12 {
-                            let m = oct * 12 + n;
-                            let label =
-                                egui::RichText::new(pitch::NOTE_NAMES[n as usize]).size(9.0);
-                            let b = egui::Button::selectable(self.is_enabled(m), label)
-                                .min_size(vec2(17.0, 15.0));
-                            if ui
-                                .add_enabled(m >= lo && m <= hi, b)
-                                .on_hover_text(pitch::note_name(m))
-                                .clicked()
-                            {
-                                self.p.notes[m as usize] = !self.p.notes[m as usize];
-                            }
-                        }
-                    });
+                    let active = |m: i32| (lo..=hi).contains(&m);
+                    widgets::note_row(ui, oct * 12, Some(oct - 1), &mut self.p.notes, active);
                 }
             });
     }

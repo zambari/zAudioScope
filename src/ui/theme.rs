@@ -5,6 +5,9 @@ use egui::{Color32, CornerRadius, Shadow, Stroke};
 
 /// Fill for selected / toggled-on things.
 pub const ACCENT: Color32 = Color32::from_rgb(184, 88, 18);
+/// Muted orange for slider fills inside inspector foldouts, so the few
+/// controls that keep [`ACCENT`] (the dB range) stand out.
+pub const ACCENT_DIM: Color32 = Color32::from_rgb(112, 60, 24);
 /// Brighter orange for text, outlines and markers on dark backgrounds.
 pub const ACCENT_BRIGHT: Color32 = Color32::from_rgb(236, 132, 44);
 /// Text drawn on top of an `ACCENT` fill.
@@ -26,6 +29,13 @@ pub fn lerp(a: Color32, b: Color32, u: f32) -> Color32 {
     let u = u.clamp(0.0, 1.0);
     let c = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * u) as u8;
     Color32::from_rgb(c(a.r(), b.r()), c(a.g(), b.g()), c(a.b(), b.b()))
+}
+
+/// `c` scaled by `u` with zero alpha: in egui's premultiplied blending that
+/// adds light instead of covering what is under it (glows, overlaps).
+pub fn additive(c: Color32, u: f32) -> Color32 {
+    let [r, g, b, _] = c.gamma_multiply(u.clamp(0.0, 1.0)).to_array();
+    Color32::from_rgba_premultiplied(r, g, b, 0)
 }
 
 /// `c` with its hue rotated by `turns` of the colour wheel (0 = unchanged).
@@ -56,6 +66,17 @@ pub fn hue_fade(bg: Color32, c: Color32, turns: f32, fade: f32, tint: f32) -> Co
 /// inspector foldout and its display panel.
 pub fn selected_edge(painter: &egui::Painter, x: f32, y: egui::Rangef) {
     painter.vline(x, y, Stroke::new(2.0, ACCENT_BRIGHT));
+}
+
+/// egui's closest thing to a CSS rule: style is inherited by child `Ui`s,
+/// so overriding it here restyles everything `add` draws (slider fills,
+/// toggled-on buttons) without touching the global theme.
+pub fn with_fill<R>(ui: &mut egui::Ui, fill: Color32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.scope(|ui| {
+        ui.visuals_mut().selection.bg_fill = fill;
+        add(ui)
+    })
+    .inner
 }
 
 pub fn apply(ctx: &egui::Context) {
