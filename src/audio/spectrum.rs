@@ -1,7 +1,7 @@
 //! Short-time spectra for the waterfall and Impulse: a small radix-2 FFT, a Hann window,
 //! and log-spaced display bands (the shared note axis is log frequency).
 
-use std::f32::consts::TAU;
+use std::f32::consts::{PI, TAU};
 
 /// Display tilt, dB per octave around 1 kHz, so typical program material
 /// (which falls off with frequency) looks roughly level.
@@ -9,13 +9,23 @@ pub const TILT_DB_PER_OCT: f32 = 3.0;
 /// Below this, a bin reads as silence.
 pub const FLOOR_DB: f32 = -96.0;
 
-/// A reusable radix-2 FFT plan of one size with a Hann window. Plans are
+/// A reusable real-input FFT plan of one size with a Hann window. Plans are
 /// kept across frames (see `modules::Shared`); spectra are not.
+///
+/// A real `n`-point transform is done as one `n/2`-point complex FFT (even
+/// samples in the real part, odd in the imaginary part) and then unpacked,
+/// which costs about half of a complex FFT of the zero-padded input.
 pub struct Fft {
     n: usize,
+    /// Hann window, `n` long.
     window: Vec<f32>,
-    twiddle: Vec<(f32, f32)>,
+    /// Bit-reversal permutation of the `n/2`-point complex FFT.
     rev: Vec<usize>,
+    /// Butterfly twiddles, one contiguous run per stage: the stage with
+    /// half-size `h` uses `stages[h-1 .. 2h-1]`.
+    stages: Vec<(f32, f32)>,
+    /// `exp(-2πik/n)` for `k` in `0..=n/2`, for unpacking the real spectrum.
+    post: Vec<(f32, f32)>,
     re: Vec<f32>,
     im: Vec<f32>,
 }
@@ -24,26 +34,37 @@ impl Fft {
     /// `n` must be a power of two.
     pub fn new(n: usize) -> Self {
         assert!(n.is_power_of_two() && n >= 16);
+        let m = n / 2;
         let window = (0..n)
             .map(|i| 0.5 - 0.5 * (TAU * i as f32 / n as f32).cos())
             .collect();
-        let twiddle = (0..n / 2)
+        let bits = m.trailing_zeros();
+        let rev = (0..m)
+            .map(|i| i.reverse_bits() >> (usize::BITS - bits))
+            .collect();
+        let mut stages = vec![(0.0, 0.0); m - 1];
+        let mut h = 1;
+        while h < m {
+            for k in 0..h {
+                let a = -PI * k as f32 / h as f32;
+                stages[h - 1 + k] = (a.cos(), a.sin());
+            }
+            h *= 2;
+        }
+        let post = (0..=m)
             .map(|k| {
                 let a = -TAU * k as f32 / n as f32;
                 (a.cos(), a.sin())
             })
             .collect();
-        let bits = n.trailing_zeros();
-        let rev = (0..n)
-            .map(|i| i.reverse_bits() >> (usize::BITS - bits))
-            .collect();
         Self {
             n,
             window,
-            twiddle,
             rev,
-            re: vec![0.0; n],
-            im: vec![0.0; n],
+            stages,
+            post,
+            re: vec![0.0; m],
+            im: vec![0.0; m],
         }
     }
 
@@ -51,43 +72,64 @@ impl Fft {
     /// scaled so a full-scale sine peaks at about 1.0 (0 dB).
     pub fn power(&mut self, x: &[f32]) -> Vec<f32> {
         debug_assert_eq!(x.len(), self.n);
-        for (i, &s) in x.iter().enumerate() {
-            let r = self.rev[i];
-            self.re[r] = s * self.window[i];
-            self.im[r] = 0.0;
+        let m = self.n / 2;
+        for (j, (s, w)) in x
+            .chunks_exact(2)
+            .zip(self.window.chunks_exact(2))
+            .enumerate()
+        {
+            let r = self.rev[j];
+            self.re[r] = s[0] * w[0];
+            self.im[r] = s[1] * w[1];
         }
         self.fft();
         // Hann window: a sine of amplitude A peaks at A·n/4.
         let scale = 4.0 / self.n as f32;
-        (0..=self.n / 2)
+        (0..=m)
             .map(|k| {
-                let (re, im) = (self.re[k] * scale, self.im[k] * scale);
-                re * re + im * im
+                // Z = E + iO holds the even and odd halves' spectra;
+                // X[k] = E[k] + W^k·O[k].
+                let (zr, zi) = (self.re[k % m], self.im[k % m]);
+                let (cr, ci) = (self.re[(m - k) % m], -self.im[(m - k) % m]);
+                let (er, ei) = (0.5 * (zr + cr), 0.5 * (zi + ci));
+                let (dr, di) = (zr - cr, zi - ci);
+                let (or, oi) = (0.5 * di, -0.5 * dr);
+                let (wr, wi) = self.post[k];
+                let xr = (er + wr * or - wi * oi) * scale;
+                let xi = (ei + wr * oi + wi * or) * scale;
+                xr * xr + xi * xi
             })
             .collect()
     }
 
-    /// In-place iterative radix-2 FFT over `re`/`im` (already bit-reversed).
+    /// In-place iterative radix-2 FFT over `re`/`im` (already bit-reversed),
+    /// `n/2` points.
     fn fft(&mut self) {
-        let n = self.n;
-        let mut len = 2;
-        while len <= n {
-            let half = len / 2;
-            let stride = n / len;
-            for start in (0..n).step_by(len) {
-                for k in 0..half {
-                    let (wr, wi) = self.twiddle[k * stride];
-                    let (a, b) = (start + k, start + k + half);
-                    let (xr, xi) = (self.re[b], self.im[b]);
+        let m = self.n / 2;
+        let mut h = 1;
+        while h < m {
+            let len = 2 * h;
+            let tw = &self.stages[h - 1..2 * h - 1];
+            for (re, im) in self
+                .re
+                .chunks_exact_mut(len)
+                .zip(self.im.chunks_exact_mut(len))
+            {
+                let (ra, rb) = re.split_at_mut(h);
+                let (ia, ib) = im.split_at_mut(h);
+                let halves = ra.iter_mut().zip(ia.iter_mut());
+                let others = rb.iter_mut().zip(ib.iter_mut());
+                for (((ar, ai), (br, bi)), &(wr, wi)) in halves.zip(others).zip(tw) {
+                    let (xr, xi) = (*br, *bi);
                     let tr = xr * wr - xi * wi;
                     let ti = xr * wi + xi * wr;
-                    self.re[b] = self.re[a] - tr;
-                    self.im[b] = self.im[a] - ti;
-                    self.re[a] += tr;
-                    self.im[a] += ti;
+                    *br = *ar - tr;
+                    *bi = *ai - ti;
+                    *ar += tr;
+                    *ai += ti;
                 }
             }
-            len *= 2;
+            h = len;
         }
     }
 }
@@ -163,5 +205,41 @@ impl Bands {
                 (10.0 * v.max(1e-12).log10() + t).max(FLOOR_DB)
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The packed real FFT must match a direct DFT of the windowed input.
+    #[test]
+    fn matches_direct_dft() {
+        for n in [16usize, 64, 256] {
+            let x: Vec<f32> = (0..n)
+                .map(|i| ((i * 37 + 11) % 97) as f32 / 97.0 - 0.5)
+                .collect();
+            let got = Fft::new(n).power(&x);
+            let scale = 4.0 / n as f64;
+            let want: Vec<f64> = (0..=n / 2)
+                .map(|k| {
+                    let (mut re, mut im) = (0.0f64, 0.0f64);
+                    for (i, &s) in x.iter().enumerate() {
+                        let w = (0.5 - 0.5 * (TAU * i as f32 / n as f32).cos()) as f64;
+                        let a = -(TAU as f64) * (i * k) as f64 / n as f64;
+                        re += s as f64 * w * a.cos();
+                        im += s as f64 * w * a.sin();
+                    }
+                    (re * re + im * im) * scale * scale
+                })
+                .collect();
+            let peak = want.iter().copied().fold(0.0, f64::max);
+            for (k, (&g, &w)) in got.iter().zip(&want).enumerate() {
+                assert!(
+                    (g as f64 - w).abs() <= 1e-4 * peak + 1e-12,
+                    "n={n} k={k}: {g} vs {w}"
+                );
+            }
+        }
     }
 }

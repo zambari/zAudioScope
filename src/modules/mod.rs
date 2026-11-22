@@ -300,17 +300,17 @@ impl Shared {
 /// `n` samples of `f` ending at absolute `end`; anything before `start` or
 /// outside the frame reads as silence.
 fn take(f: &Frame, n: usize, (start, end): (u64, u64)) -> Vec<f32> {
+    // Sample i of the window is absolute position `first + i`. Copy the run
+    // that lies inside both the snapshot and `start`; the rest stays silent.
     let first = end as i128 - n as i128;
-    (0..n)
-        .map(|i| {
-            let at = first + i as i128;
-            if at >= start as i128 && at >= f.start as i128 && at < f.end() as i128 {
-                f.samples[(at - f.start as i128) as usize]
-            } else {
-                0.0
-            }
-        })
-        .collect()
+    let mut out = vec![0.0; n];
+    let lo = first.max(start as i128).max(f.start as i128);
+    let hi = (end as i128).min(f.end() as i128);
+    if lo < hi {
+        let src = (lo - f.start as i128) as usize..(hi - f.start as i128) as usize;
+        out[(lo - first) as usize..(hi - first) as usize].copy_from_slice(&f.samples[src]);
+    }
+    out
 }
 
 /// Halve the rate: a 5-tap binomial low-pass, then every other sample,
