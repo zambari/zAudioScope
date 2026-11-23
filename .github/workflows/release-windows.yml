@@ -1,0 +1,59 @@
+# Builds the Windows binary (WASAPI + DirectSound + ASIO) and attaches it to
+# the GitHub release. The macOS build is made locally and uploaded by hand.
+name: Windows release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build and attach to (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ github.event.release.tag_name || inputs.tag }}
+  ASIO_SDK_URL: https://download.steinberg.net/sdk_downloads/ASIO-SDK_2.3.4_2025-10-15.zip
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The SDK can't be redistributed, so fetch it from Steinberg each build.
+      # cpal's asio-sys wants CPAL_ASIO_DIR = the folder holding `common/`.
+      - name: Fetch ASIO SDK
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri $env:ASIO_SDK_URL -OutFile asio-sdk.zip
+          Expand-Archive asio-sdk.zip -DestinationPath "$env:RUNNER_TEMP\asio"
+          $header = Get-ChildItem "$env:RUNNER_TEMP\asio" -Recurse -Filter asio.h |
+            Where-Object { $_.Directory.Name -eq 'common' } | Select-Object -First 1
+          if (-not $header) { throw "common\asio.h not found in the ASIO SDK zip" }
+          $dir = $header.Directory.Parent.FullName
+          Write-Host "ASIO SDK at $dir"
+          "CPAL_ASIO_DIR=$dir" >> $env:GITHUB_ENV
+          # bindgen needs libclang; the runner image ships LLVM here.
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
+
+      - name: Build
+        run: cargo build --release --features asio
+
+      - name: Package and upload
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $zip = "zAudioScope-$env:TAG-windows-x64.zip"
+          Compress-Archive -Path target\release\zaudioscope.exe, LICENSE, README.md -DestinationPath $zip
+          gh release upload $env:TAG $zip --clobber
