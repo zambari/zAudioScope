@@ -94,6 +94,11 @@ impl Module for Waterfall {
         self.p.lookback(rate)
     }
 
+    /// Keep drawing until the last loud row has scrolled off the bottom.
+    fn idle_wait_s(&self) -> f32 {
+        crate::ui::meter::NO_SIGNAL_HOLD_S.max(self.p.secs())
+    }
+
     fn update(&mut self, shared: &mut Shared) {
         self.p.db.sync(&shared.db);
         let added = self.rows.update(&self.p, shared);

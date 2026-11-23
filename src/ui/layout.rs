@@ -6,6 +6,7 @@ use egui::{Align, Align2, FontId, Id, Layout, Rect, Sense, Stroke, Ui, UiBuilder
 use serde::{Deserialize, Serialize};
 
 use super::outside as noterange_outside;
+use super::theme::TabLook;
 use super::{icons, noterange, plot, theme, widgets};
 use crate::modules::{Module, Shared, Slot, tuner};
 
@@ -165,7 +166,7 @@ impl Workspace {
         let visible: Vec<usize> = ordered
             .iter()
             .copied()
-            .filter(|&i| slots[i].visible)
+            .filter(|&i| slots[i].shown())
             .collect();
         self.sync_mix(slots);
         let layered = visible
@@ -186,15 +187,22 @@ impl Workspace {
                 .map_or(Tab::Stack, Tab::Solo),
             _ => Tab::Stack,
         };
-        let mut tabs: Vec<(Tab, &str, bool)> = vec![(Tab::Stack, "Stack", false)];
+        let mut tabs = vec![(Tab::Stack, "Stack", TabLook::Normal)];
         // Every analyzer has a solo tab; a switched-off one is dimmed and
-        // clicking it switches it back on.
+        // clicking it switches it back on. One missing its input is inert.
         tabs.extend(ordered.iter().map(|&i| {
-            let title = slots[i].module.title();
-            (Tab::Solo(title), title, !slots[i].visible)
+            let slot = &slots[i];
+            let look = if !slot.available {
+                TabLook::Disabled("Connect a MIDI input to show this")
+            } else if !slot.visible {
+                TabLook::Dim
+            } else {
+                TabLook::Normal
+            };
+            (Tab::Solo(slot.module.title()), slot.module.title(), look)
         }));
         if layered {
-            tabs.push((Tab::Composite, "Composite", false));
+            tabs.push((Tab::Composite, "Composite", TabLook::Normal));
         }
         let mut tabs_ui = child(ui, "display_tabs", column.with_max_y(column.top() + TABS));
         let before = current;
@@ -251,7 +259,7 @@ impl Workspace {
                         // A solo overlay also shows the graph it draws over.
                         Tab::Solo(solo) => solo == title || overlays.contains(&(i, solo)),
                     };
-                    if !shown {
+                    if !shown || !slot.available {
                         continue;
                     }
                     let start = profiler.start();
@@ -316,7 +324,11 @@ impl Workspace {
                 let rows: Vec<usize> = ordered
                     .iter()
                     .copied()
-                    .filter(|&i| !merged.iter().any(|m| m.1 == i) && !slots[i].module.solo_only())
+                    .filter(|&i| {
+                        slots[i].available
+                            && !merged.iter().any(|m| m.1 == i)
+                            && !slots[i].module.solo_only()
+                    })
                     .collect();
                 self.displays(ui, displays, slots, &rows, &merged, true, shared, profiler)
             }
@@ -439,7 +451,7 @@ impl Workspace {
         let View::Solo(title) = &self.view else {
             return all;
         };
-        let visible: Vec<usize> = (0..slots.len()).filter(|&i| slots[i].visible).collect();
+        let visible: Vec<usize> = (0..slots.len()).filter(|&i| slots[i].shown()).collect();
         let Some(solo) = visible
             .iter()
             .copied()
@@ -520,7 +532,7 @@ impl Workspace {
         let mut panels = BTreeMap::new();
         // The own-pane analyser shown this frame, if any.
         let pane = slots.iter().position(|s| {
-            s.visible
+            s.shown()
                 && s.module.composite_pane()
                 && self.mix.iter().any(|l| l.on && l.title == s.module.title())
         });
@@ -582,7 +594,19 @@ impl Workspace {
             area.max - vec2(1.0, 1.0),
         );
         let sized = graph.height() >= 44.0 && graph.width() >= 24.0;
-        if sized && let Some(label) = shared.idle_label() {
+        // The stack waits for its slowest layer (the waterfall's history).
+        let wait = self
+            .mix
+            .iter()
+            .filter(|l| l.on && l.opacity > 0.0 && !own_pane(slots, &l.title))
+            .filter_map(|l| {
+                slots
+                    .iter()
+                    .find(|s| s.shown() && s.module.title() == l.title)
+            })
+            .map(|s| s.module.idle_wait_s())
+            .fold(crate::ui::meter::NO_SIGNAL_HOLD_S, f32::max);
+        if sized && let Some(label) = shared.idle_label(wait) {
             widgets::placeholder(ui, graph, label);
         } else if sized {
             plot::note_grid(
@@ -599,7 +623,7 @@ impl Workspace {
             for (title, opacity) in stacked {
                 let Some(slot) = slots
                     .iter_mut()
-                    .find(|s| s.visible && s.module.title() == title)
+                    .find(|s| s.shown() && s.module.title() == title)
                 else {
                     continue;
                 };
@@ -637,6 +661,12 @@ impl Workspace {
     fn mixer(&mut self, ui: &mut Ui, slots: &[Slot]) {
         let mut separated = false;
         for layer in self.mix.iter_mut().rev() {
+            if !slots
+                .iter()
+                .any(|s| s.available && s.module.title() == layer.title)
+            {
+                continue;
+            }
             let pane = own_pane(slots, &layer.title);
             if pane && !separated {
                 ui.separator();
@@ -644,7 +674,7 @@ impl Workspace {
             }
             let on = slots
                 .iter()
-                .any(|s| s.visible && s.module.title() == layer.title);
+                .any(|s| s.shown() && s.module.title() == layer.title);
             ui.horizontal(|ui| {
                 ui.add_enabled_ui(on, |ui| {
                     ui.add(widgets::flicktoggle(&mut layer.on));
@@ -808,7 +838,10 @@ impl Workspace {
             );
             // Tiny windows still fit; don't pass inverted plot bounds to modules.
             if slot.visible && graph.height() >= 44.0 && graph.width() >= 24.0 {
-                if let Some(label) = shared.idle_label().filter(|_| slot.module.uses_audio()) {
+                if let Some(label) = shared
+                    .idle_label(slot.module.idle_wait_s())
+                    .filter(|_| slot.module.uses_audio())
+                {
                     widgets::placeholder(&pane, graph, label);
                 } else {
                     slot.module.graph(&mut pane, graph, shared);
@@ -997,7 +1030,7 @@ fn scope_pane(
     );
     let mut pane = child(ui, ("composite_pane", title), rect);
     if graph.height() >= 44.0 && graph.width() >= 24.0 {
-        if let Some(label) = shared.idle_label() {
+        if let Some(label) = shared.idle_label(slot.module.idle_wait_s()) {
             widgets::placeholder(&pane, graph, label);
         } else {
             let start = profiler.start();
@@ -1143,6 +1176,7 @@ mod tests {
             .into_iter()
             .map(|title| Slot {
                 visible: true,
+                available: true,
                 open: true,
                 module: Box::new(Probe {
                     title,
@@ -1313,6 +1347,7 @@ mod tests {
         .into_iter()
         .map(|(title, depth)| Slot {
             visible: true,
+            available: true,
             open: true,
             module: Box::new(Layered {
                 title,
@@ -1392,6 +1427,7 @@ mod tests {
         let mut slots: Vec<Slot> = vec![
             Slot {
                 visible: true,
+                available: true,
                 open: true,
                 module: Box::new(Layered {
                     title: "Image",
@@ -1401,6 +1437,7 @@ mod tests {
             },
             Slot {
                 visible: true,
+                available: true,
                 open: true,
                 module: Box::new(Pane {
                     drawn: drawn.clone(),

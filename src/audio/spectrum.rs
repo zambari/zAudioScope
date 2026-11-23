@@ -72,7 +72,6 @@ impl Fft {
     /// scaled so a full-scale sine peaks at about 1.0 (0 dB).
     pub fn power(&mut self, x: &[f32]) -> Vec<f32> {
         debug_assert_eq!(x.len(), self.n);
-        let m = self.n / 2;
         for (j, (s, w)) in x
             .chunks_exact(2)
             .zip(self.window.chunks_exact(2))
@@ -82,6 +81,25 @@ impl Fft {
             self.re[r] = s[0] * w[0];
             self.im[r] = s[1] * w[1];
         }
+        self.unpack_power()
+    }
+
+    /// Power spectrum of `x` (exactly `n` samples) that the caller already
+    /// windowed, e.g. a shorter Hann-windowed block zero-padded to `n`.
+    /// Same scale as [`Fft::power`] only when the window spans all `n`.
+    pub fn power_prewindowed(&mut self, x: &[f32]) -> Vec<f32> {
+        debug_assert_eq!(x.len(), self.n);
+        for (j, s) in x.chunks_exact(2).enumerate() {
+            let r = self.rev[j];
+            self.re[r] = s[0];
+            self.im[r] = s[1];
+        }
+        self.unpack_power()
+    }
+
+    /// Transform the loaded `re`/`im` and unpack the real power spectrum.
+    fn unpack_power(&mut self) -> Vec<f32> {
+        let m = self.n / 2;
         self.fft();
         // Hann window: a sine of amplitude A peaks at A·n/4.
         let scale = 4.0 / self.n as f32;

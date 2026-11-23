@@ -189,12 +189,22 @@ pub fn tab(label: &str, active: bool, dim: bool) -> impl egui::Widget + '_ {
     }
 }
 
+/// How a [`tab_strip`] entry is drawn.
+#[derive(Clone, Copy, PartialEq)]
+pub enum TabLook {
+    Normal,
+    /// Weak text, still clickable (e.g. a switched-off analyzer).
+    Dim,
+    /// Greyed out and inert; the text explains why on hover.
+    Disabled(&'static str),
+}
+
 /// A row of [`tab`]s; `current` is updated when one is clicked. A hairline
 /// runs along the bottom, broken under the active tab. Each entry is
-/// (value, label, dim).
+/// (value, label, look).
 pub fn tab_strip<T: Copy + PartialEq>(
     ui: &mut egui::Ui,
-    tabs: &[(T, &str, bool)],
+    tabs: &[(T, &str, TabLook)],
     current: &mut T,
 ) {
     let full = ui.available_rect_before_wrap();
@@ -202,8 +212,12 @@ pub fn tab_strip<T: Copy + PartialEq>(
     let row = ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 2.0;
         ui.add_space(6.0);
-        for &(value, label, dim) in tabs {
-            let resp = ui.add(tab(label, *current == value, dim));
+        for &(value, label, look) in tabs {
+            let widget = tab(label, *current == value, look != TabLook::Normal);
+            let resp = match look {
+                TabLook::Disabled(why) => ui.add_enabled(false, widget).on_disabled_hover_text(why),
+                _ => ui.add(widget),
+            };
             if resp.clicked() {
                 *current = value;
             }

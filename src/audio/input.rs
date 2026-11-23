@@ -41,6 +41,31 @@ pub struct DeviceInfo {
     pub name: String,
 }
 
+impl DeviceInfo {
+    /// The name without the API tag, so one interface seen through several
+    /// APIs (WASAPI, DirectSound, ASIO) groups together.
+    pub fn base_name(&self) -> &str {
+        self.name
+            .strip_suffix(" (DirectSound)")
+            .unwrap_or(&self.name)
+    }
+
+    /// Order within a group: system API first, then DirectSound, then ASIO.
+    fn api_rank(&self) -> u8 {
+        match self.id.split(':').next() {
+            Some("dsound") => 1,
+            Some("asio") => 2,
+            _ => 0,
+        }
+    }
+}
+
+/// Alphabetical by device, the same device's APIs kept together.
+pub(crate) fn sort_devices(mut list: Vec<DeviceInfo>) -> Vec<DeviceInfo> {
+    list.sort_by_cached_key(|d| (d.base_name().to_lowercase(), d.api_rank(), d.name.clone()));
+    list
+}
+
 /// Which device channels feed the analysers. Channel numbers are 0-based
 /// here and 1-based in the UI.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -414,7 +439,7 @@ impl Input {
         if let Ok(asio) = cpal::host_from_id(cpal::HostId::Asio) {
             list.extend(asio.input_devices().map(describe).unwrap_or_default());
         }
-        list
+        sort_devices(list)
     }
 
     /// The list after an endpoint change: system devices rescanned, ASIO
@@ -422,7 +447,7 @@ impl Input {
     pub fn devices_refresh(prev: &[DeviceInfo]) -> Vec<DeviceInfo> {
         let mut list = Self::system_devices();
         list.extend(prev.iter().filter(|d| is_asio(Some(&d.id))).cloned());
-        list
+        sort_devices(list)
     }
 
     fn system_devices() -> Vec<DeviceInfo> {

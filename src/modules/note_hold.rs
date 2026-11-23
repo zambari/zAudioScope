@@ -70,6 +70,10 @@ impl Reading {
 
 #[derive(Default)]
 pub struct NoteHold {
+    /// Notes an octave apart are one reading: a sighting joins a reading of
+    /// the same note name and is moved into its octave, so a pitch that
+    /// flips between octaves doesn't split or restart.
+    pub any_octave: bool,
     readings: Vec<Reading>,
     next_order: u64,
 }
@@ -83,7 +87,13 @@ impl NoteHold {
         }
         for &(m, cl) in seen {
             let i = self.find(m, targets, t.hold);
+            let fold = self.any_octave;
             let r = &mut self.readings[i];
+            let m = if fold {
+                m + 12.0 * ((r.midi - m) / 12.0).round()
+            } else {
+                m
+            };
             if r.evidence == 0.0 && r.order.is_none() {
                 r.midi = m;
             } else if !r.live {
@@ -118,7 +128,9 @@ impl NoteHold {
                 .iter_mut()
                 .filter(|r| r.shown(t.hold))
                 .min_by(|a, b| {
-                    (a.live, -a.since, a.clarity).partial_cmp(&(b.live, -b.since, b.clarity)).unwrap()
+                    (a.live, -a.since, a.clarity)
+                        .partial_cmp(&(b.live, -b.since, b.clarity))
+                        .unwrap()
                 })
                 .unwrap();
             victim.since = f32::INFINITY;
@@ -158,18 +170,33 @@ impl NoteHold {
     /// Index of the reading a sighting at `m` belongs to, created if needed.
     fn find(&mut self, m: f32, targets: &[i32], hold: f32) -> usize {
         let open = |r: &Reading| r.order.is_none() || r.since <= hold;
+        let fold = self.any_octave;
+        let gap = |r: &Reading| {
+            if fold {
+                pitch::octave_free_gap(r.midi, m)
+            } else {
+                (r.midi - m).abs()
+            }
+        };
         let near = self
             .readings
             .iter()
             .enumerate()
-            .filter(|(_, r)| open(r) && (r.midi - m).abs() < CAPTURE_SEMIS)
-            .min_by(|a, b| (a.1.midi - m).abs().total_cmp(&(b.1.midi - m).abs()))
+            .filter(|(_, r)| open(r) && gap(r) < CAPTURE_SEMIS)
+            .min_by(|a, b| gap(a.1).total_cmp(&gap(b.1)))
             .map(|(i, _)| i);
         if let Some(i) = near {
             return i;
         }
         let note = pitch::snap(m, targets.iter().copied()).map_or(m.round() as i32, |s| s.0);
-        if let Some(i) = self.readings.iter().position(|r| open(r) && r.note == note) {
+        let same = |n: i32| {
+            if fold {
+                (n - note).rem_euclid(12) == 0
+            } else {
+                n == note
+            }
+        };
+        if let Some(i) = self.readings.iter().position(|r| open(r) && same(r.note)) {
             return i;
         }
         self.readings.push(Reading {
@@ -238,6 +265,22 @@ mod tests {
         assert_eq!(notes(&h), [40, 45]);
         run(&mut h, 0.5, &[(45.0, 0.9)]);
         assert_eq!(notes(&h), [45]);
+    }
+
+    #[test]
+    fn any_octave_keeps_one_reading() {
+        let mut h = NoteHold {
+            any_octave: true,
+            ..Default::default()
+        };
+        // D#3 and D#4 alternating every frame-ish: one D# reading.
+        for _ in 0..10 {
+            run(&mut h, 0.05, &[(51.1, 0.9)]);
+            run(&mut h, 0.05, &[(63.1, 0.9)]);
+        }
+        let n = notes(&h);
+        assert_eq!(n.len(), 1, "{n:?}");
+        assert_eq!(n[0].rem_euclid(12), 3);
     }
 
     #[test]

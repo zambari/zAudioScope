@@ -304,11 +304,7 @@ fn strip(
     let label_top = keys.bottom();
     for t in hz.ticks(34.0) {
         let x = hz.px(t.value);
-        p.vline(
-            x,
-            label_top..=label_top + 3.0,
-            Stroke::new(1.0, plot::TICK),
-        );
+        p.vline(x, label_top..=label_top + 3.0, Stroke::new(1.0, plot::TICK));
         let c = if t.major {
             Color32::from_gray(140)
         } else {

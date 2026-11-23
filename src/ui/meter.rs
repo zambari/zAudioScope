@@ -23,7 +23,8 @@ const GAIN_LABEL_WIDTH: f32 = 64.0;
 pub const NO_SIGNAL_DB: f32 = -48.0;
 
 /// Quiet must last this long (seconds) before the displays read as no signal.
-pub const NO_SIGNAL_HOLD_S: f32 = 2.0;
+/// Displays with longer history wait longer: [`Module::idle_wait_s`](crate::modules::Module::idle_wait_s).
+pub const NO_SIGNAL_HOLD_S: f32 = 10.0;
 
 pub fn to_db(lin: f32) -> f32 {
     if lin <= 0.0 {
@@ -52,10 +53,10 @@ impl Meter {
         self.hold[0].max(self.hold[1])
     }
 
-    /// False once the input has stayed under [`NO_SIGNAL_DB`] for
-    /// [`NO_SIGNAL_HOLD_S`] seconds. Any louder block resets the wait.
-    pub fn has_signal(&self) -> bool {
-        self.quiet_s < NO_SIGNAL_HOLD_S
+    /// Seconds the input has stayed under [`NO_SIGNAL_DB`]; any louder block
+    /// resets it to zero.
+    pub fn quiet_s(&self) -> f32 {
+        self.quiet_s
     }
 
     /// Gain slider and meter.
@@ -97,7 +98,7 @@ impl Meter {
             self.hold[k] = peak.max(self.hold[k] * hold_fall);
         }
         // Signal presence runs on the raw peak, not the decaying readout,
-        // so the two-second wait starts when the audio actually stops.
+        // so the no-signal wait starts when the audio actually stops.
         let loudest = peaks[0].max(peaks[1]);
         self.quiet_s = if to_db(loudest.max(1e-6)) < NO_SIGNAL_DB {
             self.quiet_s + dt

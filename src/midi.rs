@@ -136,6 +136,10 @@ impl MidiHub {
         self.port.as_ref()
     }
 
+    pub fn connected(&self) -> bool {
+        self.connected.is_some()
+    }
+
     /// This frame's messages and connection state.
     pub fn frame(&self) -> MidiFrame {
         self.frame.clone()

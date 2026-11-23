@@ -141,7 +141,20 @@ pub fn device_picker(
         .height(POPUP_HEIGHT)
         .selected_text(selected)
         .show_ui(ui, |ui| {
-            for d in devices {
+            // Lists come sorted by base name; a separator sets off each
+            // device seen through more than one API.
+            let same = |a: usize, b: usize| {
+                devices[a]
+                    .base_name()
+                    .eq_ignore_ascii_case(devices[b].base_name())
+            };
+            let grouped = |i: usize| {
+                (i > 0 && same(i - 1, i)) || (i + 1 < devices.len() && same(i, i + 1))
+            };
+            for (i, d) in devices.iter().enumerate() {
+                if i > 0 && !same(i - 1, i) && (grouped(i - 1) || grouped(i)) {
+                    ui.separator();
+                }
                 if ui
                     .selectable_label(current == Some(d.id.as_str()), short_device_name(&d.name))
                     .on_hover_text(&d.name)

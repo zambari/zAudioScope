@@ -156,10 +156,12 @@ impl Monitor {
     }
 
     pub fn devices() -> Vec<DeviceInfo> {
-        cpal::default_host()
-            .output_devices()
-            .map(describe)
-            .unwrap_or_default()
+        super::input::sort_devices(
+            cpal::default_host()
+                .output_devices()
+                .map(describe)
+                .unwrap_or_default(),
+        )
     }
 
     pub fn enabled(&self) -> bool {

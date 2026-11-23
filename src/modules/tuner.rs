@@ -1,6 +1,6 @@
 //! Pitch detector / tuner over the shared note range.
 //!
-//! - Autocorrelation (NSDF) candidates are drawn as vertical lines with
+//! - Pitch candidates (autocorrelation/NSDF, or FFT harmonic sum) are drawn as vertical lines with
 //!   note name and clarity; they fade in and out with confidence and level.
 //! - Up to three clear candidates get a readout with the snapped note and
 //!   the "tune up / down by x" advice, snapping to the nearest enabled note
@@ -29,11 +29,11 @@ use crate::worker::Latest;
 pub const TITLE: &str = "Tuner";
 
 /// Cost stages, in `Costs` order; all measured on the worker thread.
-const STAGES: [&str; 3] = ["decimate", "nsdf", "ghosts"];
+const STAGES: [&str; 3] = ["decimate", "detect", "ghosts"];
 
 /// Candidates shown at most.
 const MAX_CANDIDATES: usize = 6;
-/// Below this NSDF clarity a candidate is ignored.
+/// Below this clarity a candidate is ignored.
 const MIN_CLARITY: f32 = 0.5;
 /// A candidate within this many semitones of a track is that track.
 const CAPTURE_SEMIS: f32 = 0.5;
@@ -58,6 +58,11 @@ const GHOST_DB: f32 = 24.0;
 /// a ~2 kHz cap would only decimate by 2 (4× cheaper). Fundamentals up to
 /// the top of a 24-fret guitar; spectra and waterfalls keep the full range.
 const TOP_MIDI: f32 = 88.5;
+/// FFT detection ceiling (≈8.6 kHz). The spectrum's cost grows only with
+/// the window, and high fundamentals need no lag resolution, so FFT follows
+/// the shared range almost to the top; decimation still keeps `oversample`
+/// harmonics of the highest note.
+const FFT_TOP_MIDI: f32 = 120.5;
 /// Periods of each candidate the ghost check's DFT looks at.
 const GHOST_CYCLES: f32 = 24.0;
 
@@ -68,6 +73,9 @@ struct Params {
     method: Method,
     /// 0 = no smoothing, towards 1 = very slow.
     smoothing: f32,
+    /// Notes an octave apart count as one: scores merge, snap targets
+    /// cover every octave, readouts name the note without its octave.
+    any_octave: bool,
     /// A note must be clear this long before its readout shows.
     confirm_ms: f32,
     /// A readout lingers this long after its note drops out.
@@ -99,6 +107,7 @@ impl Default for Params {
         Self {
             method: Method::Autocorrelation,
             smoothing: 0.8,
+            any_octave: false,
             confirm_ms: 150.0,
             hold_ms: 800.0,
             a4: 440.0,
@@ -145,7 +154,10 @@ impl Params {
             rate_hz: self.rate_hz,
             oversample: self.oversample,
             a4: self.a4,
-            max_midi: TOP_MIDI,
+            max_midi: match self.method {
+                Method::Autocorrelation => TOP_MIDI,
+                Method::Fft => FFT_TOP_MIDI,
+            },
         }
     }
 
@@ -192,6 +204,8 @@ enum Draw {
 /// One analysis, handed to the worker thread.
 struct Job {
     cut: Cut,
+    method: Method,
+    any_octave: bool,
     a4: f32,
     /// Analysed note span (top already held to the ceiling).
     lo: f32,
@@ -211,11 +225,13 @@ struct Found {
     laps: Laps,
 }
 
-/// Decimate, find NSDF candidates and drop subharmonic ghosts. Runs on the
+/// Decimate, find pitch candidates and drop NSDF's subharmonic ghosts. Runs on the
 /// tuner's worker thread; track easing and smoothing stay on the UI thread.
 fn analyse(job: Job) -> Found {
     let Job {
         cut,
+        method,
+        any_octave,
         a4,
         lo,
         hi,
@@ -230,7 +246,7 @@ fn analyse(job: Job) -> Found {
         laps.skip(1);
         pitch::Candidates::default()
     } else {
-        laps.time(1, || pitch::candidates(y, r, f_lo, f_hi))
+        laps.time(1, || method.candidates(y, r, f_lo, f_hi))
     };
     let mut raw: Vec<(f32, f32, bool)> = c
         .list
@@ -246,30 +262,61 @@ fn analyse(job: Job) -> Found {
         .filter(|&(m, cl, _)| cl >= MIN_CLARITY && m >= lo - 0.5 && m <= hi + 0.5)
         .collect();
     // NSDF also peaks at 2T, 3T… of the true period: lines with no
-    // spectral energy under them are those subharmonic ghosts.
-    laps.time(2, || {
-        let level = |m: f32| {
-            [-0.5, -0.25, 0.0, 0.25, 0.5]
-                .map(|d| note_db(y, r, pitch::midi_to_freq(m + d, a4), GHOST_CYCLES))
-                .into_iter()
-                .fold(f32::MIN, f32::max)
-        };
-        let levels: Vec<f32> = raw.iter().map(|&(m, ..)| level(m)).collect();
-        let peak = levels.iter().copied().fold(f32::MIN, f32::max);
-        let mut keep = levels.iter().map(|&l| l >= peak - GHOST_DB);
-        raw.retain(|&(_, _, pick)| keep.next().unwrap() || pick);
-    });
+    // spectral energy under them are those subharmonic ghosts. FFT
+    // candidates already sit on spectral peaks and drop their own ghosts.
+    if method == Method::Fft {
+        laps.skip(2);
+    } else {
+        laps.time(2, || {
+            let level = |m: f32| {
+                [-0.5, -0.25, 0.0, 0.25, 0.5]
+                    .map(|d| note_db(y, r, pitch::midi_to_freq(m + d, a4), GHOST_CYCLES))
+                    .into_iter()
+                    .fold(f32::MIN, f32::max)
+            };
+            let levels: Vec<f32> = raw.iter().map(|&(m, ..)| level(m)).collect();
+            let peak = levels.iter().copied().fold(f32::MIN, f32::max);
+            let mut keep = levels.iter().map(|&l| l >= peak - GHOST_DB);
+            raw.retain(|&(_, _, pick)| keep.next().unwrap() || pick);
+        });
+    }
+    if any_octave {
+        raw = merge_octaves(raw);
+    }
     raw.sort_by(|a, b| b.2.cmp(&a.2).then(b.1.total_cmp(&a.1)));
     raw.truncate(MAX_CANDIDATES);
-    let picked = c
-        .pick
-        .map(|i| (pitch::freq_to_midi(c.list[i].freq, a4), c.list[i].clarity));
+    // The pick as listed (its merged clarity), else as detected.
+    let picked = raw.iter().find(|r| r.2).map(|r| (r.0, r.1)).or_else(|| {
+        c.pick
+            .map(|i| (pitch::freq_to_midi(c.list[i].freq, a4), c.list[i].clarity))
+    });
     Found {
         level_db: w.level_db,
         raw,
         picked,
         laps,
     }
+}
+
+/// Candidates whose pitches differ by whole octaves become one, at the
+/// clearest one's pitch. Clarities combine as independent evidence,
+/// `1 - (1 - a)(1 - b)`, so octave rivals reinforce instead of compete.
+fn merge_octaves(mut raw: Vec<(f32, f32, bool)>) -> Vec<(f32, f32, bool)> {
+    raw.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let mut out: Vec<(f32, f32, bool)> = Vec::with_capacity(raw.len());
+    for (m, cl, pick) in raw {
+        match out
+            .iter_mut()
+            .find(|o| pitch::octave_free_gap(o.0, m) < CAPTURE_SEMIS)
+        {
+            Some(o) => {
+                o.1 = 1.0 - (1.0 - o.1) * (1.0 - cl);
+                o.2 |= pick;
+            }
+            None => out.push((m, cl, pick)),
+        }
+    }
+    out
 }
 
 #[derive(Default)]
@@ -307,8 +354,18 @@ impl Tuner {
         }
     }
 
+    /// A snap target: toggled itself, or in any-octave mode any octave of it.
     fn is_enabled(&self, midi: i32) -> bool {
-        (0..128).contains(&midi) && self.p.notes[midi as usize]
+        if !(0..128).contains(&midi) {
+            return false;
+        }
+        if self.p.any_octave {
+            (midi.rem_euclid(12)..128)
+                .step_by(12)
+                .any(|m| self.p.notes[m as usize])
+        } else {
+            self.p.notes[midi as usize]
+        }
     }
 }
 
@@ -345,6 +402,8 @@ impl Module for Tuner {
             let a4 = self.p.a4;
             let job = Job {
                 cut,
+                method: self.p.method,
+                any_octave: self.p.any_octave,
                 a4,
                 lo,
                 hi,
@@ -385,8 +444,20 @@ impl Module for Tuner {
                 for m in Method::ALL {
                     ui.selectable_value(&mut self.p.method, m, m.label());
                 }
-            });
+            })
+            .response
+            .on_hover_text(
+                "Autocorr: best for bass, tops out at E6.\n\
+                 FFT: harmonic sum on the spectrum; reaches high notes and \
+                 missing fundamentals, coarser on low bass.",
+            );
         ui.add(egui::Slider::new(&mut self.p.smoothing, 0.0..=0.98).text("smoothing"));
+        ui.checkbox(&mut self.p.any_octave, "any octave")
+            .on_hover_text(
+                "Notes an octave apart count as one: their scores add up instead of \
+             competing, snapping matches any octave of a toggled note, and \
+             readouts show the note name only",
+            );
         ui.add(
             egui::Slider::new(&mut self.p.confirm_ms, 20.0..=1000.0)
                 .logarithmic(true)
@@ -417,9 +488,9 @@ impl Module for Tuner {
             ui.add(egui::Slider::new(&mut p.rate_hz, 2.0..=60.0).logarithmic(true).suffix(" Hz").text("update rate"))
                 .on_hover_text("Free-running analyses per second (gated mode analyses once per window)");
             ui.add(egui::Slider::new(&mut p.oversample, 3.0..=20.0).text("oversample"))
-                .on_hover_text("Decimated rate vs top note: lower decimates harder (cheaper), coarser NSDF lags");
+                .on_hover_text("Decimated rate vs top note: lower decimates harder (cheaper), coarser NSDF lags / fewer FFT harmonics");
             ui.add(egui::Slider::new(&mut p.gate_db, -140.0..=-20.0).suffix(" dB").text("silence gate"))
-                .on_hover_text("Below this input level NSDF is skipped");
+                .on_hover_text("Below this input level detection is skipped");
         });
         let NoteRange { lo, hi, .. } = shared.range.get();
         let count = (lo..=hi).filter(|&m| self.is_enabled(m)).count();
@@ -553,7 +624,6 @@ impl Tuner {
         }
         self.tracks.retain(|t| t.weight > 0.01 || t.alpha > 0.004);
 
-
         let clear: Vec<(f32, f32)> = self
             .raw
             .iter()
@@ -561,6 +631,7 @@ impl Tuner {
             .map(|&(m, cl, _)| (m, cl))
             .collect();
         let targets = self.enabled_notes();
+        self.readings.any_octave = self.p.any_octave;
         self.readings.step(dt, &clear, &targets, &self.p.timing());
     }
 
@@ -688,7 +759,11 @@ impl Tuner {
         painter.text(
             panel.left_top() + vec2(8.0, 4.0),
             Align2::LEFT_TOP,
-            pitch::note_name(r.note),
+            if self.p.any_octave {
+                pitch::class_name(r.note).to_owned()
+            } else {
+                pitch::note_name(r.note)
+            },
             FontId::proportional(name_pt),
             col,
         );
@@ -706,7 +781,12 @@ impl Tuner {
         painter.text(
             panel.right_top() + vec2(-8.0, detail_y),
             Align2::RIGHT_TOP,
-            format!("{cents:+.1}¢  {hz:.2} Hz"),
+            // The reading's octave is whichever it was first seen in.
+            if self.p.any_octave {
+                format!("{cents:+.1}¢")
+            } else {
+                format!("{cents:+.1}¢  {hz:.2} Hz")
+            },
             FontId::monospace(10.0),
             dim,
         );

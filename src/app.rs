@@ -553,12 +553,16 @@ impl eframe::App for App {
         self.watch_devices();
         // Live modules: visible, and drawn by the page on screen (a solo page
         // draws one analyser), or needed by others. The rest pause in place.
+        let midi = self.midi.connected();
+        for s in &mut self.slots {
+            s.available = midi || !s.module.needs_midi();
+        }
         let requested = self.layout.requested(&self.slots);
         let live: Vec<bool> = self
             .slots
             .iter()
             .zip(&requested)
-            .map(|(s, &want)| s.visible && (want || s.module.always_live()))
+            .map(|(s, &want)| s.shown() && (want || s.module.always_live()))
             .collect();
         // Snapshot only as much as the live modules need; the ring itself
         // may hold far more (the capture length).
@@ -592,8 +596,8 @@ impl eframe::App for App {
             std::mem::take(&mut self.fft_plans),
         );
         shared.midi = self.midi.frame();
-        // The input meter's held peak, as shown, from last frame's readout.
-        shared.signal = self.meter.has_signal();
+        // How long the input has been quiet, from last frame's meter.
+        shared.quiet_s = self.meter.quiet_s();
         shared.connected = self.input.connected();
         // Analysis runs in slot order, so the scope sets the gate first.
         for (i, slot) in self.slots.iter_mut().enumerate() {

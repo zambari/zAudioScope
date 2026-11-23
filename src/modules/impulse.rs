@@ -378,7 +378,11 @@ impl Module for Impulse {
         let total = self.p.rows.max(2);
         // Smoothed layers lag the history by a frame or so; raw until the first arrives.
         let source: Vec<&[f32]> = if self.time_smooth > 0.0 && !self.smoothed.is_empty() {
-            self.smoothed.iter().take(total).map(Vec::as_slice).collect()
+            self.smoothed
+                .iter()
+                .take(total)
+                .map(Vec::as_slice)
+                .collect()
         } else {
             self.rows.history.iter().map(Vec::as_slice).collect()
         };

@@ -124,10 +124,11 @@ pub struct Shared {
     pub levels: Rc<LevelDist>,
     /// MIDI received since the last frame; the app fills it in.
     pub midi: MidiFrame,
-    /// Whether the input peak reads above the no-signal floor. The app sets
-    /// it from the input meter; while false, displays stop drawing and show
-    /// "No signal" instead. Analysis still runs.
-    pub signal: bool,
+    /// Seconds the input has stayed under the no-signal floor. The app sets
+    /// it from the input meter; once it passes a display's
+    /// [`Module::idle_wait_s`], that display stops drawing and shows
+    /// "Waiting for signal" instead. Analysis still runs.
+    pub quiet_s: f32,
     /// Whether the input is connected and not paused. The app sets it; while
     /// false, displays stop drawing and show "Paused" instead.
     pub connected: bool,
@@ -152,7 +153,7 @@ impl Shared {
             db: Cell::new(db),
             levels,
             midi: MidiFrame::default(),
-            signal: true,
+            quiet_s: 0.0,
             connected: true,
             plans: RefCell::new(plans),
             cache: Default::default(),
@@ -160,12 +161,13 @@ impl Shared {
     }
 
     /// What a display shows in place of its graph, or `None` when it should
-    /// draw: "Paused" when no audio can arrive, "No signal" when it is quiet.
-    pub fn idle_label(&self) -> Option<&'static str> {
+    /// draw: "Paused" when no audio can arrive, "Waiting for signal" once the
+    /// input has been quiet for `wait_s` seconds (see [`Module::idle_wait_s`]).
+    pub fn idle_label(&self, wait_s: f32) -> Option<&'static str> {
         if !self.connected {
             Some("Paused")
-        } else if !self.signal {
-            Some("No signal")
+        } else if self.quiet_s >= wait_s {
+            Some("Waiting for signal")
         } else {
             None
         }
@@ -365,6 +367,16 @@ pub trait Module {
     fn uses_audio(&self) -> bool {
         true
     }
+    /// Only shown while a MIDI input is connected; otherwise its solo tab
+    /// stays, disabled.
+    fn needs_midi(&self) -> bool {
+        false
+    }
+    /// Seconds of quiet input before the display gives way to "Waiting for
+    /// signal". Displays that scroll history wait until it has scrolled clear.
+    fn idle_wait_s(&self) -> f32 {
+        crate::ui::meter::NO_SIGNAL_HOLD_S
+    }
     /// Live pitches (fractional MIDI) to light on the shared range bar.
     fn marks(&self, _out: &mut Vec<f32>) {}
     /// Whether this module has controls in the row below the audio toolbar
@@ -414,6 +426,10 @@ pub trait Module {
 /// A module plus its visibility (top bar toggle) and foldout state.
 pub struct Slot {
     pub visible: bool,
+    /// Whether what this analyser needs is present this frame (a MIDI
+    /// input for MIDI displays); set by the app. An unavailable analyser
+    /// is hidden everywhere except its inert solo tab.
+    pub available: bool,
     pub open: bool,
     pub module: Box<dyn Module>,
 }
@@ -423,11 +439,17 @@ impl Slot {
     pub fn params_key(&self) -> String {
         format!("zaudioscope_module.{}", self.module.title())
     }
+
+    /// Switched on and available: shown in the stack, inspector and pages.
+    pub fn shown(&self) -> bool {
+        self.visible && self.available
+    }
 }
 
 pub fn all() -> Vec<Slot> {
     let slot = |m: Box<dyn Module>| Slot {
         visible: true,
+        available: true,
         open: true,
         module: m,
     };
