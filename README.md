@@ -18,6 +18,21 @@ The top bar selects the audio input and MIDI device and toggles modules on and o
 
 The goal is a tool for tuning bass and syncing outboard samples: play a note on repeat and see its pitch and harmonics, with the pitch snapped to the nearest semitone.
 
+## Downloads
+
+Prebuilt binaries are on the [Releases](https://github.com/zambari/zAudioScope/releases) page: a macOS (Apple silicon) zip and a Windows x64 zip built with ASIO support.
+
+The builds are not signed, so the OS warns the first time you open them:
+
+- **macOS**: the first launch is blocked ("Apple could not verify…"). Open **System Settings → Privacy & Security**, scroll to the message about `zaudioscope` and click **Open Anyway**, then launch it again. Or clear the download quarantine flag from Terminal:
+
+  ```bash
+  xattr -d com.apple.quarantine ./zaudioscope
+  ```
+
+  macOS then asks for microphone access, which the scope needs to read your audio input.
+- **Windows**: SmartScreen may show "Windows protected your PC". Click **More info → Run anyway**.
+
 ## Building and running
 
 Requires a recent stable Rust toolchain (edition 2024).
@@ -30,7 +45,7 @@ Debug builds are also usable: dependencies and the DSP code are compiled with op
 
 ## Platform
 
-Developed and tested on macOS. The code also has Windows-specific build settings, but other platforms are untested.
+Developed and tested on macOS. Windows release builds are made by GitHub Actions (WASAPI, DirectSound and ASIO); other platforms are untested.
 
 ## Licence
 
