@@ -32,6 +32,8 @@ struct Key {
     held: bool,
     /// When the current / last hold began, on the MIDI clock.
     on_t: f64,
+    /// When the last hold ended, on the MIDI clock; `None` if never played.
+    off_t: Option<f64>,
     /// Release time constant fixed at note off, s.
     release_s: f32,
     heat: f32,
@@ -78,6 +80,7 @@ impl KeyGlow {
     fn release(k: &mut Key, t: f64, scale: f32) {
         if k.held {
             k.held = false;
+            k.off_t = Some(t);
             let held = (t - k.on_t).max(0.0) as f32;
             k.release_s = (RELEASE_MIN_S + RELEASE_PER_HELD * held).min(RELEASE_MAX_S) * scale;
         }
@@ -167,5 +170,13 @@ impl KeyGlow {
 
     pub fn held(&self, key: i32) -> bool {
         self.key(key).is_some_and(|k| k.held)
+    }
+
+    /// Held, or released less than `window` s before `now` (MIDI clock):
+    /// lets a quick arpeggio count as a chord.
+    pub fn recent(&self, key: i32, now: f64, window: f32) -> bool {
+        self.key(key).is_some_and(|k| {
+            k.held || k.off_t.is_some_and(|t| now - t < window as f64)
+        })
     }
 }

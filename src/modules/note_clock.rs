@@ -133,6 +133,9 @@ struct Params {
     /// Line fade-in / fade-out time constants, s.
     line_attack_s: f32,
     line_release_s: f32,
+    /// Released notes stay in the lines this long, s (0 = held only), so
+    /// arpeggios draw their chord too.
+    chord_window_s: f32,
     radial: Radial,
     invert: bool,
     fifths: bool,
@@ -176,6 +179,7 @@ impl Default for Params {
             lines: Lines::Filled,
             line_attack_s: 0.03,
             line_release_s: 0.6,
+            chord_window_s: 0.0,
             radial: Radial::Single,
             invert: false,
             fifths: false,
@@ -207,6 +211,7 @@ impl Params {
         self.spin = self.spin.clamp(-2.0, 2.0);
         self.line_attack_s = self.line_attack_s.clamp(0.005, 2.0);
         self.line_release_s = self.line_release_s.clamp(0.02, 8.0);
+        self.chord_window_s = self.chord_window_s.clamp(0.0, 4.0);
         self.inner = self.inner.clamp(0.0, 0.9);
         self.led_size = self.led_size.clamp(0.3, 3.0);
         self.skeleton = self.skeleton.clamp(0.0, 1.0);
@@ -255,6 +260,8 @@ pub struct NoteClock {
     /// When the fades and rotation were last advanced, MIDI clock.
     last_t: Option<f64>,
     links: Vec<Link>,
+    /// Keys joined by the lines this frame, in order round the dial.
+    points: Vec<i32>,
     spectrum: RadialSpectrum,
     /// The note each computer key is sounding, by [`KEYBOARD`] slot.
     keys_down: [Option<u8>; 12],
@@ -337,17 +344,19 @@ impl NoteClock {
         (levels, helds)
     }
 
-    /// Held keys, one per spot on the dial (a single ring folds octaves
-    /// together), in order round it.
-    fn held_points(&self, l: &polar::Layout) -> Vec<i32> {
-        let (_, held) = self.folded(l);
+    /// Keys the lines join (held, or released within the chord window),
+    /// one per spot on the dial (a single ring folds octaves together), in
+    /// order round it.
+    fn chord_points(&self, l: &polar::Layout, now: f64) -> Vec<i32> {
         let top = if l.radial == Radial::Single {
             (l.lo + 11).min(l.hi)
         } else {
             l.hi
         };
-        let mut keys: Vec<i32> = (l.lo..=l.hi)
-            .filter(|&k| held[k as usize])
+        let window = self.p.chord_window_s;
+        let mut keys: Vec<i32> = (0..128)
+            .filter(|&k| self.glow.recent(k, now, window))
+            .filter_map(|k| fold(k, l.lo, l.hi))
             .filter_map(|k| fold(k, l.lo, top))
             .collect();
         let at = |k: &i32| {
@@ -363,11 +372,11 @@ impl NoteClock {
     }
 
     /// Lines wanted now, as `(a, b)` with `a < b`.
-    fn wanted_links(&self, l: &polar::Layout) -> Vec<(i32, i32)> {
+    fn wanted_links(&self) -> Vec<(i32, i32)> {
         if !(self.p.chord || self.p.style == Style::Chord) {
             return Vec::new();
         }
-        let keys = self.held_points(l);
+        let keys = &self.points;
         match self.p.lines {
             Lines::Radial => keys.iter().map(|&k| (CENTER, k)).collect(),
             Lines::Polygon | Lines::Filled => {
@@ -424,7 +433,7 @@ impl NoteClock {
             }
         };
         if self.p.lines == Lines::Filled && l.radial == Radial::Single {
-            let pts: Vec<Pos2> = self.held_points(l).into_iter().map(at).collect();
+            let pts: Vec<Pos2> = self.points.iter().map(|&k| at(k)).collect();
             let level = self
                 .links
                 .iter()
@@ -512,6 +521,15 @@ impl NoteClock {
                     .text("line release"),
             )
             .on_hover_text("Fade-out time after a note off breaks the line");
+            ui.add(
+                egui::Slider::new(&mut p.chord_window_s, 0.0..=4.0)
+                    .suffix(" s")
+                    .text("chord window"),
+            )
+            .on_hover_text(
+                "Released notes stay joined this long, so a quick arpeggio \
+                 draws its chord too (0 = held notes only)",
+            );
         });
         widgets::choice(ui, "layout", &mut p.radial, &Radial::ALL, |r| {
             r.label().into()
@@ -876,7 +894,8 @@ impl Module for NoteClock {
             .map_or(0.0, |t| (now - t).clamp(0.0, 0.25) as f32);
         self.last_t = Some(now);
         self.spin(dt);
-        let want = self.wanted_links(&self.layout(shared));
+        self.points = self.chord_points(&self.layout(shared), now);
+        let want = self.wanted_links();
         self.fade_links(&want, dt);
         self.lit |= !self.links.is_empty();
     }
