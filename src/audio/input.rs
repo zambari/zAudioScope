@@ -26,9 +26,6 @@ const BACKOFF_MS: [u64; 4] = [250, 500, 1000, 2000];
 /// Timer retries for an ASIO device before waiting for an endpoint change:
 /// each try loads the driver, and some show a dialog when the box is gone.
 const ASIO_TIMER_RETRIES: u32 = 3;
-/// Without endpoint notifications, how often a missing wanted device is
-/// looked for while running on the default.
-const PRESENCE_POLL: Duration = Duration::from_secs(3);
 /// No callback for this long right after opening counts as a stall. Some
 /// drivers take a while to start.
 const FIRST_CALLBACK_WAIT: Duration = Duration::from_secs(3);
@@ -587,9 +584,7 @@ impl Input {
     /// ASIO is only looked for on a change: looking loads the driver.
     fn wanted_present(&mut self, changed: bool, now: Instant) -> bool {
         let id = self.device_id.as_deref();
-        let timer = !endpoints::watched()
-            && !is_asio(id)
-            && now.duration_since(self.presence_checked) >= PRESENCE_POLL;
+        let timer = !is_asio(id) && endpoints::poll_due(&mut self.presence_checked, now);
         if !(changed || timer) {
             return false;
         }

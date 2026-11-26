@@ -77,6 +77,8 @@ pub struct App {
     fft_plans: FftPlans,
     /// Endpoint change count the device lists were last refreshed at.
     devices_gen: u64,
+    /// Last timed rescan, where endpoint changes aren't reported (macOS).
+    devices_checked: std::time::Instant,
 }
 
 impl App {
@@ -132,17 +134,20 @@ impl App {
             levels: Default::default(),
             fft_plans: FftPlans::default(),
             devices_gen: endpoints::generation(),
+            devices_checked: std::time::Instant::now(),
         }
     }
 
     /// Keep the streams alive across device changes, and the device lists
-    /// current. ASIO entries are carried over, not rescanned: listing ASIO
+    /// current: on an endpoint change, or on a timer where changes aren't
+    /// reported. ASIO entries are carried over, not rescanned: listing ASIO
     /// loads its drivers, which the ⟳ button alone may do.
     fn watch_devices(&mut self) {
         self.input.tick();
         self.monitor.tick();
         let generation = endpoints::generation();
-        if generation != self.devices_gen {
+        let timer = endpoints::poll_due(&mut self.devices_checked, std::time::Instant::now());
+        if generation != self.devices_gen || timer {
             self.devices_gen = generation;
             self.devices = Input::devices_refresh(&self.devices);
             self.out_devices = Monitor::devices();

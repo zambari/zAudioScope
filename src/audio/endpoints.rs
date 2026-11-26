@@ -9,6 +9,10 @@
 //! Elsewhere the counter never moves and lost devices are retried on a timer.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+/// Without notifications, how often devices are looked for again.
+pub const POLL: Duration = Duration::from_secs(3);
 
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 
@@ -25,6 +29,16 @@ pub fn watched() -> bool {
     return win::ensure_started();
     #[cfg(not(windows))]
     false
+}
+
+/// Where changes aren't reported, whether `POLL` has passed since `last`;
+/// restarts the wait when it has.
+pub fn poll_due(last: &mut Instant, now: Instant) -> bool {
+    if watched() || now.duration_since(*last) < POLL {
+        return false;
+    }
+    *last = now;
+    true
 }
 
 #[cfg(windows)]
